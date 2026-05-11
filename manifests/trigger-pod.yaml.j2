@@ -1,0 +1,41 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ pod_name }}
+  namespace: {{ namespace }}
+  labels:
+    app: node-startup-latency
+    latency-test/iteration: "{{ iteration }}"
+    latency-test/run-id: "{{ run_id }}"
+spec:
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 0
+  {% if node_selector %}
+  nodeSelector:
+    {% for k, v in node_selector.items() %}{{ k }}: "{{ v }}"
+    {% endfor %}
+  {% endif %}
+  {% if tolerations %}
+  tolerations:
+    {% for t in tolerations %}- {{ t | tojson }}
+    {% endfor %}
+  {% endif %}
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values: ["node-startup-latency"]
+          topologyKey: kubernetes.io/hostname
+  containers:
+    - name: pause
+      image: {{ image }}
+      resources:
+        requests:
+          cpu: "{{ cpu }}"
+          memory: "{{ memory }}"
+        limits:
+          cpu: "{{ cpu }}"
+          memory: "{{ memory }}"

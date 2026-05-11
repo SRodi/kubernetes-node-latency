@@ -1,0 +1,145 @@
+"""CLI entrypoint."""
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+import time
+from pathlib import Path
+
+from . import providers
+from .analysis import write_outputs
+from .config import Config
+from .plotting import plot_all, plot_compare
+from .records import IterationRecord
+from .runner import run_iterations
+
+
+def _setup_logging(verbose: bool) -> None:
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    cfg = Config.from_file(args.config)
+    cfg.merge_cli(
+        provider=args.provider,
+        region=args.region,
+        iterations=args.iterations,
+        cluster_name=args.cluster_name,
+    )
+    run_id = args.run_id or time.strftime("%Y%m%d-%H%M%S")
+    run_dir = Path(cfg.output.base_dir) / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    provider = providers.get(cfg.provider, cfg)
+    if args.existing_cluster:
+        cfg.cluster_name = args.existing_cluster
+        provider = providers.get("existing", cfg)
+
+    handle = provider.create(cfg)
+    try:
+        records: list[IterationRecord] = run_iterations(cfg, handle, provider, run_dir, run_id)
+        summary = write_outputs(records, run_dir,
+                                run_id=run_id, provider=provider.name, region=handle.region)
+        plots = plot_all(run_dir / "iterations.csv", run_dir / "plots",
+                         title=f"({provider.name} @ {handle.region})")
+        logging.getLogger(__name__).info("wrote %d plots to %s", len(plots), run_dir / "plots")
+        print(f"\nRun {run_id} complete. Results in: {run_dir}")
+        print(f"  iterations.csv  -> {run_dir/'iterations.csv'}")
+        print(f"  summary.md      -> {run_dir/'summary.md'}")
+        print(f"  plots/          -> {run_dir/'plots'}")
+        return 0
+    finally:
+        if not args.keep_cluster:
+            provider.delete(handle)
+
+
+def _cmd_analyze(args: argparse.Namespace) -> int:
+    run_dir = Path(args.results_dir)
+    csv = run_dir / "iterations.csv"
+    if not csv.exists():
+        print(f"no iterations.csv in {run_dir}", file=sys.stderr); return 2
+    import pandas as pd
+    df = pd.read_csv(csv)
+    records = []
+    for _, row in df.iterrows():
+        # We re-emit summary from existing CSV without recomputing T*.
+        pass
+    # Simpler: write_outputs needs IterationRecord; instead recompute aggregate on the CSV directly.
+    from .analysis import aggregate
+    from tabulate import tabulate
+    agg = aggregate(df)
+    (run_dir / "summary.csv").write_text(agg.to_csv(index=False))
+    print(tabulate(agg, headers="keys", tablefmt="github", showindex=False))
+    return 0
+
+
+def _cmd_plot(args: argparse.Namespace) -> int:
+    run_dir = Path(args.results_dir)
+    paths = plot_all(run_dir / "iterations.csv", run_dir / "plots")
+    print("wrote:")
+    for p in paths:
+        print(f"  {p}")
+    if args.compare:
+        csvs = [Path(d) / "iterations.csv" for d in args.compare]
+        cmp_paths = plot_compare([run_dir / "iterations.csv", *csvs], run_dir / "plots")
+        print("comparison:")
+        for p in cmp_paths:
+            print(f"  {p}")
+    return 0
+
+
+def _cmd_clean(args: argparse.Namespace) -> int:
+    base = Path(args.base_dir or "results")
+    removed = 0
+    for child in base.iterdir():
+        if child.is_dir() and child.name != ".gitkeep":
+            import shutil; shutil.rmtree(child); removed += 1
+    print(f"removed {removed} run dir(s) under {base}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog="node-startup-latency",
+                                description="Measure node startup latency across cloud providers.")
+    p.add_argument("--verbose", "-v", action="store_true")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    pr = sub.add_parser("run", help="execute a measurement run")
+    pr.add_argument("--config", default="config.yaml")
+    pr.add_argument("--provider", default=None,
+                    choices=["gke_autopilot", "gke_standard_dpv2",
+                             "aks_overlay_cilium", "aks_byocni", "existing"])
+    pr.add_argument("--region", default=None)
+    pr.add_argument("--iterations", type=int, default=None)
+    pr.add_argument("--cluster-name", default=None)
+    pr.add_argument("--existing-cluster", default=None,
+                    help="reuse current kubeconfig context with this cluster name")
+    pr.add_argument("--keep-cluster", action="store_true")
+    pr.add_argument("--run-id", default=None)
+    pr.set_defaults(func=_cmd_run)
+
+    pa = sub.add_parser("analyze", help="re-aggregate stats from an existing run dir")
+    pa.add_argument("results_dir")
+    pa.set_defaults(func=_cmd_analyze)
+
+    pp = sub.add_parser("plot", help="(re)generate plots for an existing run dir")
+    pp.add_argument("results_dir")
+    pp.add_argument("--compare", nargs="*", default=[],
+                    help="additional run dirs to overlay on the comparison CDF")
+    pp.set_defaults(func=_cmd_plot)
+
+    pc = sub.add_parser("clean", help="remove all run dirs under results/")
+    pc.add_argument("--base-dir", default=None)
+    pc.set_defaults(func=_cmd_clean)
+
+    args = p.parse_args(argv)
+    _setup_logging(args.verbose)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

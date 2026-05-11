@@ -1,0 +1,28 @@
+# Default configuration for node-startup-latency runs.
+# Override on the CLI with --provider, --iterations, --region, --run-id.
+
+provider: gke_autopilot   # gke_autopilot | gke_standard_dpv2 | aks_overlay_cilium | aks_byocni | existing
+region: europe-west1
+cluster_name: node-latency-test
+release_channel: regular  # GKE only
+kubernetes_version: null  # null = provider default
+
+iterations: 10
+per_iteration_timeout_s: 900
+node_settle_seconds: 30   # wait this long after pod cleanup before next iteration
+
+trigger_pod:
+  namespace: default
+  image: registry.k8s.io/pause:3.9
+  cpu: "1500m"
+  memory: "2Gi"
+
+cni:
+  # Override the CNIProbe; null = pick the one paired with the provider.
+  probe: null             # cilium_dpv2 | cilium_generic | null
+  ready_regex: null       # null = use probe default
+  log_tail_lines: 5000
+
+output:
+  base_dir: results
+  show_plots: false
