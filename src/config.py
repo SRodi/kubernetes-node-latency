@@ -28,7 +28,7 @@ class AKSNodePoolCfg:
     name: str = "latencypool"
     vm_size: str = "Standard_D4s_v5"
     min_count: int = 0
-    max_count: int = 10
+    max_count: int = 50
     node_count: int = 0
 
 

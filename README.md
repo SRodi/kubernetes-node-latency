@@ -85,7 +85,7 @@ aks:
     name: latencypool
     vm_size: Standard_D4s_v5
     min_count: 0
-    max_count: 10
+    max_count: 50                 # bump if you plan many iterations; CA holds nodes ~10min before scale-down
     node_count: 0                 # baseline; manual mode scales to N+1 each iteration
   byocni:                         # only consumed by aks_byocni
     cilium_chart_version: "1.19.3"

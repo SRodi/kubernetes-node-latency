@@ -119,50 +119,55 @@ class Collector:
         Nodes that pre-date the trigger (with `skew_tolerance_s` of clock skew)
         are skipped: they were already being provisioned for unrelated reasons
         and would yield bogus negative latencies.
+
+        Resilient to the apiserver closing watch streams early (it typically
+        does so well before our budget), by re-opening the watch until the
+        deadline is actually exceeded.
         """
         deadline = time.monotonic() + timeout_s
         cutoff = (not_before - timedelta(seconds=skew_tolerance_s)) if not_before else None
-        w = watch.Watch()
-        try:
-            for ev in w.stream(self.core.list_node, timeout_seconds=timeout_s):
-                node = ev["object"]
-                name = node.metadata.name
-                if name in before_nodes:
-                    continue
-                ts = _parse_k8s_time(node.metadata.creation_timestamp) or utcnow()
-                if cutoff is not None and ts < cutoff:
-                    self.sink.write("node_pre_dates_trigger",
-                                    {"name": name, "creationTimestamp": ts.isoformat(),
-                                     "not_before": not_before.isoformat()})
-                    before_nodes.add(name)  # ignore from now on
-                    continue
-                self.sink.write("node_added", {"name": name, "creationTimestamp": ts.isoformat()})
-                return name, ts
-                if time.monotonic() > deadline:
-                    break
-        finally:
-            w.stop()
+        while time.monotonic() < deadline:
+            remaining = max(1, int(deadline - time.monotonic()))
+            w = watch.Watch()
+            try:
+                for ev in w.stream(self.core.list_node, timeout_seconds=remaining):
+                    node = ev["object"]
+                    name = node.metadata.name
+                    if name in before_nodes:
+                        continue
+                    ts = _parse_k8s_time(node.metadata.creation_timestamp) or utcnow()
+                    if cutoff is not None and ts < cutoff:
+                        self.sink.write("node_pre_dates_trigger",
+                                        {"name": name, "creationTimestamp": ts.isoformat(),
+                                         "not_before": not_before.isoformat()})
+                        before_nodes.add(name)
+                        continue
+                    self.sink.write("node_added", {"name": name, "creationTimestamp": ts.isoformat()})
+                    return name, ts
+            finally:
+                w.stop()
+            # apiserver closed the stream early; loop and re-watch with remaining budget.
         raise TimeoutError("no genuinely-new node observed before timeout")
 
     # ----- T4: Ready=True transition -----
     def wait_for_node_ready(self, node_name: str, timeout_s: int) -> datetime:
         deadline = time.monotonic() + timeout_s
-        w = watch.Watch()
-        try:
-            field = f"metadata.name={node_name}"
-            for ev in w.stream(self.core.list_node, field_selector=field,
-                               timeout_seconds=timeout_s):
-                node = ev["object"]
-                for c in (node.status.conditions or []):
-                    if c.type == "Ready" and c.status == "True":
-                        ts = _parse_k8s_time(c.last_transition_time) or utcnow()
-                        self.sink.write("node_ready", {"name": node_name, "ts": ts.isoformat()})
-                        return ts
-                if time.monotonic() > deadline:
-                    break
-        finally:
-            w.stop()
-        raise TimeoutError(f"node {node_name} never became Ready=True")
+        while time.monotonic() < deadline:
+            remaining = max(1, int(deadline - time.monotonic()))
+            w = watch.Watch()
+            try:
+                for ev in w.stream(self.core.list_node,
+                                   field_selector=f"metadata.name={node_name}",
+                                   timeout_seconds=remaining):
+                    node = ev["object"]
+                    for cond in (node.status.conditions or []):
+                        if cond.type == "Ready" and cond.status == "True":
+                            ts = _parse_k8s_time(cond.last_transition_time) or utcnow()
+                            self.sink.write("node_ready", {"name": node_name, "ts": ts.isoformat()})
+                            return ts
+            finally:
+                w.stop()
+        raise TimeoutError(f"node {node_name} did not become Ready before timeout")
 
     # ----- T2/T3: CNI agent — pod-watch driven, no log access required -----
     def find_agent_pod(self, node_name: str, timeout_s: int = 120) -> client.V1Pod | None:

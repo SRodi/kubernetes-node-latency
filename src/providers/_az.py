@@ -61,6 +61,20 @@ def aks_nodepool_scale(rg: str, cluster: str, pool: str, *, count: int) -> None:
         "-n", pool, "--node-count", str(count)])
 
 
+def aks_nodepool_delete_machines(rg: str, cluster: str, pool: str,
+                                  *, machine_names: list[str]) -> None:
+    """Delete specific node VMs from an AKS nodepool.
+
+    Uses the GA `aks nodepool delete-machines` command. Tolerates failure
+    because under cluster-autoscaler the node may already be reclaimed.
+    """
+    if not machine_names:
+        return
+    az(["aks", "nodepool", "delete-machines",
+        "-g", rg, "--cluster-name", cluster, "-n", pool,
+        "--machine-names", *machine_names], check=False)
+
+
 def helm_repo_add(name: str, url: str) -> None:
     helm(["repo", "add", name, url], check=False)
     helm(["repo", "update"])
