@@ -12,7 +12,8 @@ import yaml
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from kubernetes import client, config as kubeconfig
 
-from .collectors import Collector, EventSink, _parse_k8s_time, list_node_names
+from .collectors import (Collector, EventSink, _parse_k8s_time, cordon_nodes,
+                         list_node_names, uncordon_nodes)
 from .config import Config
 from .providers.base import ClusterHandle, ClusterProvider
 from .records import IterationRecord, utcnow
@@ -71,9 +72,12 @@ def run_iterations(cfg: Config, handle: ClusterHandle, provider: ClusterProvider
             rec = IterationRecord(iteration=i, run_id=run_id,
                                   provider=provider.name, region=handle.region)
             log.info("=== iteration %d/%d ===", i, cfg.iterations)
+            cordoned: list[str] = []
             try:
                 before = list_node_names(core)
                 sink.write("iteration_start", {"iteration": i, "pre_existing_nodes": sorted(before)})
+
+                cordoned = cordon_nodes(core, before, sink)
 
                 manifest = render_pod(cfg, run_id=run_id, iteration=i, provider=provider)
                 rec.pod_name = manifest["metadata"]["name"]
@@ -117,6 +121,9 @@ def run_iterations(cfg: Config, handle: ClusterHandle, provider: ClusterProvider
             finally:
                 if rec.pod_name:
                     delete_pod(core, rec.pod_name, cfg.trigger_pod.namespace)
+                # Best-effort uncordon so leftover nodes can be reused/reaped normally.
+                if cordoned:
+                    uncordon_nodes(core, cordoned, sink)
                 records.append(rec)
                 sink.write("iteration_end", {"iteration": i, **rec.to_row()})
                 if i < cfg.iterations:

@@ -240,3 +240,30 @@ class Collector:
 
 def list_node_names(core: client.CoreV1Api) -> set[str]:
     return {n.metadata.name for n in core.list_node().items}
+
+
+def cordon_nodes(core: client.CoreV1Api, names: Iterable[str], sink: EventSink | None = None) -> list[str]:
+    """Mark nodes unschedulable so the scheduler can't reuse them. Returns names actually cordoned."""
+    cordoned: list[str] = []
+    body = {"spec": {"unschedulable": True}}
+    for name in names:
+        try:
+            core.patch_node(name=name, body=body)
+            cordoned.append(name)
+        except client.ApiException as e:
+            if sink:
+                sink.write("cordon_error", {"node": name, "error": str(e)[:200]})
+    if sink:
+        sink.write("nodes_cordoned", {"nodes": cordoned})
+    return cordoned
+
+
+def uncordon_nodes(core: client.CoreV1Api, names: Iterable[str], sink: EventSink | None = None) -> None:
+    """Best-effort uncordon; failures are logged but don't raise."""
+    body = {"spec": {"unschedulable": False}}
+    for name in names:
+        try:
+            core.patch_node(name=name, body=body)
+        except client.ApiException as e:
+            if sink:
+                sink.write("uncordon_error", {"node": name, "error": str(e)[:200]})
