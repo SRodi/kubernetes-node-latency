@@ -13,10 +13,8 @@ import pandas as pd  # noqa: E402
 from .analysis import METRICS
 
 PHASE_COLS = [
-    ("T0_pod_created", "T1_node_registered", "pod \u2192 node registered"),
-    ("T1_node_registered", "T2_cilium_started", "node registered \u2192 cilium started"),
-    ("T2_cilium_started", "T3_cilium_ready", "cilium init"),
-    ("T3_cilium_ready", "T4_node_ready", "cilium ready \u2192 node ready"),
+    ("T0_pod_created", "T1_node_registered", "VM provision + node registered"),
+    ("T1_node_registered", "T4_node_ready", "node init to Ready"),
 ]
 
 
@@ -59,7 +57,9 @@ def plot_all(iterations_csv: Path, out_dir: Path, *, title: str = "") -> list[Pa
     ax.grid(True, axis="y", alpha=0.3)
     p = out_dir / "mean_stddev.png"; fig.tight_layout(); fig.savefig(p, dpi=140); plt.close(fig); paths.append(p)
 
-    # 3. stacked phase per iteration
+    # 3. stacked phase per iteration (always sums to node_startup_latency_s = T4 - T0).
+    #    Cilium agent init (T3 - T2) is overlaid as a separate line because it
+    #    can complete BEFORE or AFTER T4 (e.g. on GKE Autopilot it lands after).
     phases = pd.DataFrame({label: _seconds(ok[b], ok[a]).clip(lower=0)
                            for a, b, label in PHASE_COLS
                            if a in ok.columns and b in ok.columns})
@@ -71,8 +71,15 @@ def plot_all(iterations_csv: Path, out_dir: Path, *, title: str = "") -> list[Pa
             vals = phases[col].fillna(0).values
             ax.bar(x, vals, bottom=bottom, label=col)
             bottom += vals
+        cilium = pd.to_numeric(ok.get("cilium_init_duration_s"), errors="coerce")
+        if cilium is not None and cilium.notna().any():
+            ax.plot(x, cilium.values, color="black", marker="D", linewidth=1.2,
+                    label="cilium agent init (T3 \u2212 T2, parallel)")
         ax.set_xlabel("iteration"); ax.set_ylabel("seconds")
-        ax.set_title(f"Phase breakdown per iteration {title}")
+        ax.set_title(
+            f"Phase breakdown per iteration {title}\n"
+            "stack = node startup latency (T4 \u2212 T0); diamonds = cilium init duration"
+        )
         ax.legend(loc="upper right", fontsize=8)
         ax.grid(True, axis="y", alpha=0.3)
         p = out_dir / "phase_stacked.png"; fig.tight_layout(); fig.savefig(p, dpi=140); plt.close(fig); paths.append(p)

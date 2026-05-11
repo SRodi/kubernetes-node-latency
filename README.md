@@ -132,6 +132,14 @@ emission of CSV / Markdown / JSON / plots from synthetic fixtures.
 
 ## Notes & caveats
 
+- **Phase chart semantics**: the stacked bar always sums to
+  `node_startup_latency_s = T4 − T0` and is split into
+  *VM provision + node registered* (T0→T1) and *node init to Ready* (T1→T4).
+  The Cilium agent's init duration (T3 − T2) is overlaid as a black diamond
+  line because it is a **parallel** signal that on GKE Autopilot typically
+  completes **after** T4 — i.e. CNI does not delay node readiness on
+  Autopilot. When `cni_induced_delay_s == 0` consistently, that is the
+  intended finding, not a missing measurement.
 - **Autopilot kube-system access** is restricted. If the CNI agent log cannot be
   read, T2/T3 are emitted as `null` and the iteration still records T0/T1/T4
   (i.e. node startup latency is always measured).
