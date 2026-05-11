@@ -24,6 +24,45 @@ class CNICfg:
 
 
 @dc.dataclass
+class AKSNodePoolCfg:
+    name: str = "latencypool"
+    vm_size: str = "Standard_D4s_v5"
+    min_count: int = 0
+    max_count: int = 10
+    node_count: int = 0
+
+
+@dc.dataclass
+class AKSSystemPoolCfg:
+    name: str = "systempool"
+    vm_size: str = "Standard_D4s_v5"
+    node_count: int = 1
+
+
+@dc.dataclass
+class AKSByocniCfg:
+    cilium_chart_version: str = "1.19.3"
+    cilium_repo_url: str = "https://helm.cilium.io/"
+    cilium_values: dict = dc.field(default_factory=lambda: {
+        "kubeProxyReplacement": "true",
+        "operator.replicas": "1",
+    })
+    install_timeout_s: int = 600
+
+
+@dc.dataclass
+class AKSCfg:
+    resource_group: str = "node-latency-rg"
+    location: str | None = None  # falls back to top-level region
+    kubernetes_version: str | None = None
+    node_provisioning: str = "cluster_autoscaler"  # cluster_autoscaler|nap|manual
+    system_node_pool: AKSSystemPoolCfg = dc.field(default_factory=AKSSystemPoolCfg)
+    user_node_pool: AKSNodePoolCfg = dc.field(default_factory=AKSNodePoolCfg)
+    byocni: AKSByocniCfg = dc.field(default_factory=AKSByocniCfg)
+    keep_resource_group: bool = True
+
+
+@dc.dataclass
 class OutputCfg:
     base_dir: str = "results"
     show_plots: bool = False
@@ -41,6 +80,7 @@ class Config:
     node_settle_seconds: int = 30
     trigger_pod: TriggerPodCfg = dc.field(default_factory=TriggerPodCfg)
     cni: CNICfg = dc.field(default_factory=CNICfg)
+    aks: AKSCfg = dc.field(default_factory=AKSCfg)
     output: OutputCfg = dc.field(default_factory=OutputCfg)
 
     @classmethod
@@ -54,7 +94,13 @@ class Config:
         tp = TriggerPodCfg(**(data.pop("trigger_pod", {}) or {}))
         cni = CNICfg(**(data.pop("cni", {}) or {}))
         out = OutputCfg(**(data.pop("output", {}) or {}))
-        return cls(trigger_pod=tp, cni=cni, output=out, **data)
+        aks_raw = data.pop("aks", {}) or {}
+        sys_pool = AKSSystemPoolCfg(**(aks_raw.pop("system_node_pool", {}) or {}))
+        usr_pool = AKSNodePoolCfg(**(aks_raw.pop("user_node_pool", {}) or {}))
+        byocni = AKSByocniCfg(**(aks_raw.pop("byocni", {}) or {}))
+        aks = AKSCfg(system_node_pool=sys_pool, user_node_pool=usr_pool,
+                     byocni=byocni, **aks_raw)
+        return cls(trigger_pod=tp, cni=cni, aks=aks, output=out, **data)
 
     def merge_cli(self, **overrides: Any) -> "Config":
         for k, v in overrides.items():

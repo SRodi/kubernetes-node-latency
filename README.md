@@ -55,7 +55,60 @@ Other providers:
 
 # GKE Standard with Dataplane V2 (Cilium)
 .venv/bin/python -m src.cli run --provider gke_standard_dpv2 --region europe-west1
+
+# AKS with Azure CNI Powered by Cilium (managed dataplane)
+.venv/bin/python -m src.cli run --provider aks_overlay_cilium --region westeurope
+
+# AKS BYOCNI + upstream Cilium installed via Helm
+.venv/bin/python -m src.cli run --provider aks_byocni --region westeurope
 ```
+
+### AKS prerequisites
+
+- `az` CLI logged in (`az login`) with rights to create resource groups and AKS clusters.
+- `helm` (only for `aks_byocni`) and `kubectl` on `PATH`.
+- Configure provider-specific settings under the `aks:` block in `config.yaml`:
+
+```yaml
+provider: aks_overlay_cilium      # or aks_byocni
+region: westeurope
+aks:
+  resource_group: node-latency-rg
+  location: westeurope            # defaults to top-level region
+  kubernetes_version: null        # null => AKS default
+  node_provisioning: cluster_autoscaler   # cluster_autoscaler | nap | manual
+  system_node_pool:
+    name: systempool
+    vm_size: Standard_D4s_v5
+    node_count: 1
+  user_node_pool:                 # ignored when node_provisioning=nap
+    name: latencypool
+    vm_size: Standard_D4s_v5
+    min_count: 0
+    max_count: 10
+    node_count: 0                 # baseline; manual mode scales to N+1 each iteration
+  byocni:                         # only consumed by aks_byocni
+    cilium_chart_version: "1.19.3"
+    cilium_repo_url: https://helm.cilium.io/
+    cilium_values:
+      kubeProxyReplacement: "true"
+      operator.replicas: "1"
+    install_timeout_s: 600
+  keep_resource_group: true
+```
+
+Trigger modes:
+- `cluster_autoscaler` (default): user pool starts at `node_count`, CA scales up to satisfy each trigger Pod.
+- `nap`: enables AKS Node Auto-Provisioning; no user pool is added.
+- `manual`: harness scales the user pool by +1 before each iteration and back down after.
+
+Live AKS smoke test (opt-in):
+
+```bash
+AKS_LIVE_TEST=1 .venv/bin/python -m src.cli run --provider aks_overlay_cilium --iterations 1
+```
+
+> Cost note: each AKS run provisions a real cluster (and BYOCNI installs Cilium via Helm). Always let the harness `delete` the cluster, or pass `--keep-cluster` only for debugging.
 
 ## Outputs
 

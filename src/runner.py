@@ -74,6 +74,7 @@ def run_iterations(cfg: Config, handle: ClusterHandle, provider: ClusterProvider
             log.info("=== iteration %d/%d ===", i, cfg.iterations)
             cordoned: list[str] = []
             try:
+                getattr(provider, "pre_iteration", lambda *a, **kw: None)(handle, i)
                 before = list_node_names(core)
                 sink.write("iteration_start", {"iteration": i, "pre_existing_nodes": sorted(before)})
 
@@ -125,6 +126,7 @@ def run_iterations(cfg: Config, handle: ClusterHandle, provider: ClusterProvider
                 # Best-effort uncordon so leftover nodes can be reused/reaped normally.
                 if cordoned:
                     uncordon_nodes(core, cordoned, sink)
+                getattr(provider, "post_iteration", lambda *a, **kw: None)(handle, i)
                 records.append(rec)
                 sink.write("iteration_end", {"iteration": i, **rec.to_row()})
                 if i < cfg.iterations:

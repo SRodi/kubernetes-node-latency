@@ -26,3 +26,27 @@ cni:
 output:
   base_dir: results
   show_plots: false
+
+aks:
+  resource_group: node-latency-rg
+  location: null              # null -> falls back to top-level region
+  kubernetes_version: null
+  node_provisioning: cluster_autoscaler   # cluster_autoscaler | nap | manual
+  keep_resource_group: true   # don't delete the RG on cluster delete
+  system_node_pool:
+    name: systempool
+    vm_size: Standard_D4s_v5
+    node_count: 1
+  user_node_pool:             # the autoscaling pool that hosts trigger pods
+    name: latencypool
+    vm_size: Standard_D4s_v5
+    min_count: 0
+    max_count: 10
+    node_count: 0
+  byocni:
+    cilium_chart_version: "1.19.3"
+    cilium_repo_url: https://helm.cilium.io/
+    cilium_values:
+      kubeProxyReplacement: "true"
+      operator.replicas: "1"
+    install_timeout_s: 600

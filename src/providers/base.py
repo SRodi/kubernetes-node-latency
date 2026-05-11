@@ -31,3 +31,9 @@ class ClusterProvider(Protocol):
     def delete(self, h: ClusterHandle) -> None: ...
     def node_autoprovision_hint(self) -> dict: ...
     def cni_probe(self) -> CNIProbe: ...
+
+    def pre_iteration(self, h: ClusterHandle, iteration: int) -> None:  # default no-op
+        return None
+
+    def post_iteration(self, h: ClusterHandle, iteration: int) -> None:  # default no-op
+        return None
