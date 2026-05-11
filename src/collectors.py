@@ -5,7 +5,7 @@ import json
 import logging
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -111,8 +111,17 @@ class Collector:
         self.sink = sink
 
     # ----- T1: first time the new node shows up in the API -----
-    def wait_for_new_node(self, before_nodes: set[str], timeout_s: int) -> tuple[str, datetime]:
+    def wait_for_new_node(self, before_nodes: set[str], timeout_s: int,
+                          *, not_before: datetime | None = None,
+                          skew_tolerance_s: float = 2.0) -> tuple[str, datetime]:
+        """Wait for a node whose creationTimestamp is at or after ``not_before``.
+
+        Nodes that pre-date the trigger (with `skew_tolerance_s` of clock skew)
+        are skipped: they were already being provisioned for unrelated reasons
+        and would yield bogus negative latencies.
+        """
         deadline = time.monotonic() + timeout_s
+        cutoff = (not_before - timedelta(seconds=skew_tolerance_s)) if not_before else None
         w = watch.Watch()
         try:
             for ev in w.stream(self.core.list_node, timeout_seconds=timeout_s):
@@ -121,13 +130,19 @@ class Collector:
                 if name in before_nodes:
                     continue
                 ts = _parse_k8s_time(node.metadata.creation_timestamp) or utcnow()
+                if cutoff is not None and ts < cutoff:
+                    self.sink.write("node_pre_dates_trigger",
+                                    {"name": name, "creationTimestamp": ts.isoformat(),
+                                     "not_before": not_before.isoformat()})
+                    before_nodes.add(name)  # ignore from now on
+                    continue
                 self.sink.write("node_added", {"name": name, "creationTimestamp": ts.isoformat()})
                 return name, ts
                 if time.monotonic() > deadline:
                     break
         finally:
             w.stop()
-        raise TimeoutError("no new node observed before timeout")
+        raise TimeoutError("no genuinely-new node observed before timeout")
 
     # ----- T4: Ready=True transition -----
     def wait_for_node_ready(self, node_name: str, timeout_s: int) -> datetime:

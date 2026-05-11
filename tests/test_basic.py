@@ -140,3 +140,43 @@ def test_pod_ready_transition_returns_none_when_absent():
     from src.collectors import _pod_ready_transition
     pod = _make_pod()
     assert _pod_ready_transition(pod, "Ready") is None
+
+
+def test_wait_for_new_node_skips_nodes_predating_trigger(monkeypatch):
+    """A node whose creationTimestamp is well before T0 must be ignored, the
+    next genuinely-post-T0 node accepted."""
+    from datetime import datetime, timezone
+    from src.collectors import Collector, EventSink
+    from src.cni import get as get_probe
+
+    class FakeMeta:
+        def __init__(self, name, ts): self.name = name; self.creation_timestamp = ts
+
+    class FakeNode:
+        def __init__(self, name, ts): self.metadata = FakeMeta(name, ts)
+
+    t0 = datetime(2025, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    stale = FakeNode("stale", datetime(2025, 1, 1, 11, 59, 0, tzinfo=timezone.utc))
+    fresh = FakeNode("fresh", datetime(2025, 1, 1, 12, 0, 5, tzinfo=timezone.utc))
+
+    class FakeWatch:
+        def stream(self, *a, **kw):
+            yield {"object": stale}
+            yield {"object": fresh}
+        def stop(self): pass
+
+    monkeypatch.setattr("src.collectors.watch.Watch", FakeWatch)
+
+    sink_calls = []
+    class S:
+        def write(self, kind, obj): sink_calls.append((kind, obj))
+
+    class FakeCore:
+        def list_node(self, **kw): return None  # never actually called
+    c = Collector(core=FakeCore(), probe=get_probe("cilium_dpv2"), sink=S())  # type: ignore[arg-type]
+    name, ts = c.wait_for_new_node(set(), timeout_s=5, not_before=t0)
+    assert name == "fresh"
+    assert ts.minute == 0 and ts.second == 5
+    kinds = [k for k, _ in sink_calls]
+    assert "node_pre_dates_trigger" in kinds
+    assert "node_added" in kinds
