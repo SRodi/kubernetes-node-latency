@@ -193,9 +193,15 @@ emission of CSV / Markdown / JSON / plots from synthetic fixtures.
   completes **after** T4 — i.e. CNI does not delay node readiness on
   Autopilot. When `cni_induced_delay_s == 0` consistently, that is the
   intended finding, not a missing measurement.
-- **Autopilot kube-system access** is restricted. If the CNI agent log cannot be
-  read, T2/T3 are emitted as `null` and the iteration still records T0/T1/T4
-  (i.e. node startup latency is always measured).
+- **T2/T3 capture path**: T2 (CNI agent container started) and T3 (CNI ready)
+  are read from the agent Pod's `status.containerStatuses[].state.running.startedAt`
+  and `Ready` condition `lastTransitionTime` — *not* from log scraping. This
+  avoids a transient race on Autopilot where the konnectivity tunnel to a
+  brand-new node isn't ready yet, so `kubectl logs` against that node returns
+  `No agent available` for a few seconds (logs work normally once the node
+  settles). Log scraping is kept only as a fallback. If the agent Pod can't be
+  located within the timeout, T2/T3 are emitted as `null` and the iteration
+  still records T0/T1/T4 (node startup latency is always measured).
 - **Forcing fresh nodes**: trigger pods request 1500m CPU / 2Gi RAM by default
   with strict `podAntiAffinity` against earlier iterations, so each iteration
   needs a brand-new node on Autopilot. Tune in `config.yaml` for other providers.
