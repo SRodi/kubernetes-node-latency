@@ -23,14 +23,18 @@ class GKEStandardDPv2Provider(ClusterProvider):
 
     def create(self, cfg) -> ClusterHandle:
         kc = self._kubeconfig_path(cfg.cluster_name)
+        gs = cfg.gke_standard
         cmd = [
             "gcloud", "container", "clusters", "create", cfg.cluster_name,
             "--region", cfg.region,
             "--release-channel", cfg.release_channel,
             "--enable-dataplane-v2",
             "--enable-ip-alias",
-            "--num-nodes", "1",
-            "--enable-autoscaling", "--min-nodes", "0", "--max-nodes", "10",
+            "--machine-type", gs.machine_type,
+            "--num-nodes", str(gs.num_nodes),
+            "--enable-autoscaling",
+            "--min-nodes", str(gs.min_nodes),
+            "--max-nodes", str(gs.max_nodes),
         ]
         if cfg.kubernetes_version:
             cmd += ["--cluster-version", cfg.kubernetes_version]
@@ -66,9 +70,11 @@ class GKEStandardDPv2Provider(ClusterProvider):
         return get_probe("cilium_dpv2")
 
     def describe(self, h: ClusterHandle) -> dict:
+        gs = self.cfg.gke_standard
         return {
             "flavor": "standard",
             "release_channel": self.cfg.release_channel,
             "dataplane_v2": True,
-            "autoscaling": "min=0,max=10",
+            "machine_type": gs.machine_type,
+            "autoscaling": f"min={gs.min_nodes},max={gs.max_nodes}",
         }

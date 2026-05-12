@@ -27,6 +27,14 @@ output:
   base_dir: results
   show_plots: false
 
+gke_standard:
+  # Trigger pod requests 1500m CPU / 2Gi — e2-medium is too small for CA to
+  # find a fit, leaving the pod Pending forever. e2-standard-4 has headroom.
+  machine_type: e2-standard-4
+  num_nodes: 1
+  min_nodes: 0
+  max_nodes: 10
+
 aks:
   resource_group: node-latency-rg
   location: null              # null -> falls back to top-level region

@@ -63,6 +63,14 @@ class AKSCfg:
 
 
 @dc.dataclass
+class GKEStandardCfg:
+    machine_type: str = "e2-standard-4"
+    num_nodes: int = 1
+    min_nodes: int = 0
+    max_nodes: int = 10
+
+
+@dc.dataclass
 class OutputCfg:
     base_dir: str = "results"
     show_plots: bool = False
@@ -84,6 +92,7 @@ class Config:
     trigger_pod: TriggerPodCfg = dc.field(default_factory=TriggerPodCfg)
     cni: CNICfg = dc.field(default_factory=CNICfg)
     aks: AKSCfg = dc.field(default_factory=AKSCfg)
+    gke_standard: GKEStandardCfg = dc.field(default_factory=GKEStandardCfg)
     output: OutputCfg = dc.field(default_factory=OutputCfg)
 
     @classmethod
@@ -103,7 +112,9 @@ class Config:
         byocni = AKSByocniCfg(**(aks_raw.pop("byocni", {}) or {}))
         aks = AKSCfg(system_node_pool=sys_pool, user_node_pool=usr_pool,
                      byocni=byocni, **aks_raw)
-        return cls(trigger_pod=tp, cni=cni, aks=aks, output=out, **data)
+        gke_std = GKEStandardCfg(**(data.pop("gke_standard", {}) or {}))
+        return cls(trigger_pod=tp, cni=cni, aks=aks, gke_standard=gke_std,
+                   output=out, **data)
 
     def merge_cli(self, **overrides: Any) -> "Config":
         for k, v in overrides.items():
