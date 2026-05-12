@@ -121,6 +121,19 @@ class AKSProviderBase(ClusterProvider):
     def cni_probe(self) -> CNIProbe:
         return get_probe(self.cfg.cni.probe or "cilium_generic")
 
+    def describe(self, h: ClusterHandle) -> dict:
+        return {
+            "node_provisioning": self._mode,
+            "system_pool_vm": self.cfg.aks.system_node_pool.vm_size,
+            "user_pool_vm": self.cfg.aks.user_node_pool.vm_size,
+            "resource_group": self.cfg.aks.resource_group,
+            **self._network_describe(),
+        }
+
+    def _network_describe(self) -> dict:
+        # Subclasses override with their network plugin/dataplane facts.
+        return {}
+
     # -- per-iteration hooks --
     def pre_iteration(self, h: ClusterHandle, iteration: int) -> None:
         if self._mode == MANUAL:

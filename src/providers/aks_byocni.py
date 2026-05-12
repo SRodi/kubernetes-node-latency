@@ -16,6 +16,12 @@ class AKSBYOCNIProvider(AKSProviderBase):
     def _az_create_cluster_args(self, cfg) -> list[str]:
         return ["--network-plugin", "none"]
 
+    def _network_describe(self) -> dict:
+        return {
+            "network_plugin": "none",
+            "cilium_chart_version": self.cfg.aks.byocni.cilium_chart_version,
+        }
+
     def _post_create(self, handle: ClusterHandle) -> None:
         b = self.cfg.aks.byocni
         log.info("installing Cilium %s via Helm onto %s", b.cilium_chart_version, handle.name)

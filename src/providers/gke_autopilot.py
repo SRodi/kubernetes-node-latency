@@ -64,3 +64,10 @@ class GKEAutopilotProvider(ClusterProvider):
 
     def cni_probe(self) -> CNIProbe:
         return get_probe("cilium_dpv2")
+
+    def describe(self, h: ClusterHandle) -> dict:
+        return {
+            "flavor": "autopilot",
+            "release_channel": self.cfg.release_channel,
+            "dataplane_v2": True,
+        }

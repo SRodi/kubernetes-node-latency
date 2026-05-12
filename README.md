@@ -136,6 +136,7 @@ Each run writes to `results/<run_id>/`:
 
 ```
 results/20260512-085541/
+├── run_metadata.json      # run identity, effective config, cluster + CNI facts
 ├── raw_events.jsonl       # every watcher event for offline replay
 ├── iterations.csv         # per-iteration row (T0..T4 + derived metrics)
 ├── summary.csv            # aggregate stats per metric

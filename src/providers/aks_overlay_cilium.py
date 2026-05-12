@@ -14,3 +14,10 @@ class AKSOverlayCiliumProvider(AKSProviderBase):
             "--network-dataplane", "cilium",
             "--pod-cidr", "10.244.0.0/16",
         ]
+
+    def _network_describe(self) -> dict:
+        return {
+            "network_plugin": "azure",
+            "network_plugin_mode": "overlay",
+            "network_dataplane": "cilium",
+        }
