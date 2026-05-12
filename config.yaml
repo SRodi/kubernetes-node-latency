@@ -22,6 +22,11 @@ cni:
   probe: null             # cilium_dpv2 | cilium_generic | null
   ready_regex: null       # null = use probe default
   log_tail_lines: 5000
+  # Tier-1 deep-Cilium capture (also enabled via --deep-cilium):
+  # exec into the agent after T3 to record bootstrap timings + Prometheus
+  # metrics. Adds ~2-5s per iteration.
+  deep: false
+  metrics_ports: [9962, 9963, 9090]
 
 output:
   base_dir: results

@@ -21,6 +21,10 @@ class CNICfg:
     probe: str | None = None
     ready_regex: str | None = None
     log_tail_lines: int = 5000
+    # Tier-1 deep-Cilium capture: exec `cilium status -o json --verbose` and
+    # scrape the agent's Prometheus metrics endpoint after T3 fires.
+    deep: bool = False
+    metrics_ports: list[int] = dc.field(default_factory=lambda: [9962, 9963, 9090])
 
 
 @dc.dataclass

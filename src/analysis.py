@@ -15,6 +15,15 @@ METRICS = [
     "node_register_latency_s",
     "cilium_init_duration_s",
     "cni_induced_delay_s",
+    # Tier-1 deep-Cilium headlines — silently skipped when the column is
+    # absent or all-null (i.e. --deep-cilium not set).
+    "cilium_bootstrap_total_s",
+    "cilium_bootstrap_k8s_init_s",
+    "cilium_bootstrap_restore_s",
+    "cilium_bootstrap_bpf_base_s",
+    "cilium_bootstrap_ipam_s",
+    "cilium_bootstrap_proxy_s",
+    "cilium_endpoint_regen_avg_s",
 ]
 
 
@@ -29,6 +38,10 @@ def aggregate(df: pd.DataFrame) -> pd.DataFrame:
             continue
         s = pd.to_numeric(df[m], errors="coerce").dropna()
         if s.empty:
+            # Skip silently for optional deep-cilium columns; keep the
+            # placeholder for the always-present core metrics.
+            if m.startswith("cilium_bootstrap_") or m == "cilium_endpoint_regen_avg_s":
+                continue
             rows.append({"metric": m, "count": 0})
             continue
         rows.append({

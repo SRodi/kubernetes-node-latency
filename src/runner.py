@@ -114,6 +114,18 @@ def run_iterations(cfg: Config, handle: ClusterHandle, provider: ClusterProvider
                     sink.write("cni_probe_unavailable",
                                {"node": rec.node_name, "probe": probe.name})
 
+                if cfg.cni.deep and agent is not None and rec.T3_cilium_ready is not None:
+                    from .cilium_deep import collect as collect_deep
+                    iter_dir = run_dir / f"iter-{i:03d}"
+                    rec.deep_cilium = collect_deep(
+                        core, agent_pod=agent, probe=probe,
+                        iter_dir=iter_dir,
+                        metrics_ports=cfg.cni.metrics_ports,
+                    ) or None
+                    sink.write("cilium_deep_collected",
+                               {"iteration": i, "have_status": "bootstrap" in (rec.deep_cilium or {}),
+                                "have_metrics": "metrics" in (rec.deep_cilium or {})})
+
                 rec.status = "success"
             except TimeoutError as e:
                 rec.status = "timeout"

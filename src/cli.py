@@ -34,6 +34,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
     )
     if args.aks_node_provisioning is not None:
         cfg.aks.node_provisioning = args.aks_node_provisioning
+    if args.deep_cilium:
+        cfg.cni.deep = True
     run_id = args.run_id or time.strftime("%Y%m%d-%H%M%S")
     run_dir = Path(cfg.output.base_dir) / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -150,6 +152,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="reuse current kubeconfig context with this cluster name")
     pr.add_argument("--keep-cluster", action="store_true")
     pr.add_argument("--run-id", default=None)
+    pr.add_argument("--deep-cilium", action="store_true",
+                    help="exec into cilium-agent after T3 to capture "
+                         "`cilium status -o json --verbose` and Prometheus "
+                         "metrics; adds bootstrap/regen columns to iterations.csv")
     pr.set_defaults(func=_cmd_run)
 
     pa = sub.add_parser("analyze", help="re-aggregate stats from an existing run dir")

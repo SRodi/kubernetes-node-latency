@@ -38,8 +38,13 @@ class IterationRecord:
     status: str = "pending"  # pending|success|timeout|error
     error: str | None = None
 
+    # Tier-1 deep-Cilium headline numbers (None when --deep-cilium not set
+    # or when the agent pod was unreachable).
+    deep_cilium: dict | None = None
+
     def to_row(self) -> dict:
-        return {
+        from .cilium_deep import headline_to_columns
+        row = {
             "iteration": self.iteration,
             "run_id": self.run_id,
             "provider": self.provider,
@@ -61,3 +66,5 @@ class IterationRecord:
             "status": self.status,
             "error": self.error,
         }
+        row.update(headline_to_columns(self.deep_cilium))
+        return row

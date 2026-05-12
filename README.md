@@ -142,6 +142,10 @@ results/20260512-085541/
 ├── summary.csv            # aggregate stats per metric
 ├── summary.md             # human-readable Markdown report
 ├── summary.json           # machine-readable summary
+├── iter-001/              # only with --deep-cilium: per-iteration Cilium artefacts
+│   ├── cilium_status.json        # `cilium status -o json --verbose` (bootstrap timings, IPAM, KPR…)
+│   ├── cilium_metrics.txt        # raw Prometheus dump
+│   └── cilium_deep_headline.json # parsed headline numbers (also merged into iterations.csv)
 └── plots/
     ├── box.png                  # distribution per metric
     ├── mean_stddev.png          # mean ± stddev bars
@@ -159,6 +163,22 @@ Re-analyze or re-plot without re-running, and overlay multiple runs:
 .venv/bin/python -m src.cli plot results/gke-run \
     --compare results/aks-run results/aks-byocni-run
 ```
+
+### Deep Cilium capture (`--deep-cilium`)
+
+Append `--deep-cilium` to any `run` command to exec into the cilium-agent
+on each new node right after T3 fires and capture:
+
+- `cilium status -o json --verbose` → per-phase **bootstrap** durations
+  (`k8sInit`, `restoreState`, `bpfBase`, `ipam`, `proxyInit`, `total`),
+  IPAM mode/health, kube-proxy-replacement mode, agent version.
+- The agent's Prometheus endpoint → `cilium_endpoint_regeneration_time_stats_seconds`
+  (avg per scope), `cilium_identity_count`, `cilium_bpf_map_pressure`.
+
+Headline numbers are merged into `iterations.csv` as
+`cilium_bootstrap_{total,k8s_init,restore,bpf_base,ipam,proxy}_s` and
+`cilium_endpoint_regen_avg_s`. Raw artefacts land under
+`results/<run_id>/iter-<NNN>/`. Adds ~2-5s per iteration; off by default.
 
 ## Architecture
 
