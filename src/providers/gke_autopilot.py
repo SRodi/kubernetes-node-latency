@@ -17,6 +17,8 @@ class GKEAutopilotProvider(ClusterProvider):
         self.cfg = cfg
 
     def _kubeconfig_path(self, cluster_name: str) -> Path:
+        if getattr(self.cfg, "kubeconfig_path", None):
+            return Path(self.cfg.kubeconfig_path)
         return Path.cwd() / f".kubeconfig-{self.name}-{cluster_name}"
 
     def create(self, cfg) -> ClusterHandle:

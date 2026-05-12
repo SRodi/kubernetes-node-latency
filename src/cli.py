@@ -34,6 +34,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
     run_dir = Path(cfg.output.base_dir) / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    # Per-run isolation so two terminals can run in parallel without collisions:
+    # 1. kubeconfig lives inside run_dir (unique by construction).
+    # 2. cluster name is suffixed with run_id, unless the user passed --cluster-name.
+    if cfg.kubeconfig_path is None:
+        cfg.kubeconfig_path = (run_dir / "kubeconfig").resolve()
+    if args.cluster_name is None and cfg.cluster_name_suffix is None:
+        # Last 6 chars of run_id keep the cluster name within cloud length limits.
+        cfg.cluster_name_suffix = run_id[-6:]
+    if cfg.cluster_name_suffix:
+        cfg.cluster_name = f"{cfg.cluster_name}-{cfg.cluster_name_suffix}"
+
     provider = providers.get(cfg.provider, cfg)
     if args.existing_cluster:
         cfg.cluster_name = args.existing_cluster

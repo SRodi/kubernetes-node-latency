@@ -110,6 +110,23 @@ AKS_LIVE_TEST=1 .venv/bin/python -m src.cli run --provider aks_overlay_cilium --
 
 > Cost note: each AKS run provisions a real cluster (and BYOCNI installs Cilium via Helm). Always let the harness `delete` the cluster, or pass `--keep-cluster` only for debugging.
 
+### Running multiple tests in parallel
+
+You can launch independent runs from separate terminals — each run gets:
+- Its own `results/<run_id>/` directory.
+- Its own kubeconfig at `results/<run_id>/kubeconfig` (no clobbering of `~/.kube/config` and no shared `.kubeconfig-*` file in cwd).
+- A unique cluster name suffixed with the last 6 chars of the `run_id` (e.g. `node-latency-test-152203`), so two parallel runs of the same provider don't try to create the same cluster.
+
+Pass `--cluster-name` explicitly to opt out of the suffix (useful with `--existing-cluster`).
+
+```bash
+# terminal A
+.venv/bin/python -m src.cli run --provider gke_autopilot --region europe-west1
+
+# terminal B (concurrent, independent)
+.venv/bin/python -m src.cli run --provider aks_overlay_cilium --region westeurope
+```
+
 ## Outputs
 
 Each run writes to `results/<run-id>/`:

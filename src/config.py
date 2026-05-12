@@ -78,6 +78,9 @@ class Config:
     iterations: int = 10
     per_iteration_timeout_s: int = 900
     node_settle_seconds: int = 30
+    # Per-run isolation (set by CLI; enables parallel runs from different terminals).
+    kubeconfig_path: Path | None = None
+    cluster_name_suffix: str | None = None
     trigger_pod: TriggerPodCfg = dc.field(default_factory=TriggerPodCfg)
     cni: CNICfg = dc.field(default_factory=CNICfg)
     aks: AKSCfg = dc.field(default_factory=AKSCfg)
