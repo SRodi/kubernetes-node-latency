@@ -6,7 +6,7 @@ from pathlib import Path
 
 from ..cni import get as get_probe
 from ..cni.base import CNIProbe
-from ._cli import run
+from ._cli import run, run_with_retry
 from .base import ClusterHandle, ClusterProvider
 
 
@@ -48,10 +48,15 @@ class GKEAutopilotProvider(ClusterProvider):
     def delete(self, h: ClusterHandle) -> None:
         if not h.created:
             return
-        run([
-            "gcloud", "container", "clusters", "delete", h.name,
-            "--region", h.region, "--quiet",
-        ], check=False)
+        # Autopilot serializes control-plane ops; a trailing housekeeping op
+        # (autorepair, scale-down) can return a 400 "incompatible operation"
+        # right after the last iteration. Retry with backoff.
+        run_with_retry(
+            ["gcloud", "container", "clusters", "delete", h.name,
+             "--region", h.region, "--quiet"],
+            retry_on=("incompatible operation", "FAILED_PRECONDITION",
+                      "currently has operation"),
+        )
 
     def node_autoprovision_hint(self) -> dict:
         # Autopilot picks node class from pod resource requests; nothing extra needed.

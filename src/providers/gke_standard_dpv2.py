@@ -6,7 +6,7 @@ from pathlib import Path
 
 from ..cni import get as get_probe
 from ..cni.base import CNIProbe
-from ._cli import run
+from ._cli import run, run_with_retry
 from .base import ClusterHandle, ClusterProvider
 
 
@@ -52,10 +52,12 @@ class GKEStandardDPv2Provider(ClusterProvider):
     def delete(self, h: ClusterHandle) -> None:
         if not h.created:
             return
-        run([
-            "gcloud", "container", "clusters", "delete", h.name,
-            "--region", h.region, "--quiet",
-        ], check=False)
+        run_with_retry(
+            ["gcloud", "container", "clusters", "delete", h.name,
+             "--region", h.region, "--quiet"],
+            retry_on=("incompatible operation", "FAILED_PRECONDITION",
+                      "currently has operation"),
+        )
 
     def node_autoprovision_hint(self) -> dict:
         return {"nodeSelector": {}, "tolerations": []}
