@@ -58,6 +58,9 @@ def delete_pod(core: client.CoreV1Api, name: str, namespace: str) -> None:
         core.delete_namespaced_pod(name=name, namespace=namespace,
                                    grace_period_seconds=0, propagation_policy="Foreground")
     except client.ApiException as e:
+        if getattr(e, "status", None) == 404:
+            # Already gone (e.g. AKS NAP reaped the node + pod). Not an error.
+            return
         log.warning("delete pod %s failed: %s", name, e)
 
 
