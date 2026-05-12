@@ -23,10 +23,14 @@ cni:
   ready_regex: null       # null = use probe default
   log_tail_lines: 5000
   # Tier-1 deep-Cilium capture (also enabled via --deep-cilium):
-  # exec into the agent after T3 to record bootstrap timings + Prometheus
-  # metrics. Adds ~2-5s per iteration.
+  # one-shot scraper Pod per iteration, pinned to the new node, that curls
+  # the agent's PodIP:port/metrics. Works on every supported platform
+  # (incl. GKE Autopilot — no exec/proxy/hostNetwork required).
+  # Adds ~3-5s per iteration.
   deep: false
   metrics_ports: [9962, 9963, 9090]
+  deep_scraper_image: curlimages/curl:8.11.1
+  deep_scraper_namespace: default
 
 output:
   base_dir: results

@@ -143,8 +143,7 @@ results/20260512-085541/
 ├── summary.md             # human-readable Markdown report
 ├── summary.json           # machine-readable summary
 ├── iter-001/              # only with --deep-cilium: per-iteration Cilium artefacts
-│   ├── cilium_status.json        # `cilium status -o json --verbose` (bootstrap timings, IPAM, KPR…)
-│   ├── cilium_metrics.txt        # raw Prometheus dump
+│   ├── cilium_metrics.txt        # raw Prometheus dump from the agent on the new node
 │   └── cilium_deep_headline.json # parsed headline numbers (also merged into iterations.csv)
 └── plots/
     ├── box.png                  # distribution per metric
@@ -166,19 +165,32 @@ Re-analyze or re-plot without re-running, and overlay multiple runs:
 
 ### Deep Cilium capture (`--deep-cilium`)
 
-Append `--deep-cilium` to any `run` command to exec into the cilium-agent
-on each new node right after T3 fires and capture:
+Append `--deep-cilium` to any `run` command to scrape the Cilium agent's
+Prometheus `/metrics` endpoint on each new node right after T3 fires and
+capture:
 
-- `cilium status -o json --verbose` → per-phase **bootstrap** durations
-  (`k8sInit`, `restoreState`, `bpfBase`, `ipam`, `proxyInit`, `total`),
-  IPAM mode/health, kube-proxy-replacement mode, agent version.
-- The agent's Prometheus endpoint → `cilium_endpoint_regeneration_time_stats_seconds`
-  (avg per scope), `cilium_identity_count`, `cilium_bpf_map_pressure`.
+- **Bootstrap phase durations** from `cilium_bootstrap_seconds{scope=...}`
+  (`k8sInit`, `restoreState`, `bpfBase`, `ipam`, `proxyInit`, `total`).
+- `cilium_endpoint_regeneration_time_stats_seconds` (avg per scope),
+  `cilium_identity_count`, `cilium_bpf_map_pressure`, agent version.
 
 Headline numbers are merged into `iterations.csv` as
-`cilium_bootstrap_{total,k8s_init,restore,bpf_base,ipam,proxy}_s` and
-`cilium_endpoint_regen_avg_s`. Raw artefacts land under
-`results/<run_id>/iter-<NNN>/`. Adds ~2-5s per iteration; off by default.
+`cilium_bootstrap_{total,k8s_init,restore,bpf_base,ipam,proxy}_s`,
+`cilium_endpoint_regen_avg_s`, `cilium_identity_count`, and
+`cilium_version`. Raw artefacts land under
+`results/<run_id>/iter-<NNN>/`. Adds ~3-5s per iteration; off by default.
+
+**How it works (works on every supported platform, including GKE Autopilot).**
+A single-shot scraper Pod (`curlimages/curl`) is created in the `default`
+namespace, pinned to the new node via `nodeName` (no scheduler / no extra
+node provisioned), and curls `http://<agent-pod-ip>:<port>/metrics`.
+Because the Cilium agent runs `hostNetwork: true` everywhere (GKE `anetd`,
+AKS Azure-CNI cilium, AKS BYOCNI cilium), its PodIP equals the node IP and
+the metrics port is reachable from any same-node Pod — no `pods/exec`,
+`pods/proxy`, `hostNetwork`, or privileged operations are needed, so
+Autopilot's GKE Warden does not block it. The scraper Pod is deleted
+after each iteration. Override the image / namespace via
+`cni.deep_scraper_image` / `cni.deep_scraper_namespace` in `config.yaml`.
 
 ## Architecture
 

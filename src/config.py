@@ -21,10 +21,13 @@ class CNICfg:
     probe: str | None = None
     ready_regex: str | None = None
     log_tail_lines: int = 5000
-    # Tier-1 deep-Cilium capture: exec `cilium status -o json --verbose` and
-    # scrape the agent's Prometheus metrics endpoint after T3 fires.
+    # Tier-1 deep-Cilium capture: scrape the agent's Prometheus metrics
+    # endpoint after T3 fires, via a one-shot scraper Pod pinned to the new
+    # node (works on Autopilot, AKS distroless cilium, BYOCNI, etc.).
     deep: bool = False
     metrics_ports: list[int] = dc.field(default_factory=lambda: [9962, 9963, 9090])
+    deep_scraper_image: str = "curlimages/curl:8.11.1"
+    deep_scraper_namespace: str = "default"
 
 
 @dc.dataclass

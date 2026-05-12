@@ -119,11 +119,14 @@ def run_iterations(cfg: Config, handle: ClusterHandle, provider: ClusterProvider
                     iter_dir = run_dir / f"iter-{i:03d}"
                     rec.deep_cilium = collect_deep(
                         core, agent_pod=agent, probe=probe,
+                        node_name=rec.node_name,
                         iter_dir=iter_dir,
                         metrics_ports=cfg.cni.metrics_ports,
+                        scraper_image=cfg.cni.deep_scraper_image,
+                        scraper_namespace=cfg.cni.deep_scraper_namespace,
                     ) or None
                     sink.write("cilium_deep_collected",
-                               {"iteration": i, "have_status": "bootstrap" in (rec.deep_cilium or {}),
+                               {"iteration": i,
                                 "have_metrics": "metrics" in (rec.deep_cilium or {})})
 
                 rec.status = "success"

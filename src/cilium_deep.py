@@ -1,40 +1,47 @@
-"""Tier-1 "deep Cilium" capture.
+"""Tier-1 "deep Cilium" capture — universal scraper-Pod strategy.
 
-Once T3 fires for an iteration, exec into the cilium-agent pod on the new
-node and capture two artefacts:
+Once T3 fires, capture the Cilium agent's Prometheus metrics endpoint
+(`/metrics` on port 9962/9090/etc.) for the new node and persist them
+under `<run_dir>/iter-<NNN>/cilium_metrics.txt`. Headline numbers
+(bootstrap timings, endpoint-regen averages, identity count, agent
+version) are parsed from the metrics text and merged into
+`iterations.csv` via `headline_to_columns()`.
 
-  * `cilium status -o json --verbose` — has a `bootstrap` block with
-    per-phase durations (k8sInit, restoreState, daemonInit, bpfBase, ipam,
-    proxyInit, endpointRestore, total, …) plus controller, ipam, kvstore,
-    encryption, kube-proxy-replacement health.
-  * `curl -s localhost:<port>/metrics` — Prometheus exposition; we keep
-    the whole thing for offline analysis and parse a small set of
-    histograms (bootstrap, endpoint regeneration, BPF map pressure)
-    into headline numbers for `iterations.csv`.
+Why a scraper Pod (and not exec / pod-proxy / ephemeral container)?
+  GKE Autopilot's Warden blocks every operation that targets a
+  managed kube-system Pod (exec, proxy, ephemeral containers). And
+  Autopilot also blocks `hostNetwork: true` and privileged Pods. The
+  one technique that works on **all** platforms is a vanilla user-
+  namespace Pod that dials the agent's PodIP. Since the Cilium agent
+  always runs hostNetwork, its PodIP equals the node's primary IP, and
+  the metrics port is reachable from any Pod scheduled on the same
+  node — no special permissions required.
 
-Both artefacts are written under `<run_dir>/iter-<NNN>/`. Per-iteration
-headline numbers are merged into the IterationRecord via
-`apply_to_record()`.
+This also covers AKS Azure-CNI (distroless cilium image, no shell),
+AKS BYOCNI, GKE Standard DPv2, and any user-managed Cilium DaemonSet.
 
-This is opt-in (cfg.cni.deep) because the exec adds ~2-5s per iteration.
+Adds ~3-5s per iteration (scraper image pull is cached after iter 1).
 """
 from __future__ import annotations
 
 import json
 import logging
 import re
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
 from kubernetes import client
-from kubernetes.stream import stream
 
 log = logging.getLogger(__name__)
+
+DEFAULT_SCRAPER_IMAGE = "curlimages/curl:8.11.1"
+DEFAULT_SCRAPER_NAMESPACE = "default"
 
 
 # ---- Prometheus parsing ---------------------------------------------------
 
-# Match a single sample line: "name{labels} value [timestamp]"
 _PROM_LINE = re.compile(
     r"^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)"
     r"(?:\{(?P<labels>[^}]*)\})?\s+(?P<value>\S+)(?:\s+\d+)?\s*$"
@@ -63,21 +70,14 @@ def _iter_samples(metrics_text: str):
 
 
 def parse_metrics(metrics_text: str) -> dict[str, Any]:
-    """Pull a small set of headline numbers out of a Prometheus dump.
-
-    Headlines are stable across Cilium versions used by GKE/AKS:
-      * cilium_bootstrap_seconds (or cilium_agent_bootstrap_seconds) — per-scope
-      * cilium_endpoint_regeneration_time_stats_seconds — buckets per scope
-      * cilium_endpoint_state — gauge per state
-      * cilium_identity_count — gauge
-      * cilium_bpf_map_pressure — gauge per map
-    """
+    """Pull a small set of headline numbers out of a Prometheus dump."""
     bootstrap: dict[str, float] = {}
     regen_sums: dict[str, float] = {}
     regen_counts: dict[str, float] = {}
     endpoint_state: dict[str, float] = {}
     identity_count: float | None = None
     map_pressure_max: float = 0.0
+    version: str | None = None
 
     for name, labels, value in _iter_samples(metrics_text):
         if name in ("cilium_bootstrap_seconds", "cilium_agent_bootstrap_seconds"):
@@ -93,6 +93,10 @@ def parse_metrics(metrics_text: str) -> dict[str, Any]:
             identity_count = value
         elif name == "cilium_bpf_map_pressure":
             map_pressure_max = max(map_pressure_max, value)
+        elif name == "cilium_version" or name == "cilium_version_info":
+            v = labels.get("version") or labels.get("ver")
+            if v:
+                version = v
 
     regen_avg = {
         scope: (regen_sums[scope] / regen_counts[scope])
@@ -105,139 +109,249 @@ def parse_metrics(metrics_text: str) -> dict[str, Any]:
         "endpoint_state": endpoint_state,
         "identity_count": identity_count,
         "bpf_map_pressure_max": map_pressure_max,
+        "version": version,
     }
 
 
-# ---- exec helpers ---------------------------------------------------------
+# ---- scraper Pod ----------------------------------------------------------
 
-def _exec(core: client.CoreV1Api, *, namespace: str, pod: str, container: str,
-           command: list[str], timeout_s: int = 30) -> tuple[str, int]:
-    """Synchronously exec a command in a container; return (stdout, rc).
+def _scraper_manifest(*, name: str, namespace: str, node_name: str,
+                       agent_ip: str, ports: list[int], image: str) -> dict:
+    """Build a minimal Pod that curls the agent's metrics endpoint.
 
-    On any failure we return (stderr/exception text, non-zero rc) rather
-    than raising — deep-capture must never break a successful iteration.
+    Pinned to the same node via `nodeName` so:
+      * we never trigger autoscaler / NAP for this Pod, and
+      * traffic stays on-host for fastest path.
+
+    The shell tries each port in turn, prints a one-line probe summary
+    per port (HTTP code + bytes), then on the first port that returns
+    Cilium metrics, prints them and exits. Always exits 0 so diagnostic
+    output is preserved in pod logs even when no port works.
+
+    Resource requests are sized to satisfy Autopilot's per-Pod minimums
+    (250m CPU / 0.5 GiB) without pushing the new node out of headroom
+    (the trigger Pod requesting 1500m is still on it at this point).
     """
-    try:
-        resp = stream(
-            core.connect_get_namespaced_pod_exec,
-            pod, namespace, container=container, command=command,
-            stderr=True, stdin=False, stdout=True, tty=False,
-            _preload_content=False,
-        )
-        out_chunks: list[str] = []
-        err_chunks: list[str] = []
-        resp.run_forever(timeout=timeout_s)
-        if resp.peek_stdout():
-            out_chunks.append(resp.read_stdout())
-        if resp.peek_stderr():
-            err_chunks.append(resp.read_stderr())
-        rc = 0
+    port_list = " ".join(str(p) for p in ports)
+    script = (
+        f'set +e; AGENT_IP="{agent_ip}"; PORTS="{port_list}"; '
+        'for p in $PORTS; do '
+        '  body=$(curl -s -m 5 -o - -w "\\nHTTP=%{http_code} BYTES=%{size_download}\\n" '
+        '         "http://$AGENT_IP:$p/metrics" 2>&1); '
+        '  echo "=== probe port=$p ==="; '
+        '  echo "$body" | tail -3; '
+        '  if echo "$body" | grep -q "^cilium_"; then '
+        '    echo "=== METRICS port=$p ==="; '
+        '    echo "$body" | sed "/^HTTP=/d"; exit 0; '
+        '  fi; '
+        'done; exit 0'
+    )
+    return {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "labels": {"app": "node-startup-latency", "role": "cilium-scraper"},
+        },
+        "spec": {
+            "restartPolicy": "Never",
+            "nodeName": node_name,
+            "terminationGracePeriodSeconds": 1,
+            "containers": [{
+                "name": "scraper",
+                "image": image,
+                "command": ["sh", "-c", script],
+                "resources": {
+                    "requests": {"cpu": "250m", "memory": "512Mi"},
+                    "limits": {"cpu": "500m", "memory": "512Mi"},
+                },
+            }],
+        },
+    }
+
+
+def _wait_pod_terminal(core: client.CoreV1Api, *, namespace: str, name: str,
+                        timeout_s: int) -> str | None:
+    """Poll until Pod phase is Succeeded/Failed; return the phase or None."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
         try:
-            status = resp.read_channel(3, timeout=2)  # error channel
-            if status:
-                payload = json.loads(status)
-                if payload.get("status") == "Failure":
-                    rc = int(((payload.get("details") or {}).get("causes") or [{}])
-                              [0].get("message", "1") or 1)
-        except Exception:
-            pass
-        out = "".join(out_chunks)
-        if rc != 0 and not out:
-            out = "".join(err_chunks)
-        return out, rc
-    except Exception as e:  # noqa: BLE001
-        log.warning("exec failed in %s/%s: %s", namespace, pod, e)
-        return f"exec_error: {e}", 1
-
-
-def fetch_status(core: client.CoreV1Api, *, namespace: str, pod: str,
-                  container: str) -> dict | None:
-    out, rc = _exec(core, namespace=namespace, pod=pod, container=container,
-                     command=["cilium", "status", "-o", "json", "--verbose"])
-    if rc != 0 or not out.strip():
-        log.info("cilium status unavailable on %s/%s (rc=%s)", namespace, pod, rc)
-        return None
-    try:
-        return json.loads(out)
-    except json.JSONDecodeError as e:
-        log.warning("cilium status returned non-JSON: %s", e)
-        return None
-
-
-def fetch_metrics(core: client.CoreV1Api, *, namespace: str, pod: str,
-                   container: str, ports: list[int]) -> str | None:
-    for port in ports:
-        out, rc = _exec(
-            core, namespace=namespace, pod=pod, container=container,
-            command=["sh", "-c",
-                     f"command -v curl >/dev/null && curl -sf http://127.0.0.1:{port}/metrics "
-                     f"|| wget -qO- http://127.0.0.1:{port}/metrics"],
-        )
-        if rc == 0 and out and "cilium_" in out:
-            log.debug("got Cilium metrics on port %d", port)
-            return out
-    log.info("cilium metrics not reachable on ports %s", ports)
+            p = core.read_namespaced_pod(name, namespace)
+        except client.ApiException as e:
+            log.debug("read scraper pod failed: %s", e.reason)
+            return None
+        phase = (p.status and p.status.phase) or "Pending"
+        if phase in ("Succeeded", "Failed"):
+            return phase
+        time.sleep(0.5)
     return None
+
+
+def _delete_pod_quiet(core: client.CoreV1Api, namespace: str, name: str) -> None:
+    try:
+        core.delete_namespaced_pod(
+            name, namespace,
+            body=client.V1DeleteOptions(grace_period_seconds=0,
+                                         propagation_policy="Background"))
+    except client.ApiException as e:
+        if e.status not in (404, 410):
+            log.debug("scraper cleanup failed: %s", e.reason)
+
+
+def _resolve_agent_ip(core: client.CoreV1Api, *, namespace: str, name: str,
+                       retries: int = 8, backoff_s: float = 2.0) -> str | None:
+    """Re-fetch the agent Pod until PodIP is populated (or retries exhausted)."""
+    for _ in range(retries):
+        try:
+            p = core.read_namespaced_pod(name, namespace)
+        except client.ApiException as e:
+            log.debug("agent pod re-read failed: %s", e.reason)
+            return None
+        ip = (p.status and p.status.pod_ip) or None
+        if ip:
+            return ip
+        time.sleep(backoff_s)
+    return None
+
+
+def fetch_metrics(core: client.CoreV1Api, *, agent_pod, node_name: str,
+                   ports: list[int], image: str = DEFAULT_SCRAPER_IMAGE,
+                   namespace: str = DEFAULT_SCRAPER_NAMESPACE,
+                   timeout_s: int = 60) -> str | None:
+    """Run a one-shot scraper Pod against the agent's PodIP, return its log.
+
+    Returns the metrics text on success, None on any failure (the iteration
+    must never break because of deep capture). The returned text may include
+    a short diagnostic preamble from the scraper (per-port HTTP probe lines)
+    above a `=== METRICS port=<P> ===` separator.
+    """
+    agent_ip = (agent_pod.status and agent_pod.status.pod_ip) or None
+    if not agent_ip:
+        # The snapshot from T3 may predate PodIP assignment (common on
+        # Autopilot where anetd reports Ready before its hostNetwork IP
+        # is wired up). Re-resolve from the API with a short backoff.
+        agent_ip = _resolve_agent_ip(
+            core, namespace=agent_pod.metadata.namespace,
+            name=agent_pod.metadata.name)
+    if not agent_ip:
+        log.info("agent pod has no PodIP yet; skipping deep capture")
+        return None
+
+    name = f"cilium-scrape-{uuid.uuid4().hex[:8]}"
+    manifest = _scraper_manifest(name=name, namespace=namespace,
+                                  node_name=node_name, agent_ip=agent_ip,
+                                  ports=ports, image=image)
+    try:
+        core.create_namespaced_pod(namespace, manifest)
+    except client.ApiException as e:
+        log.warning("scraper pod create failed (%s): %s", e.status, e.reason)
+        return None
+
+    try:
+        phase = _wait_pod_terminal(core, namespace=namespace, name=name,
+                                    timeout_s=timeout_s)
+        if phase is None:
+            log.info("scraper pod %s did not finish within %ss", name, timeout_s)
+            return None
+        logs = None
+        last_err: Exception | None = None
+        for _ in range(4):
+            try:
+                logs = core.read_namespaced_pod_log(
+                    name=name, namespace=namespace, container="scraper")
+                break
+            except client.ApiException as e:
+                last_err = e
+                if e.status not in (400, 404):
+                    break
+                time.sleep(0.5)
+        if logs is None:
+            log.warning("scraper log read failed: %s",
+                         getattr(last_err, "reason", last_err))
+            return None
+        if not logs or "cilium_" not in logs:
+            tail = "\n".join((logs or "").splitlines()[-12:])
+            log.info("scraper pod returned no Cilium metrics on ports %s "
+                     "(phase=%s, log_len=%d). Tail: %s",
+                     ports, phase, len(logs or ""), tail or "(empty)")
+            return logs or None  # surface diag log to caller for persistence
+        return logs
+    finally:
+        _delete_pod_quiet(core, namespace, name)
 
 
 # ---- top-level entry ------------------------------------------------------
 
-def collect(core: client.CoreV1Api, *, agent_pod, probe, iter_dir: Path,
-             metrics_ports: list[int]) -> dict[str, Any]:
-    """Capture status + metrics for one agent pod; persist to iter_dir.
+def collect(core: client.CoreV1Api, *, agent_pod, probe, node_name: str,
+             iter_dir: Path, metrics_ports: list[int],
+             scraper_image: str = DEFAULT_SCRAPER_IMAGE,
+             scraper_namespace: str = DEFAULT_SCRAPER_NAMESPACE,
+             scraper_timeout_s: int = 60) -> dict[str, Any]:
+    """Collect Cilium metrics for the agent on `node_name`.
 
-    Returns a dict of headline numbers suitable for merging into
-    IterationRecord.deep_cilium.
+    Persists `cilium_metrics.txt` and `cilium_deep_headline.json` under
+    `iter_dir` only when something was actually captured (no empty dirs).
+    Returns the headline dict for merging into IterationRecord.
     """
-    iter_dir.mkdir(parents=True, exist_ok=True)
     headline: dict[str, Any] = {}
 
-    status = fetch_status(core, namespace=agent_pod.metadata.namespace,
-                          pod=agent_pod.metadata.name,
-                          container=probe.container_name)
-    if status is not None:
-        (iter_dir / "cilium_status.json").write_text(
-            json.dumps(status, indent=2, default=str))
-        bootstrap = (status.get("bootstrap") or {})
-        # Cilium reports bootstrap durations either as nanoseconds or as
-        # seconds-with-unit-suffix; normalise to float seconds.
-        b: dict[str, float] = {}
-        for k, v in bootstrap.items():
-            try:
-                if isinstance(v, (int, float)):
-                    # > 1e6 → almost certainly nanoseconds
-                    b[k] = float(v) / 1e9 if abs(v) > 1e6 else float(v)
-                elif isinstance(v, str) and v.endswith("ms"):
-                    b[k] = float(v[:-2]) / 1000.0
-                elif isinstance(v, str) and v.endswith("s"):
-                    b[k] = float(v[:-1])
-            except (TypeError, ValueError):
-                continue
-        headline["bootstrap"] = b
-        ipam = (status.get("ipam") or {}).get("status")
-        headline["ipam_mode"] = (status.get("ipam") or {}).get("mode")
-        headline["ipam_status"] = ipam
-        kpr = (status.get("kube-proxy-replacement") or {}).get("mode")
-        headline["kube_proxy_replacement"] = kpr
-        headline["cilium_version"] = (status.get("cilium") or {}).get("version")
+    raw = fetch_metrics(
+        core, agent_pod=agent_pod, node_name=node_name, ports=metrics_ports,
+        image=scraper_image, namespace=scraper_namespace,
+        timeout_s=scraper_timeout_s,
+    )
+    if not raw:
+        return headline
 
-    metrics_text = fetch_metrics(core, namespace=agent_pod.metadata.namespace,
-                                  pod=agent_pod.metadata.name,
-                                  container=probe.container_name,
-                                  ports=metrics_ports)
-    if metrics_text is not None:
-        (iter_dir / "cilium_metrics.txt").write_text(metrics_text)
-        headline["metrics"] = parse_metrics(metrics_text)
+    # Split off the scraper's diagnostic preamble (per-port HTTP probes).
+    # On success the log looks like:
+    #   === probe port=9962 ===
+    #   ...
+    #   === METRICS port=9962 ===
+    #   <prometheus text>
+    metrics_text = raw
+    diag_text = ""
+    sep_idx = raw.find("=== METRICS port=")
+    if sep_idx >= 0:
+        diag_text = raw[:sep_idx]
+        nl = raw.find("\n", sep_idx)
+        metrics_text = raw[nl + 1:] if nl >= 0 else ""
 
-    if headline:
-        (iter_dir / "cilium_deep_headline.json").write_text(
-            json.dumps(headline, indent=2, default=str))
+    iter_dir.mkdir(parents=True, exist_ok=True)
+    if diag_text:
+        (iter_dir / "scraper_probe.log").write_text(diag_text)
+
+    if "cilium_" not in metrics_text:
+        # No port returned metrics — keep diagnostics for inspection but bail.
+        (iter_dir / "scraper_probe.log").write_text(raw)
+        return headline
+
+    (iter_dir / "cilium_metrics.txt").write_text(metrics_text)
+    parsed = parse_metrics(metrics_text)
+    headline["metrics"] = parsed
+    if parsed.get("bootstrap"):
+        headline["bootstrap"] = parsed["bootstrap"]
+    if parsed.get("version"):
+        headline["cilium_version"] = parsed["version"]
+
+    # Best-effort: image tag from the agent pod is always available and gives
+    # us a reliable version when `cilium_version_info` isn't emitted.
+    try:
+        for c in (agent_pod.spec.containers or []):
+            if c.name == probe.container_name:
+                headline.setdefault("cilium_version", c.image)
+                break
+    except Exception:  # noqa: BLE001
+        pass
+
+    (iter_dir / "cilium_deep_headline.json").write_text(
+        json.dumps(headline, indent=2, default=str))
     return headline
 
 
 # ---- record integration ---------------------------------------------------
 
-# Stable column names exposed in iterations.csv when --deep-cilium is set.
 HEADLINE_COLUMNS = (
     "cilium_bootstrap_total_s",
     "cilium_bootstrap_k8s_init_s",
@@ -252,7 +366,6 @@ HEADLINE_COLUMNS = (
 
 
 def headline_to_columns(headline: dict[str, Any] | None) -> dict[str, Any]:
-    """Project the deep-cilium headline dict to the stable CSV columns."""
     if not headline:
         return {c: None for c in HEADLINE_COLUMNS}
     b = headline.get("bootstrap") or {}
