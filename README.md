@@ -1,28 +1,39 @@
 # node-startup-latency
 
-Automation for the **node startup latency** test plan: measures the time from
-triggering node provisioning to `Node Ready=True` on GKE Autopilot (Dataplane V2 /
-Cilium), with a provider abstraction so the same harness can later run on AKS
-(Azure CNI Powered by Cilium) and AKS BYOCNI + Cilium.
+Measures end-to-end **node startup latency** (`Pod created → Node Ready=True`)
+on managed Kubernetes platforms, with a uniform measurement methodology across
+GKE Autopilot, GKE Standard with Dataplane V2, AKS with Azure CNI Powered by
+Cilium, and AKS BYOCNI + upstream Cilium.
 
-## What it measures
+## Methodology
 
-Per iteration, the harness records five timestamps:
+Each iteration submits a single resource-heavy trigger Pod with `podAntiAffinity`
+against earlier iterations, forcing the platform to provision a brand-new node
+VM, while the harness watches the Kubernetes API to capture five timestamps
+from a common cluster clock: T0 Pod created, T1 Node registered, T2 CNI agent
+container started, T3 CNI agent Ready, T4 Node `Ready=True`. The primary KPI
+is `node_startup_latency = T4 − T0`; CNI's contribution is `T3 − T2` (parallel
+with node init) and any CNI-induced delay is `max(0, T3 − T4)`. The same code
+path runs across all four providers — only the cluster-creation primitive and
+the new-node trigger mechanism (Autopilot / NAP / cluster-autoscaler / manual
+scale) differ per platform.
+
+### Timestamps and derived metrics
 
 | Marker | Source |
 |---|---|
-| **T0** Pod created (provisioning trigger) | `Pod.metadata.creationTimestamp` |
+| **T0** Pod created | `Pod.metadata.creationTimestamp` |
 | **T1** Node registered | new `Node` first observed via watch (`creationTimestamp`) |
 | **T2** CNI agent container started | `pod.status.containerStatuses[*].state.running.startedAt` |
-| **T3** CNI agent reports ready | log line matching `ready_regex` (Cilium) |
+| **T3** CNI agent Ready | agent Pod's `Ready` condition `lastTransitionTime` |
 | **T4** Node `Ready=True` | `Node.status.conditions[Ready].lastTransitionTime` |
 
 Derived metrics (seconds):
 
-- `node_startup_latency_s = T4 − T0` *(primary KPI)*
+- `node_startup_latency_s  = T4 − T0` *(primary KPI)*
 - `node_register_latency_s = T1 − T0`
-- `cilium_init_duration_s = T3 − T2`
-- `cni_induced_delay_s   = max(T4 − T3, 0)`
+- `cilium_init_duration_s  = T3 − T2`
+- `cni_induced_delay_s     = max(T4 − T3, 0)`
 
 ## Install
 
@@ -31,12 +42,14 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-Pre-reqs depending on provider:
+Per-provider prerequisites:
 
-- `gke_autopilot` / `gke_standard_dpv2`: `gcloud` CLI authenticated.
-- `aks_overlay_cilium` / `aks_byocni`: stubs (raise `NotImplementedError`) —
-  provision out-of-band and use `--provider existing` for now.
-- `existing`: a working `kubeconfig` for the target cluster.
+| Providers | Required tools |
+|---|---|
+| `gke_autopilot`, `gke_standard_dpv2` | `gcloud` authenticated |
+| `aks_overlay_cilium` | `az` logged in (`az login`), `kubectl` |
+| `aks_byocni` | `az` logged in, `kubectl`, `helm` |
+| `existing` | a working `kubeconfig` for the target cluster |
 
 ## Run
 
@@ -47,27 +60,28 @@ Pre-reqs depending on provider:
     --iterations 10
 ```
 
-Other providers:
+One command per supported scenario:
 
 ```bash
-# Re-use a cluster you already created
-.venv/bin/python -m src.cli run --provider existing --iterations 5
+# GKE Autopilot (managed Cilium / Dataplane V2)
+.venv/bin/python -m src.cli run --provider gke_autopilot     --region europe-west1 --iterations 10
 
 # GKE Standard with Dataplane V2 (Cilium)
-.venv/bin/python -m src.cli run --provider gke_standard_dpv2 --region europe-west1
+.venv/bin/python -m src.cli run --provider gke_standard_dpv2 --region europe-west1 --iterations 10
 
 # AKS with Azure CNI Powered by Cilium (managed dataplane)
-.venv/bin/python -m src.cli run --provider aks_overlay_cilium --region westeurope
+.venv/bin/python -m src.cli run --provider aks_overlay_cilium --region westeurope --iterations 10
 
 # AKS BYOCNI + upstream Cilium installed via Helm
-.venv/bin/python -m src.cli run --provider aks_byocni --region westeurope
+.venv/bin/python -m src.cli run --provider aks_byocni        --region westeurope --iterations 10
+
+# Re-use a cluster you already created
+.venv/bin/python -m src.cli run --provider existing --iterations 5
 ```
 
-### AKS prerequisites
+### AKS configuration
 
-- `az` CLI logged in (`az login`) with rights to create resource groups and AKS clusters.
-- `helm` (only for `aks_byocni`) and `kubectl` on `PATH`.
-- Configure provider-specific settings under the `aks:` block in `config.yaml`:
+Set provider-specific options under the `aks:` block in `config.yaml`:
 
 ```yaml
 provider: aks_overlay_cilium      # or aks_byocni
@@ -85,7 +99,7 @@ aks:
     name: latencypool
     vm_size: Standard_D4s_v5
     min_count: 0
-    max_count: 50                 # bump if you plan many iterations; CA holds nodes ~10min before scale-down
+    max_count: 50                 # CA holds nodes ~10 min before scale-down
     node_count: 0                 # baseline; manual mode scales to N+1 each iteration
   byocni:                         # only consumed by aks_byocni
     cilium_chart_version: "1.19.3"
@@ -97,42 +111,31 @@ aks:
   keep_resource_group: true
 ```
 
-Trigger modes:
-- `cluster_autoscaler` (default): user pool starts at `node_count`, CA scales up to satisfy each trigger Pod.
-- `nap`: enables AKS Node Auto-Provisioning; no user pool is added.
-- `manual`: harness scales the user pool by +1 before each iteration and back down after.
+`node_provisioning` can also be set per run with `--aks-node-provisioning {cluster_autoscaler|nap|manual}`.
 
-Live AKS smoke test (opt-in):
+| Mode | Behavior |
+|---|---|
+| `cluster_autoscaler` (default) | User pool starts at `node_count`; CA scales up to satisfy each trigger Pod. |
+| `nap` | AKS Node Auto-Provisioning enabled; no user pool added. Closest analog to Autopilot. |
+| `manual` | Harness scales the user pool by +1 before each iteration and back down after. |
 
-```bash
-AKS_LIVE_TEST=1 .venv/bin/python -m src.cli run --provider aks_overlay_cilium --iterations 1
-```
-
-> Cost note: each AKS run provisions a real cluster (and BYOCNI installs Cilium via Helm). Always let the harness `delete` the cluster, or pass `--keep-cluster` only for debugging.
+> **Cost note**: each run provisions a real cluster. Always let the harness
+> `delete` it; pass `--keep-cluster` only for debugging.
 
 ### Running multiple tests in parallel
 
-You can launch independent runs from separate terminals — each run gets:
-- Its own `results/<run_id>/` directory.
-- Its own kubeconfig at `results/<run_id>/kubeconfig` (no clobbering of `~/.kube/config` and no shared `.kubeconfig-*` file in cwd).
-- A unique cluster name suffixed with the last 6 chars of the `run_id` (e.g. `node-latency-test-152203`), so two parallel runs of the same provider don't try to create the same cluster.
-
-Pass `--cluster-name` explicitly to opt out of the suffix (useful with `--existing-cluster`).
-
-```bash
-# terminal A
-.venv/bin/python -m src.cli run --provider gke_autopilot --region europe-west1
-
-# terminal B (concurrent, independent)
-.venv/bin/python -m src.cli run --provider aks_overlay_cilium --region westeurope
-```
+Independent runs from separate terminals are safe. Each run gets its own
+`results/<run_id>/` directory, its own kubeconfig at
+`results/<run_id>/kubeconfig`, and a unique cluster name suffixed with the
+last 6 chars of the `run_id` (e.g. `node-latency-test-152203`). Pass
+`--cluster-name` explicitly to opt out of the suffix.
 
 ## Outputs
 
-Each run writes to `results/<run-id>/`:
+Each run writes to `results/<run_id>/`:
 
 ```
-results/20251001-120000/
+results/20260512-085541/
 ├── raw_events.jsonl       # every watcher event for offline replay
 ├── iterations.csv         # per-iteration row (T0..T4 + derived metrics)
 ├── summary.csv            # aggregate stats per metric
@@ -140,19 +143,18 @@ results/20251001-120000/
 ├── summary.json           # machine-readable summary
 └── plots/
     ├── box.png                  # distribution per metric
-    ├── mean_stddev.png          # mean +/- stddev bars
+    ├── mean_stddev.png          # mean ± stddev bars
     ├── phase_stacked.png        # T0..T4 breakdown per iteration
     ├── latency_vs_iteration.png # drift / warm-up effects
     └── cdf.png                  # CDF with p50/p90/p99 markers
 ```
 
-### Re-analyze / re-plot without re-running
+Re-analyze or re-plot without re-running, and overlay multiple runs:
 
 ```bash
-.venv/bin/python -m src.cli analyze results/<run-id>
-.venv/bin/python -m src.cli plot    results/<run-id>
+.venv/bin/python -m src.cli analyze results/<run_id>
+.venv/bin/python -m src.cli plot    results/<run_id>
 
-# Cross-provider comparison overlay
 .venv/bin/python -m src.cli plot results/gke-run \
     --compare results/aks-run results/aks-byocni-run
 ```
@@ -161,35 +163,30 @@ results/20251001-120000/
 
 ```
 src/
-├── cli.py                  # argparse entrypoint (run|analyze|plot|clean)
-├── config.py               # YAML + dataclass config
-├── runner.py               # iteration loop
-├── collectors.py           # K8s watchers + Cilium log scan
-├── records.py              # IterationRecord + derived metrics
-├── analysis.py             # pandas aggregation -> CSV/MD/JSON
-├── plotting.py             # matplotlib charts + --compare
-├── providers/              # cluster lifecycle per cloud
-│   ├── base.py             #   ClusterProvider Protocol
+├── cli.py             argparse entrypoint (run|analyze|plot|clean)
+├── config.py          YAML + dataclass config
+├── runner.py          iteration loop
+├── collectors.py      K8s watchers, T0..T4 capture, cordon helpers
+├── records.py         IterationRecord + derived metrics
+├── analysis.py        pandas aggregation -> CSV/MD/JSON
+├── plotting.py        matplotlib charts + --compare overlay
+├── providers/         cluster lifecycle per cloud (ClusterProvider Protocol)
 │   ├── gke_autopilot.py
 │   ├── gke_standard_dpv2.py
-│   ├── aks_overlay_cilium.py  # stub
-│   ├── aks_byocni.py          # stub
+│   ├── aks_overlay_cilium.py
+│   ├── aks_byocni.py
 │   └── existing.py
-└── cni/                    # Cilium "ready" signal detection
-    ├── base.py
-    ├── cilium_dpv2.py      # GKE Dataplane V2 (anetd)
-    └── cilium_generic.py   # upstream Cilium (AKS managed / BYOCNI)
+└── cni/               CNI ready-signal probes
+    ├── cilium_dpv2.py     # GKE Dataplane V2 (anetd)
+    └── cilium_generic.py  # upstream Cilium (AKS managed / BYOCNI)
 ```
 
-### Adding a provider
-
-1. Create `src/providers/<name>.py` implementing `ClusterProvider`
-   (`create`, `get_credentials`, `delete`, `node_autoprovision_hint`, `cni_probe`).
-2. Register it in `src/providers/__init__.py`.
-3. If the CNI ready-line differs, add a `CNIProbe` under `src/cni/`.
-
-The runner, collectors, analysis, and plotting modules are cloud-agnostic, so
-any new provider produces results in the same schema as existing ones.
+To add a provider, implement `ClusterProvider` in `src/providers/<name>.py`
+(`create`, `get_credentials`, `delete`, `node_autoprovision_hint`,
+`cni_probe`, optional `pre_iteration`/`post_iteration`), register it in
+`src/providers/__init__.py`, and add a `CNIProbe` under `src/cni/` if the
+agent's labels or ready signal differ. Runner, collectors, analysis, and
+plotting are cloud-agnostic.
 
 ## Tests
 
@@ -197,64 +194,51 @@ any new provider produces results in the same schema as existing ones.
 .venv/bin/python -m pytest tests/ -v
 ```
 
-Unit tests cover the parsers, derived-metric math, aggregation, and end-to-end
-emission of CSV / Markdown / JSON / plots from synthetic fixtures.
+Unit tests cover parsers, derived-metric math, aggregation, plotting from
+synthetic fixtures, and mocked AKS provider invocations. Live AKS smoke test
+is opt-in:
+
+```bash
+AKS_LIVE_TEST=1 .venv/bin/python -m src.cli run --provider aks_overlay_cilium --iterations 1
+```
 
 ## Notes & caveats
 
-- **Cross-provider methodology — what's identical, what differs**:
-
-  *Identical across all providers (same code path):*
-  - Same trigger Pod (Jinja2 template, 1500m CPU / 2Gi RAM, `podAntiAffinity`
-    against earlier iterations).
-  - Same cordon of pre-existing nodes per iteration.
-  - Same T0–T4 capture (Pod `creationTimestamp`, Node `creationTimestamp`
-    via watch, CNI agent Pod `containerStarted` + `Ready` condition,
-    Node `Ready=True` `lastTransitionTime`).
-  - Same `not_before` filter, same resilient watch, same analysis & plots.
-
-  *Provisioning trigger differs by platform primitive:*
+- **Cross-platform comparability.** The measurement code path is identical
+  across providers, but the *node provisioning trigger* is platform-specific:
 
   | Provider | What causes the new VM |
   |---|---|
   | `gke_autopilot` | Autopilot node auto-provisioning (no pre-existing pool) |
   | `gke_standard_dpv2` | GKE cluster-autoscaler scales pool from `min=0` |
-  | `aks_overlay_cilium` (default `cluster_autoscaler`) | AKS cluster-autoscaler scales VMSS from `min=0` |
-  | `aks_overlay_cilium` (`nap` mode, opt-in) | AKS Node Auto-Provisioning (closest analog to Autopilot) |
-  | `aks_overlay_cilium` (`manual` mode, opt-in) | Harness scales nodepool +1 directly (CA out of loop) |
-  | `aks_byocni` | Same as overlay (default CA, optional NAP/manual) |
+  | `aks_overlay_cilium` / `aks_byocni` (`cluster_autoscaler`, default) | AKS cluster-autoscaler scales VMSS from `min=0` |
+  | `aks_overlay_cilium` / `aks_byocni` (`nap`) | AKS Node Auto-Provisioning |
+  | `aks_overlay_cilium` / `aks_byocni` (`manual`) | Harness scales nodepool +1 directly |
 
-  *Caveat — `T1 − T0` is not strictly apples-to-apples across all four:*
-  Autopilot bakes provisioning into the platform; CA-driven runs (the AKS
-  default and GKE Standard) include the autoscaler's scan/decision time on
-  top of the cloud's VM-provision time. For the most-comparable cross-cloud
-  number, use `aks_overlay_cilium` (or `aks_byocni`) with
+  As a result, `T1 − T0` is not strictly apples-to-apples: CA-driven runs
+  include the autoscaler scan/decision time on top of cloud VM provisioning.
+  For the most-comparable cross-cloud number, run AKS with
   `node_provisioning: nap` against `gke_autopilot`. `T4 − T1` (Ready after
   registration) and `T3 − T2` (Cilium init) are unaffected by the trigger
-  mechanism and remain directly comparable across all four runs.
+  mechanism and remain directly comparable across all providers.
 
-- **Phase chart semantics**: the stacked bar always sums to
-  `node_startup_latency_s = T4 − T0` and is split into
-  *VM provision + node registered* (T0→T1) and *node init to Ready* (T1→T4).
-  The Cilium agent's init duration (T3 − T2) is overlaid as a black diamond
-  line because it is a **parallel** signal that on GKE Autopilot typically
-  completes **after** T4 — i.e. CNI does not delay node readiness on
-  Autopilot. When `cni_induced_delay_s == 0` consistently, that is the
-  intended finding, not a missing measurement.
-- **T2/T3 capture path**: T2 (CNI agent container started) and T3 (CNI ready)
-  are read from the agent Pod's `status.containerStatuses[].state.running.startedAt`
-  and `Ready` condition `lastTransitionTime` — *not* from log scraping. This
-  avoids a transient race on Autopilot where the konnectivity tunnel to a
-  brand-new node isn't ready yet, so `kubectl logs` against that node returns
-  `No agent available` for a few seconds (logs work normally once the node
-  settles). Log scraping is kept only as a fallback. If the agent Pod can't be
-  located within the timeout, T2/T3 are emitted as `null` and the iteration
-  still records T0/T1/T4 (node startup latency is always measured).
-- **Forcing fresh nodes**: trigger pods request 1500m CPU / 2Gi RAM by default
-  with strict `podAntiAffinity` against earlier iterations, so each iteration
-  needs a brand-new node on Autopilot. Tune in `config.yaml` for other providers.
-- **Cost**: each iteration creates a node VM. The pod is torn down between
-  iterations and Autopilot reaps idle nodes; for GKE Standard the autoscaler
-  is configured `min=0`.
-- **Replay**: `raw_events.jsonl` lets you re-run `analyze`/`plot` offline
-  without burning more cloud resources.
+- **Phase chart semantics.** The stacked bar in `phase_stacked.png` always
+  sums to `node_startup_latency_s = T4 − T0`, split into *VM provision +
+  node registered* (T0→T1) and *node init to Ready* (T1→T4). Cilium's init
+  duration (T3 − T2) is overlaid as a black diamond line because it runs
+  in **parallel** and on GKE Autopilot typically completes *after* T4.
+  When `cni_induced_delay_s == 0` consistently, that is the intended
+  finding, not a missing measurement.
+
+- **T2/T3 capture path.** T2 and T3 are read from the agent Pod's status
+  (`containerStatuses[].state.running.startedAt` and the `Ready` condition
+  `lastTransitionTime`) — *not* from log scraping. This avoids a transient
+  race on Autopilot where the konnectivity tunnel to a brand-new node isn't
+  ready yet and `kubectl logs` returns `No agent available` for a few
+  seconds (logs work normally once the node settles). Log scraping is kept
+  as a fallback. If the agent Pod can't be located within the timeout,
+  T2/T3 are emitted as `null` and the iteration still records T0/T1/T4
+  (the primary KPI is always measured).
+
+- **Replay.** `raw_events.jsonl` lets you re-run `analyze`/`plot` offline
+  without re-provisioning clusters.
