@@ -20,15 +20,6 @@ spec:
     {% for t in tolerations %}- {{ t | tojson }}
     {% endfor %}
   {% endif %}
-  affinity:
-    podAntiAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        - labelSelector:
-            matchExpressions:
-              - key: app
-                operator: In
-                values: ["node-startup-latency"]
-          topologyKey: kubernetes.io/hostname
   containers:
     - name: pause
       image: {{ image }}
