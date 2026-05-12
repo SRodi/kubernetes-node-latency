@@ -30,6 +30,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
         iterations=args.iterations,
         cluster_name=args.cluster_name,
     )
+    if args.aks_node_provisioning is not None:
+        cfg.aks.node_provisioning = args.aks_node_provisioning
     run_id = args.run_id or time.strftime("%Y%m%d-%H%M%S")
     run_dir = Path(cfg.output.base_dir) / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -127,6 +129,9 @@ def main(argv: list[str] | None = None) -> int:
     pr.add_argument("--region", default=None)
     pr.add_argument("--iterations", type=int, default=None)
     pr.add_argument("--cluster-name", default=None)
+    pr.add_argument("--aks-node-provisioning", default=None,
+                    choices=["cluster_autoscaler", "nap", "manual"],
+                    help="AKS only: how new nodes are provisioned per iteration")
     pr.add_argument("--existing-cluster", default=None,
                     help="reuse current kubeconfig context with this cluster name")
     pr.add_argument("--keep-cluster", action="store_true")
