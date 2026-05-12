@@ -202,6 +202,37 @@ emission of CSV / Markdown / JSON / plots from synthetic fixtures.
 
 ## Notes & caveats
 
+- **Cross-provider methodology — what's identical, what differs**:
+
+  *Identical across all providers (same code path):*
+  - Same trigger Pod (Jinja2 template, 1500m CPU / 2Gi RAM, `podAntiAffinity`
+    against earlier iterations).
+  - Same cordon of pre-existing nodes per iteration.
+  - Same T0–T4 capture (Pod `creationTimestamp`, Node `creationTimestamp`
+    via watch, CNI agent Pod `containerStarted` + `Ready` condition,
+    Node `Ready=True` `lastTransitionTime`).
+  - Same `not_before` filter, same resilient watch, same analysis & plots.
+
+  *Provisioning trigger differs by platform primitive:*
+
+  | Provider | What causes the new VM |
+  |---|---|
+  | `gke_autopilot` | Autopilot node auto-provisioning (no pre-existing pool) |
+  | `gke_standard_dpv2` | GKE cluster-autoscaler scales pool from `min=0` |
+  | `aks_overlay_cilium` (default `cluster_autoscaler`) | AKS cluster-autoscaler scales VMSS from `min=0` |
+  | `aks_overlay_cilium` (`nap` mode, opt-in) | AKS Node Auto-Provisioning (closest analog to Autopilot) |
+  | `aks_overlay_cilium` (`manual` mode, opt-in) | Harness scales nodepool +1 directly (CA out of loop) |
+  | `aks_byocni` | Same as overlay (default CA, optional NAP/manual) |
+
+  *Caveat — `T1 − T0` is not strictly apples-to-apples across all four:*
+  Autopilot bakes provisioning into the platform; CA-driven runs (the AKS
+  default and GKE Standard) include the autoscaler's scan/decision time on
+  top of the cloud's VM-provision time. For the most-comparable cross-cloud
+  number, use `aks_overlay_cilium` (or `aks_byocni`) with
+  `node_provisioning: nap` against `gke_autopilot`. `T4 − T1` (Ready after
+  registration) and `T3 − T2` (Cilium init) are unaffected by the trigger
+  mechanism and remain directly comparable across all four runs.
+
 - **Phase chart semantics**: the stacked bar always sums to
   `node_startup_latency_s = T4 − T0` and is split into
   *VM provision + node registered* (T0→T1) and *node init to Ready* (T1→T4).
