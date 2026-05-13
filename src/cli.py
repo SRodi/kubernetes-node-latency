@@ -64,6 +64,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
         # Snapshot run identity + cluster facts BEFORE iterations so a partial
         # run still has metadata. Finalised in the `finally` block below.
         core = load_kube(handle.kubeconfig)
+        # Probe apiserver reachability before any blocking call. Newly-created
+        # AKS HCP clusters intermittently take several minutes for the public
+        # apiserver endpoint to become routable from the harness host.
+        from .runner import wait_for_apiserver
+        if not wait_for_apiserver(core, timeout_s=600):
+            raise RuntimeError(
+                "apiserver did not become reachable within 10 minutes; "
+                "aborting before iterations.")
         meta = gather_metadata(cfg=cfg, handle=handle, provider=provider,
                                 core=core, run_id=run_id, cli_argv=sys.argv[1:])
         write_metadata(run_dir, meta)

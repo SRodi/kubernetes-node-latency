@@ -110,9 +110,9 @@ def _cni_image(core: client.CoreV1Api, probe) -> dict[str, str | None]:
 
 def _cluster_facts(core: client.CoreV1Api, probe, max_nodes: int = 5) -> dict[str, Any]:
     try:
-        nodes = core.list_node().items
-    except client.ApiException as e:
-        log.warning("cluster facts lookup failed: %s", e)
+        nodes = core.list_node(_request_timeout=(5, 30)).items
+    except Exception as e:  # noqa: BLE001 — connection, retry, and API errors all tolerated
+        log.warning("cluster facts lookup failed: %s: %s", type(e).__name__, e)
         return {"node_count_at_start": None, "nodes": [], "cni": None}
     sample = nodes[:max_nodes]
     return {

@@ -29,6 +29,39 @@ def load_kube(kubeconfig_path: Path) -> client.CoreV1Api:
     return client.CoreV1Api()
 
 
+def wait_for_apiserver(core: client.CoreV1Api, *, timeout_s: int = 600,
+                        poll_interval_s: float = 10.0) -> bool:
+    """Block until the apiserver answers a cheap call, or timeout.
+
+    Newly-created AKS clusters report ``provisioningState=Succeeded`` to the
+    Azure control plane several minutes before the HCP-fronted apiserver
+    hostname is actually reachable from the harness host. Without this probe
+    the very first ``list_node`` call would burn the urllib3 default retry
+    budget (3 × ~2-minute connect timeouts = ~6 minutes) before raising.
+
+    Uses ``_request_timeout=(connect=5, read=10)`` so we fail fast and retry
+    on a fresh interval. Returns True once the apiserver is reachable, False
+    if the timeout elapses.
+    """
+    deadline = time.monotonic() + timeout_s
+    last_err: Exception | None = None
+    attempt = 0
+    while time.monotonic() < deadline:
+        attempt += 1
+        try:
+            core.list_node(limit=1, _request_timeout=(5, 10))
+            log.info("apiserver reachable after %d attempt(s)", attempt)
+            return True
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            if attempt == 1 or attempt % 6 == 0:
+                log.info("waiting for apiserver (attempt %d): %s",
+                         attempt, type(e).__name__)
+            time.sleep(poll_interval_s)
+    log.warning("apiserver unreachable after %ss: %s", timeout_s, last_err)
+    return False
+
+
 def render_pod(cfg: Config, *, run_id: str, iteration: int, provider: ClusterProvider) -> dict:
     env = Environment(loader=FileSystemLoader(str(MANIFEST_DIR)),
                       autoescape=select_autoescape(disabled_extensions=("j2",)))
