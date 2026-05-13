@@ -289,9 +289,16 @@ def fetch_metrics(core: client.CoreV1Api, *, agent_pod, node_name: str,
         if phase is None:
             log.info("scraper pod %s did not finish within %ss", name, timeout_s)
             return None
+        # Brief settle wait: on a brand-new node the kubelet often reports
+        # phase=Succeeded ~2-3s before the apiserver's log endpoint is ready
+        # (containerStatuses not yet propagated). This is post-T4 / post-T3 so
+        # it has zero effect on the measured node-startup or cilium-init
+        # latencies — it only widens the window in which we can pull metrics.
+        time.sleep(2.0)
         logs = None
         last_err: Exception | None = None
-        for _ in range(4):
+        delay = 1.0
+        for attempt in range(12):
             try:
                 logs = core.read_namespaced_pod_log(
                     name=name, namespace=namespace, container="scraper")
@@ -300,9 +307,12 @@ def fetch_metrics(core: client.CoreV1Api, *, agent_pod, node_name: str,
                 last_err = e
                 if e.status not in (400, 404):
                     break
-                time.sleep(0.5)
+                if attempt == 0:
+                    log.debug("scraper log read transient %s; retrying", e.status)
+                time.sleep(delay)
+                delay = min(delay * 1.5, 2.0)
         if logs is None:
-            log.warning("scraper log read failed: %s",
+            log.warning("scraper log read failed after retries: %s",
                          getattr(last_err, "reason", last_err))
             return None
         if not logs or "cilium_" not in logs:

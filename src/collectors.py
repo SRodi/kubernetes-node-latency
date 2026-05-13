@@ -126,11 +126,19 @@ class Collector:
         """
         deadline = time.monotonic() + timeout_s
         cutoff = (not_before - timedelta(seconds=skew_tolerance_s)) if not_before else None
+        # Client-side HTTP read timeout for each watch invocation. AKS/GKE
+        # apiservers occasionally drop watch TCP streams without sending FIN,
+        # which leaves `w.stream()` blocked on a socket read indefinitely and
+        # the outer deadline never gets a chance to fire. Capping the read
+        # forces the inner loop to exit so we can re-open the watch.
+        read_timeout = min(120, max(30, timeout_s // 4))
         while time.monotonic() < deadline:
             remaining = max(1, int(deadline - time.monotonic()))
             w = watch.Watch()
             try:
-                for ev in w.stream(self.core.list_node, timeout_seconds=remaining):
+                for ev in w.stream(self.core.list_node,
+                                    timeout_seconds=remaining,
+                                    _request_timeout=(10, read_timeout)):
                     node = ev["object"]
                     name = node.metadata.name
                     if name in before_nodes:
@@ -144,6 +152,12 @@ class Collector:
                         continue
                     self.sink.write("node_added", {"name": name, "creationTimestamp": ts.isoformat()})
                     return name, ts
+            except Exception as e:  # noqa: BLE001
+                # ReadTimeoutError / ProtocolError / chunked-encoding errors:
+                # treat as a transient watch drop and re-open. Log once per
+                # occurrence so silent hangs are visible in raw_events.
+                self.sink.write("node_watch_reopen", {"error": type(e).__name__,
+                                                       "msg": str(e)[:200]})
             finally:
                 w.stop()
             # apiserver closed the stream early; loop and re-watch with remaining budget.
@@ -152,19 +166,25 @@ class Collector:
     # ----- T4: Ready=True transition -----
     def wait_for_node_ready(self, node_name: str, timeout_s: int) -> datetime:
         deadline = time.monotonic() + timeout_s
+        read_timeout = min(120, max(30, timeout_s // 4))
         while time.monotonic() < deadline:
             remaining = max(1, int(deadline - time.monotonic()))
             w = watch.Watch()
             try:
                 for ev in w.stream(self.core.list_node,
                                    field_selector=f"metadata.name={node_name}",
-                                   timeout_seconds=remaining):
+                                   timeout_seconds=remaining,
+                                   _request_timeout=(10, read_timeout)):
                     node = ev["object"]
                     for cond in (node.status.conditions or []):
                         if cond.type == "Ready" and cond.status == "True":
                             ts = _parse_k8s_time(cond.last_transition_time) or utcnow()
                             self.sink.write("node_ready", {"name": node_name, "ts": ts.isoformat()})
                             return ts
+            except Exception as e:  # noqa: BLE001
+                self.sink.write("node_ready_watch_reopen",
+                                {"node": node_name, "error": type(e).__name__,
+                                 "msg": str(e)[:200]})
             finally:
                 w.stop()
         raise TimeoutError(f"node {node_name} did not become Ready before timeout")
@@ -190,11 +210,13 @@ class Collector:
         """
         t2: datetime | None = None
         t3: datetime | None = None
+        read_timeout = min(120, max(30, timeout_s // 4))
         w = watch.Watch()
         try:
             for ev in w.stream(
                 self.core.list_namespaced_pod, namespace=self.probe.namespace,
                 field_selector=f"metadata.name={pod_name}", timeout_seconds=timeout_s,
+                _request_timeout=(10, read_timeout),
             ):
                 pod = ev["object"]
                 if t2 is None:
