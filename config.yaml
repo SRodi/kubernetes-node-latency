@@ -14,8 +14,11 @@ node_settle_seconds: 30   # wait this long after pod cleanup before next iterati
 trigger_pod:
   namespace: default
   image: registry.k8s.io/pause:3.9
-  cpu: "1500m"
-  memory: "2Gi"
+  # 6 vCPU / 16 GiB forces AKS NAP to provision a D8-class SKU (8 vCPU /
+  # 32 GiB) so cross-provider runs aren't skewed by per-node headroom.
+  # GKE Autopilot already lands on ek-standard-8 by default.
+  cpu: "6000m"
+  memory: "16Gi"
 
 cni:
   # Override the CNIProbe; null = pick the one paired with the provider.
@@ -52,11 +55,11 @@ aks:
   keep_resource_group: true   # don't delete the RG on cluster delete
   system_node_pool:
     name: systempool
-    vm_size: Standard_D4s_v5
+    vm_size: Standard_D8s_v5     # 8 vCPU / 32 GiB — parity with GKE ek-standard-8
     node_count: 1
   user_node_pool:             # the autoscaling pool that hosts trigger pods
     name: latencypool
-    vm_size: Standard_D4s_v5
+    vm_size: Standard_D8s_v5     # 8 vCPU / 32 GiB — parity with GKE ek-standard-8
     min_count: 0
     max_count: 50
     node_count: 0

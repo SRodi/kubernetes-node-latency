@@ -12,8 +12,14 @@ import yaml
 class TriggerPodCfg:
     namespace: str = "default"
     image: str = "registry.k8s.io/pause:3.9"
-    cpu: str = "1500m"
-    memory: str = "2Gi"
+    # Sized to force AKS NAP (Karpenter) to provision an 8-vCPU / 32-GiB
+    # SKU (e.g. Standard_D8s_v5), matching GKE Autopilot's default
+    # `ek-standard-8` node class. NAP picks the cheapest SKU that fits the
+    # pod request plus system overhead; 6000m / 16Gi rules out D2/D4 SKUs.
+    # GKE Autopilot accommodates this just as easily (single pod, no impact
+    # on its node-class selection since it already lands on ek-standard-8).
+    cpu: str = "6000m"
+    memory: str = "16Gi"
 
 
 @dc.dataclass
@@ -34,7 +40,11 @@ class CNICfg:
 @dc.dataclass
 class AKSNodePoolCfg:
     name: str = "latencypool"
-    vm_size: str = "Standard_D4s_v5"
+    # Standard_D8s_v5 = 8 vCPU / 32 GiB RAM — matches GKE Autopilot's default
+    # `ek-standard-8` node class so cross-provider comparisons aren't skewed
+    # by per-node CPU/memory headroom (image-pull, container-start, BPF
+    # compilation all scale with CPU).
+    vm_size: str = "Standard_D8s_v5"
     min_count: int = 0
     max_count: int = 50
     node_count: int = 0
@@ -43,7 +53,7 @@ class AKSNodePoolCfg:
 @dc.dataclass
 class AKSSystemPoolCfg:
     name: str = "systempool"
-    vm_size: str = "Standard_D4s_v5"
+    vm_size: str = "Standard_D8s_v5"
     node_count: int = 1
 
 

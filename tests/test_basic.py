@@ -81,7 +81,7 @@ def test_config_from_dict_roundtrip():
     cfg = Config.from_dict({"provider": "existing", "iterations": 3})
     assert cfg.provider == "existing"
     assert cfg.iterations == 3
-    assert cfg.trigger_pod.cpu == "1500m"
+    assert cfg.trigger_pod.cpu == "6000m"
 
 
 # --- helpers for the new T2/T3 paths ---
