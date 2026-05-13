@@ -173,18 +173,33 @@ def _scraper_manifest(*, name: str, namespace: str, node_name: str,
 
 def _wait_pod_terminal(core: client.CoreV1Api, *, namespace: str, name: str,
                         timeout_s: int) -> str | None:
-    """Poll until Pod phase is Succeeded/Failed; return the phase or None."""
+    """Poll until Pod phase is Succeeded/Failed; return the phase or None.
+
+    Transient apiserver errors (the same 400/404/500/503 races that affect
+    log reads against a fresh node) are tolerated up to the deadline; only
+    a true timeout or a definitive 4xx/5xx terminates the wait.
+    """
     deadline = time.monotonic() + timeout_s
+    transient_statuses = (400, 404, 500, 503)
+    last_err_status: int | None = None
     while time.monotonic() < deadline:
         try:
             p = core.read_namespaced_pod(name, namespace)
         except client.ApiException as e:
-            log.debug("read scraper pod failed: %s", e.reason)
-            return None
+            last_err_status = e.status
+            if e.status not in transient_statuses:
+                log.info("scraper pod %s read failed (non-transient %s): %s",
+                         name, e.status, e.reason)
+                return None
+            time.sleep(0.5)
+            continue
         phase = (p.status and p.status.phase) or "Pending"
         if phase in ("Succeeded", "Failed"):
             return phase
         time.sleep(0.5)
+    if last_err_status is not None:
+        log.info("scraper pod %s never reached terminal phase within %ss "
+                 "(last apiserver status=%s)", name, timeout_s, last_err_status)
     return None
 
 
@@ -343,7 +358,7 @@ def collect(core: client.CoreV1Api, *, agent_pod, probe, node_name: str,
              iter_dir: Path, metrics_ports: list[int],
              scraper_image: str = DEFAULT_SCRAPER_IMAGE,
              scraper_namespace: str = DEFAULT_SCRAPER_NAMESPACE,
-             scraper_timeout_s: int = 60) -> dict[str, Any]:
+             scraper_timeout_s: int = 120) -> dict[str, Any]:
     """Collect Cilium metrics for the agent on `node_name`.
 
     Persists `cilium_metrics.txt` and `cilium_deep_headline.json` under
