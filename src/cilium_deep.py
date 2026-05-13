@@ -298,19 +298,30 @@ def fetch_metrics(core: client.CoreV1Api, *, agent_pod, node_name: str,
         logs = None
         last_err: Exception | None = None
         delay = 1.0
-        for attempt in range(12):
+        # Retry on transient apiserver/kubelet races against a freshly-spawned
+        # node:
+        #   400 — apiserver: "container is waiting to start" / containerStatus
+        #         not yet populated (AKS iter-1).
+        #   404 — apiserver hasn't observed the Pod yet.
+        #   500 — apiserver→kubelet log proxy not yet established (GKE iter-1).
+        #   503 — apiserver overloaded / kubelet temporarily unreachable.
+        # Budget: ~60s. This is post-T4 / post-T3 so it does not affect any
+        # primary or secondary latency measurement — only the success rate of
+        # the metrics scrape.
+        retry_statuses = (400, 404, 500, 503)
+        for attempt in range(30):
             try:
                 logs = core.read_namespaced_pod_log(
                     name=name, namespace=namespace, container="scraper")
                 break
             except client.ApiException as e:
                 last_err = e
-                if e.status not in (400, 404):
+                if e.status not in retry_statuses:
                     break
                 if attempt == 0:
                     log.debug("scraper log read transient %s; retrying", e.status)
                 time.sleep(delay)
-                delay = min(delay * 1.5, 2.0)
+                delay = min(delay * 1.4, 2.5)
         if logs is None:
             log.warning("scraper log read failed after retries: %s",
                          getattr(last_err, "reason", last_err))
