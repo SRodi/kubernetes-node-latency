@@ -67,8 +67,21 @@ def delete_pod(core: client.CoreV1Api, name: str, namespace: str) -> None:
 def run_iterations(cfg: Config, handle: ClusterHandle, provider: ClusterProvider,
                    run_dir: Path, run_id: str) -> list[IterationRecord]:
     core = load_kube(handle.kubeconfig)
+    apps = client.AppsV1Api()
     probe = provider.cni_probe()
     sink = EventSink(run_dir / "raw_events.jsonl")
+
+    # One-shot snapshot of Cilium agent + operator configuration. Best-effort:
+    # it must never break the run.
+    try:
+        from . import cilium_config as _cc
+        _cc.snapshot(core, apps,
+                     namespace=probe.namespace,
+                     agent_label_selector=probe.label_selector,
+                     out_dir=run_dir / "cilium_config")
+    except Exception as e:  # noqa: BLE001
+        log.warning("cilium config snapshot failed: %s", e)
+
     records: list[IterationRecord] = []
     try:
         for i in range(1, cfg.iterations + 1):

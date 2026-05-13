@@ -145,6 +145,12 @@ results/20260512-085541/
 ├── iter-001/              # only with --deep-cilium: per-iteration Cilium artefacts
 │   ├── cilium_metrics.txt        # raw Prometheus dump from the agent on the new node
 │   └── cilium_deep_headline.json # parsed headline numbers (also merged into iterations.csv)
+├── cilium_config/         # one-shot Cilium configuration snapshot (agent + operator)
+│   ├── cilium-config.json        # full `cilium-config` ConfigMap
+│   ├── agent_daemonset.json      # full anetd / cilium-agent DaemonSet spec
+│   ├── operator_pod.json         # cilium-operator Pod
+│   ├── operator_deployment.json  # cilium-operator Deployment spec
+│   └── summary.json              # condensed: image tags, key flags, IPAM, KPR, port bindings
 └── plots/
     ├── box.png                  # distribution per metric
     ├── mean_stddev.png          # mean ± stddev bars
