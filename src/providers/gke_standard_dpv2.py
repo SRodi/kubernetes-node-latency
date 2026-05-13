@@ -6,7 +6,7 @@ from pathlib import Path
 
 from ..cni import get as get_probe
 from ..cni.base import CNIProbe
-from ._cli import run, run_with_retry
+from ._cli import gke_wait_for_inflight_ops, run, run_with_retry
 from .base import ClusterHandle, ClusterProvider
 
 
@@ -58,6 +58,7 @@ class GKEStandardDPv2Provider(ClusterProvider):
     def delete(self, h: ClusterHandle) -> None:
         if not h.created:
             return
+        gke_wait_for_inflight_ops(h.name, h.region)
         run_with_retry(
             ["gcloud", "container", "clusters", "delete", h.name,
              "--region", h.region, "--quiet"],

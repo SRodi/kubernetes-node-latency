@@ -50,3 +50,33 @@ def run_with_retry(cmd: list[str], *, retries: int = 6, initial_delay_s: float =
         time.sleep(delay)
         delay = min(delay * 2, max_delay_s)
     return last  # type: ignore[return-value]
+
+
+def gke_wait_for_inflight_ops(cluster_name: str, region: str, *,
+                                timeout_s: float = 900.0,
+                                poll_interval_s: float = 15.0) -> None:
+    """Block until no RUNNING ops exist on the cluster or its node-pools.
+
+    Autopilot/Standard frequently has background ops (AUTO_REPAIR_NODES, UPGRADE_*,
+    SET_NODE_POOL_*) right after a workload run. Issuing ``clusters delete`` while
+    one is in flight returns HTTP 400 "Cluster is running incompatible operation".
+    Polling beats wide exponential backoff: we usually wait <60s vs. up to ~10m
+    of retry budget.
+    """
+    deadline = time.monotonic() + timeout_s
+    filter_expr = f"targetLink~{cluster_name} AND status=RUNNING"
+    while time.monotonic() < deadline:
+        res = run(
+            ["gcloud", "container", "operations", "list",
+             "--region", region, "--filter", filter_expr,
+             "--format", "value(name,type)"],
+            check=False, capture=True,
+        )
+        lines = [ln for ln in (res.stdout or "").splitlines() if ln.strip()]
+        if not lines:
+            return
+        log.info("waiting for %d in-flight GKE op(s) on %s: %s",
+                 len(lines), cluster_name, "; ".join(lines))
+        time.sleep(poll_interval_s)
+    log.warning("timed out waiting for in-flight GKE ops on %s; proceeding anyway",
+                cluster_name)
