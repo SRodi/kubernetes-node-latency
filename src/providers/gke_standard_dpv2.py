@@ -38,6 +38,8 @@ class GKEStandardDPv2Provider(ClusterProvider):
         ]
         if cfg.kubernetes_version:
             cmd += ["--cluster-version", cfg.kubernetes_version]
+        if getattr(cfg.cni, "deep", False):
+            cmd += ["--enable-dataplane-v2-flow-observability"]
         run(cmd)
         h = ClusterHandle(name=cfg.cluster_name, region=cfg.region,
                           provider=self.name, kubeconfig=kc, created=True)

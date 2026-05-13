@@ -14,7 +14,19 @@ log = logging.getLogger(__name__)
 def _run(cmd: list[str], *, env: dict | None = None, capture: bool = False,
          check: bool = True) -> subprocess.CompletedProcess:
     log.info("$ %s", " ".join(shlex.quote(c) for c in cmd))
-    return subprocess.run(cmd, env=env, text=True, capture_output=capture, check=check)
+    try:
+        return subprocess.run(cmd, env=env, text=True,
+                              capture_output=capture, check=check)
+    except subprocess.CalledProcessError as e:
+        # When capture=True, the actual stderr from az/helm/kubectl is
+        # swallowed by CalledProcessError's default repr. Surface it so
+        # users can see what actually went wrong (quota, name conflict,
+        # invalid SKU, etc.) instead of a bare exit-status traceback.
+        if capture:
+            for stream_name, payload in (("stdout", e.stdout), ("stderr", e.stderr)):
+                if payload and payload.strip():
+                    log.error("%s %s:\n%s", cmd[0], stream_name, payload.rstrip())
+        raise
 
 
 def az(args: list[str], *, json_output: bool = False, env: dict | None = None,

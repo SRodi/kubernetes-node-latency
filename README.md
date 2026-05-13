@@ -192,6 +192,13 @@ Autopilot's GKE Warden does not block it. The scraper Pod is deleted
 after each iteration. Override the image / namespace via
 `cni.deep_scraper_image` / `cni.deep_scraper_namespace` in `config.yaml`.
 
+> **GKE prerequisite — automatic.** When `--deep-cilium` is set, the GKE
+> providers create the cluster with `--enable-dataplane-v2-metrics`
+> (and `--enable-dataplane-v2-flow-observability`). Without these flags
+> `anetd` does not bind a TCP listener on port 9090 and the scraper sees
+> connection-refused. AKS exposes the Cilium metrics port unconditionally,
+> so no equivalent flag is needed there.
+
 ## Architecture
 
 ```

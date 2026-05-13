@@ -25,7 +25,8 @@ class CNICfg:
     # endpoint after T3 fires, via a one-shot scraper Pod pinned to the new
     # node (works on Autopilot, AKS distroless cilium, BYOCNI, etc.).
     deep: bool = False
-    metrics_ports: list[int] = dc.field(default_factory=lambda: [9962, 9963, 9090])
+    metrics_ports: list[int] = dc.field(
+        default_factory=lambda: [9990, 9962, 6942, 9963, 9090])
     deep_scraper_image: str = "curlimages/curl:8.11.1"
     deep_scraper_namespace: str = "default"
 

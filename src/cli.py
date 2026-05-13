@@ -34,6 +34,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
     )
     if args.aks_node_provisioning is not None:
         cfg.aks.node_provisioning = args.aks_node_provisioning
+    if args.aks_resource_group is not None:
+        cfg.aks.resource_group = args.aks_resource_group
     if args.deep_cilium:
         cfg.cni.deep = True
     run_id = args.run_id or time.strftime("%Y%m%d-%H%M%S")
@@ -148,6 +150,9 @@ def main(argv: list[str] | None = None) -> int:
     pr.add_argument("--aks-node-provisioning", default=None,
                     choices=["cluster_autoscaler", "nap", "manual"],
                     help="AKS only: how new nodes are provisioned per iteration")
+    pr.add_argument("--aks-resource-group", default=None,
+                    help="AKS only: override the resource group name "
+                         "(default: node-latency-rg from config.yaml)")
     pr.add_argument("--existing-cluster", default=None,
                     help="reuse current kubeconfig context with this cluster name")
     pr.add_argument("--keep-cluster", action="store_true")

@@ -28,7 +28,7 @@ cni:
   # (incl. GKE Autopilot — no exec/proxy/hostNetwork required).
   # Adds ~3-5s per iteration.
   deep: false
-  metrics_ports: [9962, 9963, 9090]
+  metrics_ports: [9990, 9962, 6942, 9963, 9090]
   deep_scraper_image: curlimages/curl:8.11.1
   deep_scraper_namespace: default
 

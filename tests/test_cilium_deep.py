@@ -88,13 +88,36 @@ def test_iteration_record_to_row_merges_deep_columns():
 
 # ---------- scraper Pod ---------------------------------------------------
 
-def _agent(pod_ip: str | None = "10.0.0.5", image: str = "anetd:v1"):
+def _agent(pod_ip: str | None = "10.0.0.5", image: str = "anetd:v1",
+            container_ports: list[int] | None = None):
+    ports = []
+    for p in (container_ports or []):
+        ports.append(SimpleNamespace(container_port=p, protocol="TCP"))
     return SimpleNamespace(
         metadata=SimpleNamespace(name="anetd-x", namespace="kube-system"),
         status=SimpleNamespace(pod_ip=pod_ip),
         spec=SimpleNamespace(containers=[SimpleNamespace(name="cilium-agent",
-                                                          image=image)]),
+                                                          image=image,
+                                                          ports=ports)]),
     )
+
+
+def test_fetch_metrics_probes_declared_ports_first(monkeypatch):
+    core = MagicMock()
+    core.read_namespaced_pod.return_value = SimpleNamespace(
+        status=SimpleNamespace(phase="Succeeded"))
+    core.read_namespaced_pod_log.return_value = (
+        "=== METRICS port=9990 ===\n" + SAMPLE_METRICS)
+    monkeypatch.setattr(cilium_deep.time, "sleep", lambda *_: None)
+
+    out = cilium_deep.fetch_metrics(
+        core, agent_pod=_agent(container_ports=[9990, 4244]),
+        node_name="n", ports=[9962, 9090])
+    assert "cilium_bootstrap_seconds" in out
+    body = core.create_namespaced_pod.call_args[0][1]
+    script = body["spec"]["containers"][0]["command"][2]
+    # Declared ports come before configured fallbacks; no duplicates.
+    assert 'PORTS="9990 4244 9962 9090"' in script
 
 
 def test_fetch_metrics_happy_path(monkeypatch):

@@ -30,6 +30,11 @@ class GKEAutopilotProvider(ClusterProvider):
         ]
         if cfg.kubernetes_version:
             cmd += ["--cluster-version", cfg.kubernetes_version]
+        if getattr(cfg.cni, "deep", False):
+            # Enables Hubble flow observability on anetd; helps surface
+            # additional metrics on managed clusters. The actual scrape ports
+            # are auto-discovered from the agent Pod spec at run-time.
+            cmd += ["--enable-dataplane-v2-flow-observability"]
         run(cmd)
         h = ClusterHandle(name=cfg.cluster_name, region=cfg.region,
                           provider=self.name, kubeconfig=kc, created=True)

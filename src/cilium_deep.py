@@ -215,11 +215,41 @@ def _resolve_agent_ip(core: client.CoreV1Api, *, namespace: str, name: str,
     return None
 
 
+def _discover_agent_ports(agent_pod, container_name: str | None) -> list[int]:
+    """Return TCP container ports declared by the agent container.
+
+    Looks at the named container first (e.g. `cilium-agent`), falls back to
+    *every* container in the Pod. We skip ports < 1024 (BGP, DNS, etc.) and
+    typical health-probe ports (8080) where /metrics is unlikely to live.
+    """
+    out: list[int] = []
+    seen: set[int] = set()
+    containers = (agent_pod.spec.containers or []) if agent_pod.spec else []
+    for c in containers:
+        if container_name and c.name != container_name and out:
+            continue
+        for p in (c.ports or []):
+            proto = (getattr(p, "protocol", None) or "TCP").upper()
+            port = getattr(p, "container_port", None)
+            if proto != "TCP" or not port or port < 1024:
+                continue
+            if port in seen:
+                continue
+            seen.add(port)
+            out.append(port)
+    return out
+
+
 def fetch_metrics(core: client.CoreV1Api, *, agent_pod, node_name: str,
                    ports: list[int], image: str = DEFAULT_SCRAPER_IMAGE,
                    namespace: str = DEFAULT_SCRAPER_NAMESPACE,
-                   timeout_s: int = 60) -> str | None:
+                   timeout_s: int = 60,
+                   container_name: str | None = None) -> str | None:
     """Run a one-shot scraper Pod against the agent's PodIP, return its log.
+
+    `ports` is the user-configured fallback list. Ports declared in the
+    agent's Pod spec are probed first (covers GKE anetd which uses non-
+    upstream ports and wouldn't be in the default list).
 
     Returns the metrics text on success, None on any failure (the iteration
     must never break because of deep capture). The returned text may include
@@ -228,9 +258,6 @@ def fetch_metrics(core: client.CoreV1Api, *, agent_pod, node_name: str,
     """
     agent_ip = (agent_pod.status and agent_pod.status.pod_ip) or None
     if not agent_ip:
-        # The snapshot from T3 may predate PodIP assignment (common on
-        # Autopilot where anetd reports Ready before its hostNetwork IP
-        # is wired up). Re-resolve from the API with a short backoff.
         agent_ip = _resolve_agent_ip(
             core, namespace=agent_pod.metadata.namespace,
             name=agent_pod.metadata.name)
@@ -238,10 +265,18 @@ def fetch_metrics(core: client.CoreV1Api, *, agent_pod, node_name: str,
         log.info("agent pod has no PodIP yet; skipping deep capture")
         return None
 
+    declared = _discover_agent_ports(agent_pod, container_name)
+    # Declared ports first (most likely to work), then user-configured
+    # fallbacks the agent didn't advertise.
+    probe_ports = declared + [p for p in ports if p not in declared]
+    if declared:
+        log.debug("scraper will probe ports %s (declared %s, fallback %s)",
+                   probe_ports, declared, ports)
+
     name = f"cilium-scrape-{uuid.uuid4().hex[:8]}"
     manifest = _scraper_manifest(name=name, namespace=namespace,
                                   node_name=node_name, agent_ip=agent_ip,
-                                  ports=ports, image=image)
+                                  ports=probe_ports, image=image)
     try:
         core.create_namespaced_pod(namespace, manifest)
     except client.ApiException as e:
@@ -300,6 +335,7 @@ def collect(core: client.CoreV1Api, *, agent_pod, probe, node_name: str,
         core, agent_pod=agent_pod, node_name=node_name, ports=metrics_ports,
         image=scraper_image, namespace=scraper_namespace,
         timeout_s=scraper_timeout_s,
+        container_name=getattr(probe, "container_name", None),
     )
     if not raw:
         return headline
