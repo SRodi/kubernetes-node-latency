@@ -24,6 +24,14 @@ class CNIProbe:
     # the bridge + host-local IPAM in-process and kube-proxy provides
     # service routing). T2/T3 are emitted as null; T0/T1/T4 still measured.
     skip: bool = False
+    # NoSchedule taints applied by the CNI's operator to new nodes that
+    # block workload pod binding until the local agent clears them. On AKS
+    # managed Cilium / BYOCNI Cilium this includes
+    # `node.cilium.io/agent-not-ready` (see the ConfigMap keys
+    # `set-cilium-node-taints` / `remove-cilium-node-taints`). On GKE DPv2
+    # (anetd) and AKS kubenet no such operator taint is configured, so this
+    # tuple is empty and `cilium_scheduling_block_s` collapses to 0.
+    blocking_taint_keys: tuple[str, ...] = ()
 
     def ready_pattern(self) -> re.Pattern[str]:
         return re.compile(self.ready_regex)

@@ -34,6 +34,11 @@ class IterationRecord:
     T2_cilium_started: datetime | None = None
     T3_cilium_ready: datetime | None = None
     T4_node_ready: datetime | None = None
+    # First moment the node was both Ready=True and free of CNI-applied
+    # NoSchedule taints (e.g. `node.cilium.io/agent-not-ready` on AKS
+    # managed Cilium). Equals T4 on platforms where no such taint is
+    # configured (GKE DPv2, AKS kubenet).
+    T4b_schedulable: datetime | None = None
 
     status: str = "pending"  # pending|success|timeout|error
     error: str | None = None
@@ -56,12 +61,23 @@ class IterationRecord:
             "T2_cilium_started": iso(self.T2_cilium_started),
             "T3_cilium_ready": iso(self.T3_cilium_ready),
             "T4_node_ready": iso(self.T4_node_ready),
+            "T4b_schedulable": iso(self.T4b_schedulable),
             "node_startup_latency_s": delta(self.T4_node_ready, self.T0_pod_created),
+            "time_to_schedulable_s": delta(self.T4b_schedulable, self.T0_pod_created),
             "node_register_latency_s": delta(self.T1_node_registered, self.T0_pod_created),
             "cilium_init_duration_s": delta(self.T3_cilium_ready, self.T2_cilium_started),
             "cni_induced_delay_s": (
                 max(delta(self.T4_node_ready, self.T3_cilium_ready) or 0.0, 0.0)
                 if (self.T3_cilium_ready and self.T4_node_ready) else None
+            ),
+            # Directly-measured "Cilium taint blocks pod scheduling after Node
+            # Ready=True" delay. Captures the AKS-style gating the legacy
+            # `cni_induced_delay_s` misses (the operator stamps
+            # `node.cilium.io/agent-not-ready:NoSchedule` and only the local
+            # agent clears it at ~T3, so T4b > T4 even though T4 < T3).
+            "cilium_scheduling_block_s": (
+                max(delta(self.T4b_schedulable, self.T4_node_ready) or 0.0, 0.0)
+                if (self.T4b_schedulable and self.T4_node_ready) else None
             ),
             "status": self.status,
             "error": self.error,

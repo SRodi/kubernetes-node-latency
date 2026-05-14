@@ -27,13 +27,27 @@ scale) differ per platform.
 | **T2** CNI agent container started | `pod.status.containerStatuses[*].state.running.startedAt` |
 | **T3** CNI agent Ready | agent Pod's `Ready` condition `lastTransitionTime` |
 | **T4** Node `Ready=True` | `Node.status.conditions[Ready].lastTransitionTime` |
+| **T4b** Node schedulable | first watch event after T4 with no CNI-applied `NoSchedule` taints (e.g. `node.cilium.io/agent-not-ready`) on `Node.spec.taints` |
 
 Derived metrics (seconds):
 
-- `node_startup_latency_s  = T4 − T0` *(primary KPI)*
-- `node_register_latency_s = T1 − T0`
-- `cilium_init_duration_s  = T3 − T2`
-- `cni_induced_delay_s     = max(T4 − T3, 0)`
+- `node_startup_latency_s    = T4  − T0` *(primary KPI — kubelet `Ready=True`)*
+- `time_to_schedulable_s     = T4b − T0` *(time until workload pods can be bound to the node)*
+- `node_register_latency_s   = T1  − T0`
+- `cilium_init_duration_s    = T3  − T2`
+- `cni_induced_delay_s       = max(T4  − T3, 0)` *(Cilium gating Node Ready; ≈ 0 on every supported provider in practice — kubelet flips Ready before agent Pod Ready)*
+- `cilium_scheduling_block_s = max(T4b − T4, 0)` *(Cilium gating pod scheduling via the `node.cilium.io/agent-not-ready:NoSchedule` taint — non-zero on AKS managed Cilium / BYOCNI, zero on GKE DPv2 and AKS kubenet because their CNI doesn't apply this taint)*
+
+> **Why both `cni_induced_delay_s` and `cilium_scheduling_block_s`?** They
+> measure two distinct gating mechanisms. AKS managed Cilium and Helm-installed
+> Cilium run with `set-cilium-node-taints=true`, so the operator stamps
+> `node.cilium.io/agent-not-ready:NoSchedule` on every new node and only the
+> local agent removes it once Ready — pod scheduling is blocked from T4 until
+> ~T3. `cni_induced_delay_s` only fires when Cilium delays Node Ready itself,
+> so it reads 0 on AKS even though there is a real ~15-20 s delay before pods
+> can run. `cilium_scheduling_block_s` measures that delay directly.
+> GKE Dataplane V2 / anetd and AKS kubenet have no equivalent taint, so this
+> metric is 0 on those providers and `T4b == T4`.
 
 ## Install
 

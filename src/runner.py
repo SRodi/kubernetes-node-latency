@@ -140,7 +140,7 @@ def run_iterations(cfg: Config, handle: ClusterHandle, provider: ClusterProvider
                 rec.node_name, rec.T1_node_registered = collector.wait_for_new_node(
                     before, timeout_s=cfg.per_iteration_timeout_s,
                     not_before=rec.T0_pod_created)
-                rec.T4_node_ready = collector.wait_for_node_ready(
+                rec.T4_node_ready, rec.T4b_schedulable = collector.wait_for_node_ready(
                     rec.node_name, timeout_s=cfg.per_iteration_timeout_s)
 
                 agent = None if probe.skip else collector.find_agent_pod(rec.node_name, timeout_s=120)

@@ -163,10 +163,39 @@ class Collector:
             # apiserver closed the stream early; loop and re-watch with remaining budget.
         raise TimeoutError("no genuinely-new node observed before timeout")
 
-    # ----- T4: Ready=True transition -----
-    def wait_for_node_ready(self, node_name: str, timeout_s: int) -> datetime:
+    # ----- T4 / T4b: Ready=True transition + first moment node is schedulable -----
+    def wait_for_node_ready(self, node_name: str, timeout_s: int) -> tuple[datetime, datetime]:
+        """Wait for the node to become both Ready=True AND schedulable.
+
+        Returns ``(T4_node_ready, T4b_schedulable)``:
+
+        * T4_node_ready: ``lastTransitionTime`` of the Ready condition's
+          ``True`` transition (same value as the original `wait_for_node_ready`).
+        * T4b_schedulable: the first watch event after T4 at which none of
+          ``self.probe.blocking_taint_keys`` are present in
+          ``node.spec.taints``. If the probe has no blocking taints
+          configured (e.g. GKE DPv2, AKS kubenet), this equals T4.
+
+        T4b is the platform-agnostic "node is now actually usable by
+        workload pods" timestamp. On AKS managed Cilium / BYOCNI Cilium
+        the operator stamps ``node.cilium.io/agent-not-ready:NoSchedule``
+        on every new node and only the local agent clears it once Ready;
+        kube-scheduler will not bind any pod that does not tolerate that
+        taint while it is present, so the user-visible delay is bounded
+        by T4b, not T4.
+
+        Falls back to ``utcnow()`` for the taint-clearing observation
+        because, unlike conditions, taints don't carry their own
+        ``lastTransitionTime``. The harness's clock skew vs the apiserver
+        is bounded by the per-iteration timeout configuration and any
+        residual offset applies uniformly across providers.
+        """
         deadline = time.monotonic() + timeout_s
         read_timeout = min(120, max(30, timeout_s // 4))
+        blocking = set(self.probe.blocking_taint_keys or ())
+        t4: datetime | None = None
+        t4b: datetime | None = None
+        saw_taint = False  # only meaningful when `blocking` is non-empty
         while time.monotonic() < deadline:
             remaining = max(1, int(deadline - time.monotonic()))
             w = watch.Watch()
@@ -176,18 +205,56 @@ class Collector:
                                    timeout_seconds=remaining,
                                    _request_timeout=(10, read_timeout)):
                     node = ev["object"]
-                    for cond in (node.status.conditions or []):
-                        if cond.type == "Ready" and cond.status == "True":
-                            ts = _parse_k8s_time(cond.last_transition_time) or utcnow()
-                            self.sink.write("node_ready", {"name": node_name, "ts": ts.isoformat()})
-                            return ts
+                    if t4 is None:
+                        for cond in (node.status.conditions or []):
+                            if cond.type == "Ready" and cond.status == "True":
+                                t4 = _parse_k8s_time(cond.last_transition_time) or utcnow()
+                                self.sink.write("node_ready",
+                                                {"name": node_name, "ts": t4.isoformat()})
+                                break
+                    if blocking:
+                        present = {t.key for t in (node.spec.taints or [])} & blocking
+                        if present:
+                            saw_taint = True
+                            self.sink.write("node_blocking_taint_present",
+                                            {"name": node_name, "taints": sorted(present)})
+                        elif t4 is not None and t4b is None:
+                            # taint absent and node is Ready: this is the first
+                            # moment the node is actually schedulable.
+                            if saw_taint:
+                                t4b = utcnow()
+                                self.sink.write("node_blocking_taint_cleared",
+                                                {"name": node_name, "ts": t4b.isoformat(),
+                                                 "keys": sorted(blocking)})
+                            else:
+                                # Never observed the taint — either it was
+                                # cleared before our watch started, or the
+                                # operator never stamped it. Either way, T4
+                                # is the earliest defensible value.
+                                t4b = t4
+                                self.sink.write("node_blocking_taint_absent",
+                                                {"name": node_name,
+                                                 "keys": sorted(blocking),
+                                                 "note": "never observed; T4b := T4"})
+                    elif t4 is not None and t4b is None:
+                        # No blocking taints configured for this probe: T4b == T4.
+                        t4b = t4
+                    if t4 is not None and t4b is not None:
+                        return t4, t4b
             except Exception as e:  # noqa: BLE001
                 self.sink.write("node_ready_watch_reopen",
                                 {"node": node_name, "error": type(e).__name__,
                                  "msg": str(e)[:200]})
             finally:
                 w.stop()
-        raise TimeoutError(f"node {node_name} did not become Ready before timeout")
+        if t4 is None:
+            raise TimeoutError(f"node {node_name} did not become Ready before timeout")
+        # Ready observed but taint never cleared within the budget: fall back
+        # to Ready time so downstream math degrades gracefully.
+        self.sink.write("node_schedulable_timeout",
+                        {"node": node_name, "keys": sorted(blocking),
+                         "note": "blocking taint still present at deadline; T4b := T4"})
+        return t4, t4
 
     # ----- T2/T3: CNI agent — pod-watch driven, no log access required -----
     def find_agent_pod(self, node_name: str, timeout_s: int = 120) -> client.V1Pod | None:

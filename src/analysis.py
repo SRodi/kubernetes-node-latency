@@ -12,9 +12,11 @@ from .records import IterationRecord
 
 METRICS = [
     "node_startup_latency_s",
+    "time_to_schedulable_s",
     "node_register_latency_s",
     "cilium_init_duration_s",
     "cni_induced_delay_s",
+    "cilium_scheduling_block_s",
     # Tier-1 deep-Cilium headlines — silently skipped when the column is
     # absent or all-null (i.e. --deep-cilium not set).
     "cilium_bootstrap_total_s",
@@ -82,8 +84,10 @@ def write_outputs(records: list[IterationRecord], out_dir: Path,
         "",
         tabulate(df[[
             "iteration", "node_name", "status",
-            "node_startup_latency_s", "node_register_latency_s",
+            "node_startup_latency_s", "time_to_schedulable_s",
+            "node_register_latency_s",
             "cilium_init_duration_s", "cni_induced_delay_s",
+            "cilium_scheduling_block_s",
         ]], headers="keys", tablefmt="github", showindex=False, floatfmt=".2f"),
         "",
     ]

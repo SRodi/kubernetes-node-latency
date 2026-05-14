@@ -10,4 +10,9 @@ PROBE = CNIProbe(
     container_name="cilium-agent",
     ready_regex=r"All Cilium daemons are ready|Daemon initialization completed",
     use_cilium_cli=False,
+    # AKS managed Cilium and Helm-installed Cilium both run with
+    # `set-cilium-node-taints=true`. The operator stamps this NoSchedule
+    # taint on every new node and only the local agent removes it once
+    # Ready — so pod scheduling is gated on it, not on Node Ready=True.
+    blocking_taint_keys=("node.cilium.io/agent-not-ready",),
 )

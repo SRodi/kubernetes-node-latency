@@ -27,6 +27,26 @@ def synthetic_records(n: int = 5) -> list[IterationRecord]:
         r.T2_cilium_started = _ts(8 + i)
         r.T3_cilium_ready = _ts(20 + i)
         r.T4_node_ready = _ts(22 + i)
+        # No CNI scheduling taint on GKE DPv2 — T4b collapses to T4.
+        r.T4b_schedulable = r.T4_node_ready
+        r.status = "success"
+        out.append(r)
+    return out
+
+
+def aks_like_records(n: int = 3) -> list[IterationRecord]:
+    """T4 < T3 (kubelet flips Ready before agent Pod), and the operator
+    taint blocks scheduling until ~T3 — i.e. T4b ≈ T3."""
+    out = []
+    for i in range(1, n + 1):
+        r = IterationRecord(iteration=i, run_id="t", provider="aks_overlay_cilium", region="x")
+        r.pod_name = f"p{i}"; r.node_name = f"node-{i}"
+        r.T0_pod_created = _ts(0)
+        r.T1_node_registered = _ts(100)
+        r.T2_cilium_started = _ts(110)
+        r.T4_node_ready = _ts(115)        # kubelet Ready first
+        r.T3_cilium_ready = _ts(132)      # agent Ready ~17s later
+        r.T4b_schedulable = _ts(132)      # taint cleared at ~T3
         r.status = "success"
         out.append(r)
     return out
@@ -53,6 +73,24 @@ def test_record_row_math():
     assert row["node_register_latency_s"] == 5.0
     assert row["cilium_init_duration_s"] == 12.0
     assert row["cni_induced_delay_s"] == 2.0
+    # GKE-like fixture: no blocking taint, T4b == T4 → no extra delay,
+    # time_to_schedulable equals node_startup_latency.
+    assert row["cilium_scheduling_block_s"] == 0.0
+    assert row["time_to_schedulable_s"] == 22.0
+
+
+def test_record_row_math_aks_taint_gating():
+    """AKS-style: Node Ready fires before Cilium Ready, taint clears at T3.
+
+    cni_induced_delay_s = max(T4 - T3, 0) = 0 (T4 < T3) — the legacy metric
+    misses the gating. cilium_scheduling_block_s = T4b - T4 = 17 — captures
+    it directly."""
+    rec = aks_like_records(1)[0]
+    row = rec.to_row()
+    assert row["node_startup_latency_s"] == 115.0      # T4 - T0
+    assert row["time_to_schedulable_s"] == 132.0       # T4b - T0
+    assert row["cni_induced_delay_s"] == 0.0           # legacy metric, misleading
+    assert row["cilium_scheduling_block_s"] == 17.0    # direct measurement
 
 
 def test_aggregate_stats():
@@ -180,3 +218,73 @@ def test_wait_for_new_node_skips_nodes_predating_trigger(monkeypatch):
     kinds = [k for k, _ in sink_calls]
     assert "node_pre_dates_trigger" in kinds
     assert "node_added" in kinds
+
+
+def _fake_node(*, ready=True, ready_ts="2025-01-01T12:00:10Z", taint_keys=()):
+    """Build a minimal V1Node-like object the collector's watch loop expects."""
+    conds = []
+    if ready:
+        conds.append(_Obj(type="Ready", status="True", last_transition_time=ready_ts))
+    taints = [_Obj(key=k, effect="NoSchedule", value=None) for k in taint_keys]
+    return _Obj(metadata=_Obj(name="n1"),
+                status=_Obj(conditions=conds),
+                spec=_Obj(taints=taints))
+
+
+def _run_wait_for_node_ready(monkeypatch, probe_name, events):
+    from src.collectors import Collector
+    from src.cni import get as get_probe
+
+    class FakeWatch:
+        def __init__(self): self._stopped = False
+        def stream(self, *a, **kw):
+            for ev in events:
+                yield {"object": ev}
+        def stop(self): self._stopped = True
+
+    monkeypatch.setattr("src.collectors.watch.Watch", FakeWatch)
+    sink_calls = []
+    class S:
+        def write(self, kind, obj): sink_calls.append((kind, obj))
+    class FakeCore:
+        def list_node(self, **kw): return None
+    c = Collector(core=FakeCore(), probe=get_probe(probe_name), sink=S())  # type: ignore[arg-type]
+    t4, t4b = c.wait_for_node_ready("n1", timeout_s=5)
+    return t4, t4b, [k for k, _ in sink_calls]
+
+
+def test_wait_for_node_ready_no_blocking_taint_gke_dpv2(monkeypatch):
+    """GKE DPv2 probe declares no blocking taints → T4b collapses to T4 on
+    the first Ready=True event, regardless of any unrelated taints."""
+    events = [_fake_node(ready=True, ready_ts="2025-01-01T12:00:10Z",
+                          taint_keys=("some.other/taint",))]
+    t4, t4b, kinds = _run_wait_for_node_ready(monkeypatch, "cilium_dpv2", events)
+    assert t4 == t4b
+    assert t4.second == 10
+    assert "node_ready" in kinds
+
+
+def test_wait_for_node_ready_aks_taint_clears_after_ready(monkeypatch):
+    """AKS-style: Ready=True fires while the agent-not-ready taint is still
+    present; T4b only resolves on the later event where the taint is gone."""
+    events = [
+        # T4 transition: Ready=True observed, taint still there.
+        _fake_node(ready=True, ready_ts="2025-01-01T12:00:10Z",
+                   taint_keys=("node.cilium.io/agent-not-ready",)),
+        # Subsequent reconcile: taint removed → T4b captured here.
+        _fake_node(ready=True, ready_ts="2025-01-01T12:00:10Z", taint_keys=()),
+    ]
+    t4, t4b, kinds = _run_wait_for_node_ready(monkeypatch, "cilium_generic", events)
+    assert t4.second == 10
+    # T4b uses utcnow() at observation time, so we only assert ordering.
+    assert t4b >= t4
+    assert "node_blocking_taint_present" in kinds
+    assert "node_blocking_taint_cleared" in kinds
+
+
+def test_wait_for_node_ready_aks_taint_never_observed(monkeypatch):
+    """Taint cleared before our first watch event: T4b := T4 (best-effort)."""
+    events = [_fake_node(ready=True, ready_ts="2025-01-01T12:00:10Z", taint_keys=())]
+    t4, t4b, kinds = _run_wait_for_node_ready(monkeypatch, "cilium_generic", events)
+    assert t4 == t4b
+    assert "node_blocking_taint_absent" in kinds
