@@ -7,6 +7,7 @@ from .gke_standard_dpv2 import GKEStandardDPv2Provider
 from .existing import ExistingProvider
 from .aks_overlay_cilium import AKSOverlayCiliumProvider
 from .aks_byocni import AKSBYOCNIProvider
+from .aks_kubenet import AKSKubenetProvider
 
 _PROVIDERS = {
     GKEAutopilotProvider.name: GKEAutopilotProvider,
@@ -14,6 +15,7 @@ _PROVIDERS = {
     ExistingProvider.name: ExistingProvider,
     AKSOverlayCiliumProvider.name: AKSOverlayCiliumProvider,
     AKSBYOCNIProvider.name: AKSBYOCNIProvider,
+    AKSKubenetProvider.name: AKSKubenetProvider,
 }
 
 

@@ -19,6 +19,11 @@ class CNIProbe:
     ready_regex: str          # regex matched against agent log lines for T3 (fallback)
     pod_ready_condition: str = "Ready"  # primary T3 signal: pod condition type
     use_cilium_cli: bool = False  # fallback / alternative
+    # When true, the runner and metadata skip all agent-pod lookups: there is
+    # no per-node CNI agent to probe (e.g. AKS kubenet, where kubelet handles
+    # the bridge + host-local IPAM in-process and kube-proxy provides
+    # service routing). T2/T3 are emitted as null; T0/T1/T4 still measured.
+    skip: bool = False
 
     def ready_pattern(self) -> re.Pattern[str]:
         return re.compile(self.ready_regex)

@@ -143,8 +143,12 @@ def run_iterations(cfg: Config, handle: ClusterHandle, provider: ClusterProvider
                 rec.T4_node_ready = collector.wait_for_node_ready(
                     rec.node_name, timeout_s=cfg.per_iteration_timeout_s)
 
-                agent = collector.find_agent_pod(rec.node_name, timeout_s=120)
-                if agent is not None:
+                agent = None if probe.skip else collector.find_agent_pod(rec.node_name, timeout_s=120)
+                if probe.skip:
+                    sink.write("cni_probe_skipped",
+                               {"node": rec.node_name, "probe": probe.name,
+                                "reason": "no per-node CNI agent (e.g. kubenet)"})
+                elif agent is not None:
                     # Primary path: pod-watch (no log access required).
                     t2, t3 = collector.watch_agent_pod(
                         agent.metadata.name,

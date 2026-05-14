@@ -151,7 +151,8 @@ def main(argv: list[str] | None = None) -> int:
     pr.add_argument("--config", default="config.yaml")
     pr.add_argument("--provider", default=None,
                     choices=["gke_autopilot", "gke_standard_dpv2",
-                             "aks_overlay_cilium", "aks_byocni", "existing"])
+                             "aks_overlay_cilium", "aks_byocni", "aks_kubenet",
+                             "existing"])
     pr.add_argument("--region", default=None)
     pr.add_argument("--iterations", type=int, default=None)
     pr.add_argument("--cluster-name", default=None)

@@ -3,7 +3,7 @@
 Measures end-to-end **node startup latency** (`Pod created → Node Ready=True`)
 on managed Kubernetes platforms, with a uniform measurement methodology across
 GKE Autopilot, GKE Standard with Dataplane V2, AKS with Azure CNI Powered by
-Cilium, and AKS BYOCNI + upstream Cilium.
+Cilium, AKS BYOCNI + upstream Cilium, and AKS kubenet (no Cilium).
 
 ## Methodology
 
@@ -75,6 +75,9 @@ One command per supported scenario:
 # AKS BYOCNI + upstream Cilium installed via Helm
 .venv/bin/python -m src.cli run --provider aks_byocni        --region westeurope --iterations 10
 
+# AKS kubenet (legacy, no Cilium agent — T2/T3 emitted as null)
+.venv/bin/python -m src.cli run --provider aks_kubenet       --region westeurope --iterations 10
+
 # Re-use a cluster you already created
 .venv/bin/python -m src.cli run --provider existing --iterations 5
 ```
@@ -112,6 +115,21 @@ aks:
 ```
 
 `node_provisioning` can also be set per run with `--aks-node-provisioning {cluster_autoscaler|nap|manual}`.
+
+#### `aks_kubenet` notes
+
+`aks_kubenet` reuses the same `aks:` config block as the Cilium-based AKS
+providers but passes `--network-plugin kubenet` (no `--network-dataplane`,
+no overlay flags). There is **no per-node CNI agent DaemonSet** under
+kubenet, so the harness records T0/T1/T4 only and emits T2/T3 as `null`;
+`cilium_init_duration_s` and `cni_induced_delay_s` will therefore also be
+`null` in `iterations.csv`. The primary KPI (`node_startup_latency_s`)
+and `node_register_latency_s` remain directly comparable to the
+Cilium-based providers; `--deep-cilium` is a no-op for this provider.
+
+Kubenet is deprecated in AKS and is rejected on newer Kubernetes
+versions — set `aks.kubernetes_version` to a release where kubenet is
+still accepted (e.g. `1.28`) before running.
 
 | Mode | Behavior |
 |---|---|
@@ -257,9 +275,9 @@ AKS_LIVE_TEST=1 .venv/bin/python -m src.cli run --provider aks_overlay_cilium --
   |---|---|
   | `gke_autopilot` | Autopilot node auto-provisioning (no pre-existing pool) |
   | `gke_standard_dpv2` | GKE cluster-autoscaler scales pool from `min=0` |
-  | `aks_overlay_cilium` / `aks_byocni` (`cluster_autoscaler`, default) | AKS cluster-autoscaler scales VMSS from `min=0` |
-  | `aks_overlay_cilium` / `aks_byocni` (`nap`) | AKS Node Auto-Provisioning |
-  | `aks_overlay_cilium` / `aks_byocni` (`manual`) | Harness scales nodepool +1 directly |
+  | `aks_overlay_cilium` / `aks_byocni` / `aks_kubenet` (`cluster_autoscaler`, default) | AKS cluster-autoscaler scales VMSS from `min=0` |
+  | `aks_overlay_cilium` / `aks_byocni` / `aks_kubenet` (`nap`) | AKS Node Auto-Provisioning |
+  | `aks_overlay_cilium` / `aks_byocni` / `aks_kubenet` (`manual`) | Harness scales nodepool +1 directly |
 
   As a result, `T1 − T0` is not strictly apples-to-apples: CA-driven runs
   include the autoscaler scan/decision time on top of cloud VM provisioning.

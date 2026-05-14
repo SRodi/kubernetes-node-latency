@@ -8,6 +8,7 @@ import pytest
 from src.config import Config
 from src.providers.aks_overlay_cilium import AKSOverlayCiliumProvider
 from src.providers.aks_byocni import AKSBYOCNIProvider
+from src.providers.aks_kubenet import AKSKubenetProvider
 
 
 def _cfg(mode: str = "cluster_autoscaler", provider: str = "aks_overlay_cilium") -> Config:
@@ -103,3 +104,26 @@ def test_node_autoprovision_hint_targets_user_pool():
 def test_invalid_node_provisioning_mode_raises():
     with pytest.raises(ValueError):
         AKSOverlayCiliumProvider(_cfg(mode="bogus"))
+
+
+def test_kubenet_create_args_and_noop_probe():
+    cfg = _cfg(mode="cluster_autoscaler", provider="aks_kubenet")
+    p = AKSKubenetProvider(cfg)
+    with patch("src.providers._az._run") as run:
+        run.return_value = MagicMock(stdout="", returncode=0)
+        p.create(cfg)
+    cmds = [c.args[0] for c in run.call_args_list]
+    create_cmd = next(c for c in cmds if c[:3] == ["az", "aks", "create"])
+    assert "--network-plugin" in create_cmd
+    assert create_cmd[create_cmd.index("--network-plugin") + 1] == "kubenet"
+    # kubenet must not carry Cilium/overlay flags
+    assert "--network-dataplane" not in create_cmd
+    assert "--network-plugin-mode" not in create_cmd
+    # Default probe is the no-op (no per-node CNI agent on kubenet)
+    probe = p.cni_probe()
+    assert probe.name == "noop"
+    assert probe.skip is True
+    # Network facts reflect kubenet, not Cilium
+    assert p._network_describe()["network_plugin"] == "kubenet"
+    assert p._network_describe()["cni_agent"] is None
+

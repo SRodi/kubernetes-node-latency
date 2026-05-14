@@ -89,6 +89,8 @@ def _node_summary(n) -> dict[str, Any]:
 
 
 def _cni_image(core: client.CoreV1Api, probe) -> dict[str, str | None]:
+    if getattr(probe, "skip", False) is True or not getattr(probe, "label_selector", ""):
+        return {"image": None, "container": None}
     try:
         pods = core.list_namespaced_pod(
             probe.namespace, label_selector=probe.label_selector, limit=1).items

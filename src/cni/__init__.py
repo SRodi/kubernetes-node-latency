@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 from .base import CNIProbe
-from . import cilium_dpv2, cilium_generic
+from . import cilium_dpv2, cilium_generic, noop
 
 REGISTRY: dict[str, CNIProbe] = {
     cilium_dpv2.PROBE.name: cilium_dpv2.PROBE,
     cilium_generic.PROBE.name: cilium_generic.PROBE,
+    noop.PROBE.name: noop.PROBE,
 }
 
 
