@@ -29,6 +29,8 @@ def synthetic_records(n: int = 5) -> list[IterationRecord]:
         r.T4_node_ready = _ts(22 + i)
         # No CNI scheduling taint on GKE DPv2 — T4b collapses to T4.
         r.T4b_schedulable = r.T4_node_ready
+        # CNI conflist landed ~15s after kubelet registered, ~2s before Ready.
+        r.T1c_cni_conflist = _ts(20 + i)
         r.status = "success"
         out.append(r)
     return out
@@ -47,6 +49,8 @@ def aks_like_records(n: int = 3) -> list[IterationRecord]:
         r.T4_node_ready = _ts(115)        # kubelet Ready first
         r.T3_cilium_ready = _ts(132)      # agent Ready ~17s later
         r.T4b_schedulable = _ts(132)      # taint cleared at ~T3
+        # CNI conflist arrived shortly before Ready=True.
+        r.T1c_cni_conflist = _ts(113)
         r.status = "success"
         out.append(r)
     return out
@@ -77,6 +81,10 @@ def test_record_row_math():
     # time_to_schedulable equals node_startup_latency.
     assert row["cilium_scheduling_block_s"] == 0.0
     assert row["time_to_schedulable_s"] == 22.0
+    # T1c = T1 + 15, T4 = T1 + 17  → kubelet sat 15s with NetworkPluginNotReady,
+    # then 2s of residual readiness work after the conflist landed.
+    assert row["cni_conflist_install_s"] == 15.0
+    assert row["post_conflist_ready_s"] == 2.0
 
 
 def test_record_row_math_aks_taint_gating():
@@ -220,11 +228,20 @@ def test_wait_for_new_node_skips_nodes_predating_trigger(monkeypatch):
     assert "node_added" in kinds
 
 
-def _fake_node(*, ready=True, ready_ts="2025-01-01T12:00:10Z", taint_keys=()):
-    """Build a minimal V1Node-like object the collector's watch loop expects."""
+def _fake_node(*, ready=True, ready_ts="2025-01-01T12:00:10Z", taint_keys=(),
+               ready_status: str | None = None, ready_message: str = ""):
+    """Build a minimal V1Node-like object the collector's watch loop expects.
+
+    By default produces ``Ready=True`` (back-compat). To simulate the pre-CNI
+    kubelet state, pass ``ready_status="False"`` and a ``ready_message`` that
+    includes ``cni config uninitialized``.
+    """
     conds = []
     if ready:
-        conds.append(_Obj(type="Ready", status="True", last_transition_time=ready_ts))
+        status = ready_status or "True"
+        conds.append(_Obj(type="Ready", status=status,
+                          last_transition_time=ready_ts,
+                          message=ready_message))
     taints = [_Obj(key=k, effect="NoSchedule", value=None) for k in taint_keys]
     return _Obj(metadata=_Obj(name="n1"),
                 status=_Obj(conditions=conds),
@@ -249,8 +266,8 @@ def _run_wait_for_node_ready(monkeypatch, probe_name, events):
     class FakeCore:
         def list_node(self, **kw): return None
     c = Collector(core=FakeCore(), probe=get_probe(probe_name), sink=S())  # type: ignore[arg-type]
-    t4, t4b = c.wait_for_node_ready("n1", timeout_s=5)
-    return t4, t4b, [k for k, _ in sink_calls]
+    t4, t4b, t1c = c.wait_for_node_ready("n1", timeout_s=5)
+    return t4, t4b, t1c, [k for k, _ in sink_calls]
 
 
 def test_wait_for_node_ready_no_blocking_taint_gke_dpv2(monkeypatch):
@@ -258,9 +275,10 @@ def test_wait_for_node_ready_no_blocking_taint_gke_dpv2(monkeypatch):
     the first Ready=True event, regardless of any unrelated taints."""
     events = [_fake_node(ready=True, ready_ts="2025-01-01T12:00:10Z",
                           taint_keys=("some.other/taint",))]
-    t4, t4b, kinds = _run_wait_for_node_ready(monkeypatch, "cilium_dpv2", events)
+    t4, t4b, t1c, kinds = _run_wait_for_node_ready(monkeypatch, "cilium_dpv2", events)
     assert t4 == t4b
     assert t4.second == 10
+    assert t1c is None  # never observed the kubelet CNI-blocking message
     assert "node_ready" in kinds
 
 
@@ -274,7 +292,7 @@ def test_wait_for_node_ready_aks_taint_clears_after_ready(monkeypatch):
         # Subsequent reconcile: taint removed → T4b captured here.
         _fake_node(ready=True, ready_ts="2025-01-01T12:00:10Z", taint_keys=()),
     ]
-    t4, t4b, kinds = _run_wait_for_node_ready(monkeypatch, "cilium_generic", events)
+    t4, t4b, t1c, kinds = _run_wait_for_node_ready(monkeypatch, "cilium_generic", events)
     assert t4.second == 10
     # T4b uses utcnow() at observation time, so we only assert ordering.
     assert t4b >= t4
@@ -285,6 +303,27 @@ def test_wait_for_node_ready_aks_taint_clears_after_ready(monkeypatch):
 def test_wait_for_node_ready_aks_taint_never_observed(monkeypatch):
     """Taint cleared before our first watch event: T4b := T4 (best-effort)."""
     events = [_fake_node(ready=True, ready_ts="2025-01-01T12:00:10Z", taint_keys=())]
-    t4, t4b, kinds = _run_wait_for_node_ready(monkeypatch, "cilium_generic", events)
+    t4, t4b, t1c, kinds = _run_wait_for_node_ready(monkeypatch, "cilium_generic", events)
     assert t4 == t4b
     assert "node_blocking_taint_absent" in kinds
+
+
+def test_wait_for_node_ready_captures_t1c_after_cni_block(monkeypatch):
+    """Kubelet first reports Ready=False with the
+    `NetworkPluginNotReady / cni config uninitialized` marker; the next
+    event drops that marker (Ready=True). T1c must be set, and the sink
+    must record both `cni_conflist_blocking` and `cni_conflist_observed`."""
+    events = [
+        _fake_node(ready=True, ready_status="False",
+                   ready_message=("container runtime network not ready: "
+                                  "NetworkReady=false reason=NetworkPluginNotReady "
+                                  "message=Network plugin returns error: "
+                                  "cni config uninitialized"),
+                   taint_keys=()),
+        _fake_node(ready=True, ready_ts="2025-01-01T12:00:10Z", taint_keys=()),
+    ]
+    t4, t4b, t1c, kinds = _run_wait_for_node_ready(monkeypatch, "cilium_dpv2", events)
+    assert t4.second == 10
+    assert t1c is not None  # captured at utcnow() of the clearing event
+    assert "cni_conflist_blocking" in kinds
+    assert "cni_conflist_observed" in kinds

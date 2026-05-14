@@ -163,11 +163,13 @@ class Collector:
             # apiserver closed the stream early; loop and re-watch with remaining budget.
         raise TimeoutError("no genuinely-new node observed before timeout")
 
-    # ----- T4 / T4b: Ready=True transition + first moment node is schedulable -----
-    def wait_for_node_ready(self, node_name: str, timeout_s: int) -> tuple[datetime, datetime]:
+    # ----- T1c / T4 / T4b: Ready=True transition + first moment node is schedulable -----
+    def wait_for_node_ready(
+        self, node_name: str, timeout_s: int
+    ) -> tuple[datetime, datetime, datetime | None]:
         """Wait for the node to become both Ready=True AND schedulable.
 
-        Returns ``(T4_node_ready, T4b_schedulable)``:
+        Returns ``(T4_node_ready, T4b_schedulable, T1c_cni_conflist)``:
 
         * T4_node_ready: ``lastTransitionTime`` of the Ready condition's
           ``True`` transition (same value as the original `wait_for_node_ready`).
@@ -175,6 +177,14 @@ class Collector:
           ``self.probe.blocking_taint_keys`` are present in
           ``node.spec.taints``. If the probe has no blocking taints
           configured (e.g. GKE DPv2, AKS kubenet), this equals T4.
+        * T1c_cni_conflist: first watch event at which the Node's ``Ready``
+          condition message no longer reports the kubelet
+          ``container runtime network not ready / NetworkPluginNotReady /
+          cni config uninitialized`` block — i.e. the moment the CNI plugin
+          dropped its conflist into ``/etc/cni/net.d/`` and kubelet's
+          runtime-status loop cleared the gating message. ``None`` if we
+          never observed that message (kubelet wrote Ready=True before our
+          watch saw an intermediate False state).
 
         T4b is the platform-agnostic "node is now actually usable by
         workload pods" timestamp. On AKS managed Cilium / BYOCNI Cilium
@@ -195,7 +205,10 @@ class Collector:
         blocking = set(self.probe.blocking_taint_keys or ())
         t4: datetime | None = None
         t4b: datetime | None = None
+        t1c: datetime | None = None
         saw_taint = False  # only meaningful when `blocking` is non-empty
+        saw_cni_block = False  # True once we've seen Ready=False with the
+                               # "cni config uninitialized" / NetworkPluginNotReady marker
         while time.monotonic() < deadline:
             remaining = max(1, int(deadline - time.monotonic()))
             w = watch.Watch()
@@ -205,13 +218,34 @@ class Collector:
                                    timeout_seconds=remaining,
                                    _request_timeout=(10, read_timeout)):
                     node = ev["object"]
-                    if t4 is None:
-                        for cond in (node.status.conditions or []):
-                            if cond.type == "Ready" and cond.status == "True":
-                                t4 = _parse_k8s_time(cond.last_transition_time) or utcnow()
-                                self.sink.write("node_ready",
-                                                {"name": node_name, "ts": t4.isoformat()})
-                                break
+                    ready_cond = None
+                    for cond in (node.status.conditions or []):
+                        if cond.type == "Ready":
+                            ready_cond = cond
+                            break
+                    # --- T1c: kubelet's CNI-blocking message clears ---
+                    if t1c is None and ready_cond is not None:
+                        msg = (getattr(ready_cond, "message", "") or "")
+                        cni_blocking = (
+                            ready_cond.status != "True"
+                            and ("cni config uninitialized" in msg
+                                 or "NetworkPluginNotReady" in msg)
+                        )
+                        if cni_blocking:
+                            if not saw_cni_block:
+                                saw_cni_block = True
+                                self.sink.write("cni_conflist_blocking",
+                                                {"name": node_name,
+                                                 "message": msg[:200]})
+                        elif saw_cni_block:
+                            t1c = utcnow()
+                            self.sink.write("cni_conflist_observed",
+                                            {"name": node_name,
+                                             "ts": t1c.isoformat()})
+                    if t4 is None and ready_cond is not None and ready_cond.status == "True":
+                        t4 = _parse_k8s_time(ready_cond.last_transition_time) or utcnow()
+                        self.sink.write("node_ready",
+                                        {"name": node_name, "ts": t4.isoformat()})
                     if blocking:
                         present = {t.key for t in (node.spec.taints or [])} & blocking
                         if present:
@@ -240,7 +274,7 @@ class Collector:
                         # No blocking taints configured for this probe: T4b == T4.
                         t4b = t4
                     if t4 is not None and t4b is not None:
-                        return t4, t4b
+                        return t4, t4b, t1c
             except Exception as e:  # noqa: BLE001
                 self.sink.write("node_ready_watch_reopen",
                                 {"node": node_name, "error": type(e).__name__,
@@ -254,7 +288,7 @@ class Collector:
         self.sink.write("node_schedulable_timeout",
                         {"node": node_name, "keys": sorted(blocking),
                          "note": "blocking taint still present at deadline; T4b := T4"})
-        return t4, t4
+        return t4, t4, t1c
 
     # ----- T2/T3: CNI agent — pod-watch driven, no log access required -----
     def find_agent_pod(self, node_name: str, timeout_s: int = 120) -> client.V1Pod | None:

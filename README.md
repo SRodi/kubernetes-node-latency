@@ -26,6 +26,7 @@ scale) differ per platform.
 | **T1** Node registered | new `Node` first observed via watch (`creationTimestamp`) |
 | **T2** CNI agent container started | `pod.status.containerStatuses[*].state.running.startedAt` |
 | **T3** CNI agent Ready | agent Pod's `Ready` condition `lastTransitionTime` |
+| **T1c** CNI conflist placed | first watch event at which `Node.status.conditions[Ready].message` no longer reports `NetworkPluginNotReady` / `cni config uninitialized` — i.e. the CNI plugin (Cilium's `install-cni` init container, or kubelet itself in kubenet) dropped its conflist into `/etc/cni/net.d/`. Captured at observation time (`utcnow()`) since the condition message has no per-message timestamp. |
 | **T4** Node `Ready=True` | `Node.status.conditions[Ready].lastTransitionTime` |
 | **T4b** Node schedulable | first watch event after T4 with no CNI-applied `NoSchedule` taints (e.g. `node.cilium.io/agent-not-ready`) on `Node.spec.taints` |
 
@@ -34,9 +35,24 @@ Derived metrics (seconds):
 - `node_startup_latency_s    = T4  − T0` *(primary KPI — kubelet `Ready=True`)*
 - `time_to_schedulable_s     = T4b − T0` *(time until workload pods can be bound to the node)*
 - `node_register_latency_s   = T1  − T0`
+- `cni_conflist_install_s    = max(T1c − T1, 0)` *(kubelet sat with `NetworkPluginNotReady` for this long — this is the **only** CNI-side signal that actually blocks Node Ready on a vanilla kubelet, so it is the real "CNI induced Node-Ready delay")*
+- `post_conflist_ready_s     = max(T4  − T1c, 0)` *(residual kubelet readiness work after the conflist landed — typically a few seconds for the next status sync)*
 - `cilium_init_duration_s    = T3  − T2`
-- `cni_induced_delay_s       = max(T4  − T3, 0)` *(Cilium gating Node Ready; ≈ 0 on every supported provider in practice — kubelet flips Ready before agent Pod Ready)*
+- `cni_induced_delay_s       = max(T4  − T3, 0)` *(Cilium **agent Pod** gating Node Ready; ≈ 0 on every supported provider in practice — kubelet flips Ready before agent Pod Ready, because kubelet only needs the conflist (T1c), not the running agent)*
 - `cilium_scheduling_block_s = max(T4b − T4, 0)` *(Cilium gating pod scheduling via the `node.cilium.io/agent-not-ready:NoSchedule` taint — non-zero on AKS managed Cilium / BYOCNI, zero on GKE DPv2 and AKS kubenet because their CNI doesn't apply this taint)*
+
+> **Why `cni_conflist_install_s` is the "real" CNI-induced Node-Ready delay.**
+> A vanilla kubelet refuses to transition `Ready=True` until it sees at least
+> one usable CNI conflist in `/etc/cni/net.d/`. While that file is missing it
+> publishes `Ready=False` with `reason=KubeletNotReady` and
+> `message="container runtime network not ready: NetworkReady=false
+> reason=NetworkPluginNotReady message=Network plugin returns error: cni config
+> uninitialized"`. The first watch event where that marker disappears is T1c;
+> the kubelet's next status sync flips Node Ready=True (T4) very shortly
+> after. By contrast `cni_induced_delay_s` (T4 − T3) compares Node Ready to
+> the *agent Pod's* Ready condition — and in practice the agent Pod doesn't
+> need to be Ready for kubelet to be Ready, only its `install-cni` init
+> container needs to have run, so that metric reads ≈ 0 on every provider.
 
 > **Why both `cni_induced_delay_s` and `cilium_scheduling_block_s`?** They
 > measure two distinct gating mechanisms. AKS managed Cilium and Helm-installed

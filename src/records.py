@@ -39,6 +39,12 @@ class IterationRecord:
     # managed Cilium). Equals T4 on platforms where no such taint is
     # configured (GKE DPv2, AKS kubenet).
     T4b_schedulable: datetime | None = None
+    # First moment the kubelet's Ready=False condition stopped reporting
+    # `NetworkPluginNotReady / cni config uninitialized` — i.e. the CNI
+    # plugin dropped its conflist into /etc/cni/net.d/. This is the *only*
+    # CNI-side signal that blocks Node Ready on a vanilla kubelet, so the
+    # window T1c − T1 is the real CNI-induced Node-Ready delay.
+    T1c_cni_conflist: datetime | None = None
 
     status: str = "pending"  # pending|success|timeout|error
     error: str | None = None
@@ -62,10 +68,24 @@ class IterationRecord:
             "T3_cilium_ready": iso(self.T3_cilium_ready),
             "T4_node_ready": iso(self.T4_node_ready),
             "T4b_schedulable": iso(self.T4b_schedulable),
+            "T1c_cni_conflist": iso(self.T1c_cni_conflist),
             "node_startup_latency_s": delta(self.T4_node_ready, self.T0_pod_created),
             "time_to_schedulable_s": delta(self.T4b_schedulable, self.T0_pod_created),
             "node_register_latency_s": delta(self.T1_node_registered, self.T0_pod_created),
             "cilium_init_duration_s": delta(self.T3_cilium_ready, self.T2_cilium_started),
+            # CNI conflist placement is the only signal blocking Node Ready on
+            # a vanilla kubelet. cni_conflist_install_s = T1c − T1 measures
+            # how long kubelet sat with `NetworkPluginNotReady` after node
+            # registration; post_conflist_ready_s = T4 − T1c is the residual
+            # kubelet readiness work after the conflist landed.
+            "cni_conflist_install_s": (
+                max(delta(self.T1c_cni_conflist, self.T1_node_registered) or 0.0, 0.0)
+                if (self.T1c_cni_conflist and self.T1_node_registered) else None
+            ),
+            "post_conflist_ready_s": (
+                max(delta(self.T4_node_ready, self.T1c_cni_conflist) or 0.0, 0.0)
+                if (self.T1c_cni_conflist and self.T4_node_ready) else None
+            ),
             "cni_induced_delay_s": (
                 max(delta(self.T4_node_ready, self.T3_cilium_ready) or 0.0, 0.0)
                 if (self.T3_cilium_ready and self.T4_node_ready) else None
