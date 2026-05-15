@@ -418,3 +418,7 @@ harness at it via the `existing` provider:
 
 - **Replay.** `raw_events.jsonl` lets you re-run `analyze`/`plot` offline
   without re-provisioning clusters.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
