@@ -6,3 +6,4 @@ results/
 .kubeconfig-*
 *.egg-info/
 .pytest_cache/
+analysis/

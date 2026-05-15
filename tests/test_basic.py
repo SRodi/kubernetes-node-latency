@@ -85,6 +85,8 @@ def test_record_row_math():
     # then 2s of residual readiness work after the conflist landed.
     assert row["cni_conflist_install_s"] == 15.0
     assert row["post_conflist_ready_s"] == 2.0
+    # T4 − T1 = 17 — autoscaler-free counterpart to node_startup_latency_s.
+    assert row["node_ready_after_register_s"] == 17.0
 
 
 def test_record_row_math_aks_taint_gating():

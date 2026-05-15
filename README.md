@@ -20,26 +20,47 @@ scale) differ per platform.
 
 ### Timestamps and derived metrics
 
-| Marker | Source |
-|---|---|
-| **T0** Pod created | `Pod.metadata.creationTimestamp` |
-| **T1** Node registered | new `Node` first observed via watch (`creationTimestamp`) |
-| **T2** CNI agent container started | `pod.status.containerStatuses[*].state.running.startedAt` |
-| **T3** CNI agent Ready | agent Pod's `Ready` condition `lastTransitionTime` |
-| **T1c** CNI conflist placed | first watch event at which `Node.status.conditions[Ready].message` no longer reports `NetworkPluginNotReady` / `cni config uninitialized` — i.e. the CNI plugin (Cilium's `install-cni` init container, or kubelet itself in kubenet) dropped its conflist into `/etc/cni/net.d/`. Captured at observation time (`utcnow()`) since the condition message has no per-message timestamp. |
-| **T4** Node `Ready=True` | `Node.status.conditions[Ready].lastTransitionTime` |
-| **T4b** Node schedulable | first watch event after T4 with no CNI-applied `NoSchedule` taints (e.g. `node.cilium.io/agent-not-ready`) on `Node.spec.taints` |
+Each timestamp captures a specific transition in the lifecycle of a brand-new
+node. The table below names the marker, its concrete source, and — critically —
+**what's inside** the interval before it (i.e. which cloud / kubelet / CNI work
+contributes to the time from the previous marker to this one).
+
+| Marker | Source | What's inside the interval ending here |
+|---|---|---|
+| **T0** Pod created            | `Pod.metadata.creationTimestamp` | — (start) |
+| **T1** Node registered        | new `Node` object's `metadata.creationTimestamp`, first observed via watch | **Cloud-side autoscaler decision + VM allocation + VM boot + kubelet process startup**, ending when kubelet POSTs the Node to the apiserver. *Not* a measure of CNI or kubelet bootstrap. |
+| **T1c** CNI conflist placed   | first watch event at which `Node.status.conditions[Ready].message` no longer reports `NetworkPluginNotReady` / `cni config uninitialized`. Captured at observation time (`utcnow()`) since the condition message carries no per-message timestamp. | **CNI plugin work to place a conflist in `/etc/cni/net.d/`** — Cilium's `install-cni` init container (managed/BYOCNI/DPv2) or the kubelet itself (kubenet). This is the *only* CNI-side signal that actually blocks `Node Ready=True` on a vanilla kubelet. |
+| **T2** CNI agent container started | `pod.status.containerStatuses[*].state.running.startedAt` for the Cilium agent container on the new node | Image pull + container creation for the Cilium agent Pod (does **not** gate Node Ready — kubelet only needs T1c, not a running agent). |
+| **T3** CNI agent Ready        | agent Pod's `Ready` condition `lastTransitionTime` | Cilium agent internal bootstrap (BPF compile, k8s init, IPAM, endpoint restore) + readiness-probe lag. |
+| **T4** Node `Ready=True`      | `Node.status.conditions[Ready].lastTransitionTime` | Residual kubelet status sync after the conflist landed. Typically the next 10 s heartbeat tick, often coincident with T1c. |
+| **T4b** Node schedulable      | first watch event after T4 with no CNI-applied `NoSchedule` taint (e.g. `node.cilium.io/agent-not-ready`) on `Node.spec.taints` | Time the operator-applied scheduling-block taint remains after Node Ready (AKS managed Cilium / BYOCNI only — zero on GKE DPv2 and AKS kubenet). |
+
+**Decomposition of the end-to-end KPI:**
+
+```
+node_startup_latency_s  =  T4 − T0
+                        =  (T1 − T0)              +  (T1c − T1)              +  (T4 − T1c)
+                           = node_register_latency_s   = cni_conflist_install_s   = post_conflist_ready_s
+                           [autoscaler + VM bringup]  [CNI conflist install]    [residual kubelet sync]
+```
+
+Only the middle and right terms describe what the *node software stack* does
+once a VM exists. The left term is cloud control-plane work and varies by
+autoscaler / region / capacity. For cross-provider comparisons of CNI and
+kubelet behaviour, lead with `node_ready_after_register_s` (= middle + right),
+not `node_startup_latency_s`.
 
 Derived metrics (seconds):
 
-- `node_startup_latency_s    = T4  − T0` *(primary KPI — kubelet `Ready=True`)*
-- `time_to_schedulable_s     = T4b − T0` *(time until workload pods can be bound to the node)*
-- `node_register_latency_s   = T1  − T0`
-- `cni_conflist_install_s    = max(T1c − T1, 0)` *(kubelet sat with `NetworkPluginNotReady` for this long — this is the **only** CNI-side signal that actually blocks Node Ready on a vanilla kubelet, so it is the real "CNI induced Node-Ready delay")*
-- `post_conflist_ready_s     = max(T4  − T1c, 0)` *(residual kubelet readiness work after the conflist landed — typically a few seconds for the next status sync)*
-- `cilium_init_duration_s    = T3  − T2`
-- `cni_induced_delay_s       = max(T4  − T3, 0)` *(Cilium **agent Pod** gating Node Ready; ≈ 0 on every supported provider in practice — kubelet flips Ready before agent Pod Ready, because kubelet only needs the conflist (T1c), not the running agent)*
-- `cilium_scheduling_block_s = max(T4b − T4, 0)` *(Cilium gating pod scheduling via the `node.cilium.io/agent-not-ready:NoSchedule` taint — non-zero on AKS managed Cilium / BYOCNI, zero on GKE DPv2 and AKS kubenet because their CNI doesn't apply this taint)*
+- `node_startup_latency_s        = T4  − T0` *(end-to-end user-visible time; **includes** autoscaler + VM provisioning — quote alongside `node_register_latency_s` so the autoscaler component is visible)*
+- `time_to_schedulable_s         = T4b − T0` *(end-to-end time until workload pods can be bound)*
+- `node_register_latency_s       = T1  − T0` *(autoscaler + VM bringup + kubelet startup; cloud-side, not a node-software metric)*
+- `node_ready_after_register_s   = max(T4  − T1, 0)` *(**autoscaler-free** counterpart to `node_startup_latency_s`: kubelet-registered → Node Ready=True. Equals `cni_conflist_install_s + post_conflist_ready_s`. Use this when comparing CNI / kubelet bootstrap across providers.)*
+- `cni_conflist_install_s        = max(T1c − T1, 0)` *(time kubelet sat with `NetworkPluginNotReady` — the only CNI-side signal that actually blocks Node Ready on a vanilla kubelet)*
+- `post_conflist_ready_s         = max(T4  − T1c, 0)` *(residual kubelet readiness work after the conflist landed — typically the next status sync)*
+- `cilium_init_duration_s        = T3  − T2` *(Cilium agent container start → Ready; does **not** gate Node Ready)*
+- `cni_induced_delay_s           = max(T4  − T3, 0)` *(Cilium **agent Pod** gating Node Ready; ≈ 0 on every supported provider in practice — kubelet flips Ready before agent Pod Ready, because kubelet only needs the conflist (T1c), not the running agent)*
+- `cilium_scheduling_block_s     = max(T4b − T4, 0)` *(Cilium gating pod scheduling via the `node.cilium.io/agent-not-ready:NoSchedule` taint — non-zero on AKS managed Cilium / BYOCNI, zero on GKE DPv2 and AKS kubenet because their CNI doesn't apply this taint)*
 
 > **Why `cni_conflist_install_s` is the "real" CNI-induced Node-Ready delay.**
 > A vanilla kubelet refuses to transition `Ready=True` until it sees at least

@@ -72,6 +72,14 @@ class IterationRecord:
             "node_startup_latency_s": delta(self.T4_node_ready, self.T0_pod_created),
             "time_to_schedulable_s": delta(self.T4b_schedulable, self.T0_pod_created),
             "node_register_latency_s": delta(self.T1_node_registered, self.T0_pod_created),
+            # Autoscaler-free counterpart to node_startup_latency_s: the time
+            # from kubelet registering the Node (T1) to Node Ready=True (T4).
+            # Equals cni_conflist_install_s + post_conflist_ready_s and
+            # excludes the cloud-side autoscaler/VM-provisioning portion.
+            "node_ready_after_register_s": (
+                max(delta(self.T4_node_ready, self.T1_node_registered) or 0.0, 0.0)
+                if (self.T4_node_ready and self.T1_node_registered) else None
+            ),
             "cilium_init_duration_s": delta(self.T3_cilium_ready, self.T2_cilium_started),
             # CNI conflist placement is the only signal blocking Node Ready on
             # a vanilla kubelet. cni_conflist_install_s = T1c − T1 measures
