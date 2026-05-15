@@ -29,6 +29,7 @@ PROFILE_LANES = [
     # render a single lane here.
     ("CNI install-cni \u2192 conflist placed (kubelet blocked on CNI)",
                                               "T1_node_registered", "T1c_cni_conflist",   "cni"),
+    ("Cilium agent image pull",              "T_image_pull_start", "T_image_pulled",     "image_pull"),
     ("Kubelet: residual status sync",        "T1c_cni_conflist",   "T4_node_ready",      "kubelet"),
     ("Cilium agent bootstrap",               "T2_cilium_started",  "T3_cilium_ready",    "cilium"),
     ("Scheduling block (cilium taint)",      "T4_node_ready",      "T4b_schedulable",    "scheduler"),
@@ -40,6 +41,7 @@ ACTOR_COLORS = {
     "cni":           "#fb8c00",  # orange
     "cilium":        "#34a853",  # green
     "cilium_regen":  "#6087c5",  # mid-blue, lighter than darkest in regen zoom palette
+    "image_pull":    "#fbbf24",  # amber, matches image-pull segment in CNI zoom
     "scheduler":     "#ea4335",  # red
 }
 
@@ -299,7 +301,7 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
             ips = img_pull_start_off - t1_off
             ipe = img_pulled_off - t1_off
             if ipe > ips + 5e-3:
-                cni_breakdown.append(("image pull", ips, min(ipe, t1c_rel), "#fde68a"))
+                cni_breakdown.append(("cilium agent image pull", ips, min(ipe, t1c_rel), "#fbbf24"))
         # Init container chain after image-pulled (or after scheduler if no pull info).
         # Chain mean durations sequentially ending at T1c.
         if ic_means:
@@ -321,6 +323,7 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
         ("T1_node_registered", "T1"),
         ("T_taint_observed", "Tt"),
         ("T_pod_scheduled", "Ts"),
+        ("T_image_pull_start", "Tips"),
         ("T_image_pulled", "Tip"),
         ("T_csinode_ready", "Tcsi"),
         ("T1c_cni_conflist", "T1c"),
