@@ -9,13 +9,18 @@ Cilium, AKS BYOCNI + upstream Cilium, and AKS kubenet (no Cilium).
 
 Each iteration submits a single resource-heavy trigger Pod with `podAntiAffinity`
 against earlier iterations, forcing the platform to provision a brand-new node
-VM, while the harness watches the Kubernetes API to capture five timestamps
-from a common cluster clock: T0 Pod created, T1 Node registered, T2 CNI agent
-container started, T3 CNI agent Ready, T4 Node `Ready=True`. The primary KPI
-is `node_startup_latency = T4 − T0`; CNI's contribution is `T3 − T2` (parallel
-with node init) and any CNI-induced delay is `max(0, T3 − T4)`. The same code
-path runs across all four providers — only the cluster-creation primitive and
-the new-node trigger mechanism (Autopilot / NAP / cluster-autoscaler / manual
+VM, while the harness watches the Kubernetes API to capture a rich set of
+**lifecycle markers** from a common cluster clock — at minimum T0 Pod created,
+T1 Node registered, T1c CNI conflist placed, T2 CNI agent container started,
+T3 CNI agent Ready, T4 Node `Ready=True`, T4b Node schedulable (taints
+cleared), plus per-iteration enrichment that decomposes the T1→T1c window
+(scheduler latency, image-pull window, CSINode registration, blocking-taint
+observation, per-init-container durations). The primary KPI is
+`node_startup_latency = T4 − T0`; for cross-provider comparisons of node
+software stack behaviour lead with `node_ready_after_register_s = T4 − T1`,
+which excludes cloud autoscaler + VM bringup time. The same code path runs
+across all six providers — only the cluster-creation primitive and the
+new-node trigger mechanism (Autopilot / NAP / cluster-autoscaler / manual
 scale) differ per platform.
 
 ### Timestamps and derived metrics
@@ -29,11 +34,20 @@ contributes to the time from the previous marker to this one).
 |---|---|---|
 | **T0** Pod created            | `Pod.metadata.creationTimestamp` | — (start) |
 | **T1** Node registered        | new `Node` object's `metadata.creationTimestamp`, first observed via watch | **Cloud-side autoscaler decision + VM allocation + VM boot + kubelet process startup**, ending when kubelet POSTs the Node to the apiserver. *Not* a measure of CNI or kubelet bootstrap. |
+| **Tt** Blocking taint first observed | first watch event where the new Node carries a `NoSchedule` taint such as `node.cilium.io/agent-not-ready` (`T_taint_observed`) | Operator-stamping latency for the scheduling-block taint (AKS managed Cilium / BYOCNI only; absent on GKE DPv2 and AKS kubenet). |
+| **Ts** Cilium agent Pod scheduled | `Pod.status.conditions[PodScheduled].lastTransitionTime` for the new node's cilium-agent DS pod (`T_pod_scheduled`) | Scheduler queue time after the node registered. |
+| **Tips / Tip** Cilium agent image pull window | pod-scoped `Pulling` / `Pulled` Events for the cilium-agent container (`T_image_pull_start`, `T_image_pulled`) | Image pull duration for the agent container, measured on the new node. |
+| **Tcsi** CSINode registered   | first watch event where the Node's `Ready=False` message no longer carries `CSINode is not yet initialized` (`T_csinode_ready`) | kubelet's CSINode CRD registration after node creation — frequently the dominant gating signal in the T1→T1c window on AKS. |
 | **T1c** CNI conflist placed   | first watch event at which `Node.status.conditions[Ready].message` no longer reports `NetworkPluginNotReady` / `cni config uninitialized`. Captured at observation time (`utcnow()`) since the condition message carries no per-message timestamp. | **CNI plugin work to place a conflist in `/etc/cni/net.d/`** — Cilium's `install-cni` init container (managed/BYOCNI/DPv2) or the kubelet itself (kubenet). This is the *only* CNI-side signal that actually blocks `Node Ready=True` on a vanilla kubelet. |
 | **T2** CNI agent container started | `pod.status.containerStatuses[*].state.running.startedAt` for the Cilium agent container on the new node | Image pull + container creation for the Cilium agent Pod (does **not** gate Node Ready — kubelet only needs T1c, not a running agent). |
-| **T3** CNI agent Ready        | agent Pod's `Ready` condition `lastTransitionTime` | Cilium agent internal bootstrap (BPF compile, k8s init, IPAM, endpoint restore) + readiness-probe lag. |
+| **T3** CNI agent Ready        | agent Pod's `Ready` condition `lastTransitionTime` | Cilium agent internal bootstrap (BPF compile, k8s init, IPAM, endpoint restore) + readiness-probe lag. With `--deep-cilium`, decomposed further into `bpfCompilation`, `bpfWaitForELF`, `bpfLoadProg`, `waitingForLock`, `mapSync` per-phase means. |
 | **T4** Node `Ready=True`      | `Node.status.conditions[Ready].lastTransitionTime` | Residual kubelet status sync after the conflist landed. Typically the next 10 s heartbeat tick, often coincident with T1c. |
 | **T4b** Node schedulable      | first watch event after T4 with no CNI-applied `NoSchedule` taint (e.g. `node.cilium.io/agent-not-ready`) on `Node.spec.taints` | Time the operator-applied scheduling-block taint remains after Node Ready (AKS managed Cilium / BYOCNI only — zero on GKE DPv2 and AKS kubenet). |
+
+Per-iteration init-container timings (`initc_<name>_s`) are also captured for
+every init container on the Cilium agent pod (e.g. `install-cni-binaries`,
+`mount-cgroup`, `clean-cilium-state`) so the T1→T1c window can be attributed
+to specific install-cni steps.
 
 **Decomposition of the end-to-end KPI:**
 
@@ -98,7 +112,7 @@ Per-provider prerequisites:
 | Providers | Required tools |
 |---|---|
 | `gke_autopilot`, `gke_standard_dpv2` | `gcloud` authenticated |
-| `aks_overlay_cilium` | `az` logged in (`az login`), `kubectl` |
+| `aks_overlay_cilium`, `aks_kubenet` | `az` logged in (`az login`), `kubectl` |
 | `aks_byocni` | `az` logged in, `kubectl`, `helm` |
 | `existing` | a working `kubeconfig` for the target cluster |
 
@@ -207,13 +221,15 @@ Each run writes to `results/<run_id>/`:
 results/20260512-085541/
 ├── run_metadata.json      # run identity, effective config, cluster + CNI facts
 ├── raw_events.jsonl       # every watcher event for offline replay
-├── iterations.csv         # per-iteration row (T0..T4 + derived metrics)
+├── iterations.csv         # per-iteration row (T0..T4b + decomposition columns + derived metrics)
 ├── summary.csv            # aggregate stats per metric
 ├── summary.md             # human-readable Markdown report
 ├── summary.json           # machine-readable summary
+├── kubeconfig             # per-run isolated kubeconfig (parallel-safe)
 ├── iter-001/              # only with --deep-cilium: per-iteration Cilium artefacts
 │   ├── cilium_metrics.txt        # raw Prometheus dump from the agent on the new node
-│   └── cilium_deep_headline.json # parsed headline numbers (also merged into iterations.csv)
+│   ├── cilium_deep_headline.json # parsed headline numbers (also merged into iterations.csv)
+│   └── scraper_probe.log         # logs from the single-shot scraper Pod
 ├── cilium_config/         # one-shot Cilium configuration snapshot (agent + operator)
 │   ├── cilium-config.json        # full `cilium-config` ConfigMap
 │   ├── agent_daemonset.json      # full anetd / cilium-agent DaemonSet spec
@@ -224,7 +240,11 @@ results/20260512-085541/
     ├── box.png                  # distribution per metric
     ├── mean_stddev.png          # mean ± stddev bars
     ├── phase_stacked.png        # T0..T4 stacked breakdown per iteration
-    ├── phase_profile.png        # Gantt-style swimlane per actor (cloud/kubelet/cni/cilium/scheduler) on a shared time axis — shows which steps run in parallel and which are sequential
+    ├── phase_profile.png        # Gantt-style swimlane (kubelet / CNI / image-pull / cilium /
+    │                            # cilium-regen / scheduler) re-baselined to T1; T-markers
+    │                            # for T1, Tt, Ts, Tips, Tip, Tcsi, T1c, T2, T3, T4, T4b; plus
+    │                            # up to three zoomed sub-panels: T1→T1c CNI decomposition,
+    │                            # Cilium agent bootstrap, Cilium endpoint regeneration
     ├── latency_vs_iteration.png # drift / warm-up effects
     └── cdf.png                  # CDF with p50/p90/p99 markers
 ```
@@ -234,6 +254,9 @@ Re-analyze or re-plot without re-running, and overlay multiple runs:
 ```bash
 .venv/bin/python -m src.cli analyze results/<run_id>
 .venv/bin/python -m src.cli plot    results/<run_id>
+
+# re-plot the last N runs in one go
+.venv/bin/python -m src.cli plot --last 2
 
 .venv/bin/python -m src.cli plot results/gke-run \
     --compare results/aks-run results/aks-byocni-run
@@ -264,15 +287,21 @@ Prometheus `/metrics` endpoint on each new node right after T3 fires and
 capture:
 
 - **Bootstrap phase durations** from `cilium_bootstrap_seconds{scope=...}`
-  (`k8sInit`, `restoreState`, `bpfBase`, `ipam`, `proxyInit`, `total`).
-- `cilium_endpoint_regeneration_time_stats_seconds` (avg per scope),
-  `cilium_identity_count`, `cilium_bpf_map_pressure`, agent version.
+  — every published scope is captured, including `overall`, `earlyInit`,
+  `k8sInit`, `daemonInit`, `ipam`, `mapsInit`, `bpfBase`, `restoreState`,
+  `cleanup`, `fqdn`, `enableConntrack`, `healthCheck`.
+- **Endpoint regeneration phases** from
+  `cilium_endpoint_regeneration_time_stats_seconds{scope=...}` — average per
+  scope (`bpfCompilation`, `bpfWaitForELF`, `bpfLoadProg`,
+  `waitingForLock`, `mapSync`), plus `cilium_identity_count`,
+  `cilium_bpf_map_pressure`, agent version.
 
-Headline numbers are merged into `iterations.csv` as
-`cilium_bootstrap_{total,k8s_init,restore,bpf_base,ipam,proxy}_s`,
-`cilium_endpoint_regen_avg_s`, `cilium_identity_count`, and
-`cilium_version`. Raw artefacts land under
-`results/<run_id>/iter-<NNN>/`. Adds ~3-5s per iteration; off by default.
+Headline numbers are merged into `iterations.csv` as the
+`cilium_bootstrap_{total,early_init,k8s_init,daemon_init,ipam,maps_init,bpf_base,restore,cleanup,fqdn,enable_conntrack,health_check}_s`
+and `cilium_endpoint_regen_{avg,bpf_compilation,bpf_wait_for_elf,bpf_load_prog,waiting_for_lock,map_sync}_s`
+columns, along with `cilium_identity_count` and `cilium_version`. Raw
+artefacts land under `results/<run_id>/iter-<NNN>/`. Adds ~3-5s per
+iteration; off by default.
 
 **How it works (works on every supported platform, including GKE Autopilot).**
 A single-shot scraper Pod (`curlimages/curl`) is created in the `default`
@@ -300,27 +329,38 @@ src/
 ├── cli.py             argparse entrypoint (run|analyze|plot|report|clean)
 ├── config.py          YAML + dataclass config
 ├── runner.py          iteration loop
-├── collectors.py      K8s watchers, T0..T4 capture, cordon helpers
+├── collectors.py      K8s watchers, T0..T4b capture, T1→T1c enrichment (pod lifecycle, init containers, CSINode, taint)
 ├── records.py         IterationRecord + derived metrics
 ├── analysis.py        pandas aggregation -> CSV/MD/JSON
-├── plotting.py        matplotlib charts + --compare overlay
+├── plotting.py        matplotlib charts + --compare overlay (with T1→T1c, bootstrap, regen zoom subplots)
+├── report.py          deterministic md + docx comparison report
+├── cilium_deep.py     per-iteration Cilium /metrics scraper (bootstrap + regen phases)
+├── cilium_config.py   one-shot Cilium DS / operator / configmap snapshot
+├── metadata.py        run_metadata.json builder
 ├── providers/         cluster lifecycle per cloud (ClusterProvider Protocol)
+│   ├── _aks_base.py        shared AKS create / credentials / delete plumbing
+│   ├── _az.py              az CLI wrappers
+│   ├── _cli.py             gcloud helpers (in-flight op wait, retry)
 │   ├── gke_autopilot.py
 │   ├── gke_standard_dpv2.py
 │   ├── aks_overlay_cilium.py
 │   ├── aks_byocni.py
+│   ├── aks_kubenet.py
 │   └── existing.py
 └── cni/               CNI ready-signal probes
     ├── cilium_dpv2.py     # GKE Dataplane V2 (anetd)
-    └── cilium_generic.py  # upstream Cilium (AKS managed / BYOCNI)
+    ├── cilium_generic.py  # upstream Cilium (AKS managed / BYOCNI)
+    └── noop.py            # kubenet — no agent DaemonSet
 ```
 
 To add a provider, implement `ClusterProvider` in `src/providers/<name>.py`
 (`create`, `get_credentials`, `delete`, `node_autoprovision_hint`,
-`cni_probe`, optional `pre_iteration`/`post_iteration`), register it in
-`src/providers/__init__.py`, and add a `CNIProbe` under `src/cni/` if the
-agent's labels or ready signal differ. Runner, collectors, analysis, and
-plotting are cloud-agnostic.
+`cni_probe`, optional `describe`, `pre_iteration`/`post_iteration`), register
+it in `src/providers/__init__.py`, and add a `CNIProbe` under `src/cni/` if
+the agent's labels or ready signal differ. For AKS variants, subclass
+`AKSProviderBase` from `_aks_base.py` and override `_az_create_cluster_args`
+(plus optional `_post_create` for Helm-installed CNIs). Runner, collectors,
+analysis, and plotting are cloud-agnostic.
 
 ## Tests
 
@@ -329,11 +369,13 @@ plotting are cloud-agnostic.
 ```
 
 Unit tests cover parsers, derived-metric math, aggregation, plotting from
-synthetic fixtures, and mocked AKS provider invocations. Live AKS smoke test
-is opt-in:
+synthetic fixtures, mocked AKS provider invocations, and Cilium config /
+deep-metrics parsing. All tests run fully offline against fakes — no cloud
+credentials required. For a live smoke test on an actual cluster, point the
+harness at it via the `existing` provider:
 
 ```bash
-AKS_LIVE_TEST=1 .venv/bin/python -m src.cli run --provider aks_overlay_cilium --iterations 1
+.venv/bin/python -m src.cli run --provider existing --iterations 1
 ```
 
 ## Notes & caveats
