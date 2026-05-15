@@ -1,28 +1,13 @@
 """GKE Autopilot provider."""
 from __future__ import annotations
 
-import os
-from pathlib import Path
-
-from ..cni import get as get_probe
-from ..cni.base import CNIProbe
-from ._cli import gke_wait_for_inflight_ops, run, run_with_retry
-from .base import ClusterHandle, ClusterProvider
+from ._gke_base import GKEProviderBase
 
 
-class GKEAutopilotProvider(ClusterProvider):
+class GKEAutopilotProvider(GKEProviderBase):
     name = "gke_autopilot"
 
-    def __init__(self, cfg):
-        self.cfg = cfg
-
-    def _kubeconfig_path(self, cluster_name: str) -> Path:
-        if getattr(self.cfg, "kubeconfig_path", None):
-            return Path(self.cfg.kubeconfig_path)
-        return Path.cwd() / f".kubeconfig-{self.name}-{cluster_name}"
-
-    def create(self, cfg) -> ClusterHandle:
-        kc = self._kubeconfig_path(cfg.cluster_name)
+    def _gcloud_create_args(self, cfg) -> list[str]:
         cmd = [
             "gcloud", "container", "clusters", "create-auto", cfg.cluster_name,
             "--region", cfg.region,
@@ -35,46 +20,7 @@ class GKEAutopilotProvider(ClusterProvider):
             # additional metrics on managed clusters. The actual scrape ports
             # are auto-discovered from the agent Pod spec at run-time.
             cmd += ["--enable-dataplane-v2-flow-observability"]
-        run(cmd)
-        h = ClusterHandle(name=cfg.cluster_name, region=cfg.region,
-                          provider=self.name, kubeconfig=kc, created=True)
-        self.get_credentials(h)
-        return h
+        return cmd
 
-    def get_credentials(self, h: ClusterHandle) -> Path:
-        env = os.environ.copy()
-        env["KUBECONFIG"] = str(h.kubeconfig)
-        run([
-            "gcloud", "container", "clusters", "get-credentials", h.name,
-            "--region", h.region,
-        ], env=env)
-        return h.kubeconfig
-
-    def delete(self, h: ClusterHandle) -> None:
-        if not h.created:
-            return
-        # Autopilot serializes control-plane ops; a trailing housekeeping op
-        # (autorepair, scale-down) can return a 400 "incompatible operation"
-        # right after the last iteration. Block on in-flight ops, then retry
-        # with backoff as a safety net.
-        gke_wait_for_inflight_ops(h.name, h.region)
-        run_with_retry(
-            ["gcloud", "container", "clusters", "delete", h.name,
-             "--region", h.region, "--quiet"],
-            retry_on=("incompatible operation", "FAILED_PRECONDITION",
-                      "currently has operation"),
-        )
-
-    def node_autoprovision_hint(self) -> dict:
-        # Autopilot picks node class from pod resource requests; nothing extra needed.
-        return {"nodeSelector": {}, "tolerations": []}
-
-    def cni_probe(self) -> CNIProbe:
-        return get_probe("cilium_dpv2")
-
-    def describe(self, h: ClusterHandle) -> dict:
-        return {
-            "flavor": "autopilot",
-            "release_channel": self.cfg.release_channel,
-            "dataplane_v2": True,
-        }
+    def _describe_extra(self) -> dict:
+        return {"flavor": "autopilot"}
