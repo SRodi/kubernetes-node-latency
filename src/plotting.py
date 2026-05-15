@@ -27,7 +27,7 @@ PROFILE_LANES = [
     # writes its conflist into /etc/cni/net.d/. Both views (kubelet block,
     # CNI install-cni progress) describe the same wall-clock window, so we
     # render a single lane here.
-    ("CNI install-cni \u2192 conflist placed (kubelet blocked on CNI)",
+    ("Kubelet blocked on CNI (T1\u2192T1c)",
                                               "T1_node_registered", "T1c_cni_conflist",   "cni"),
     ("Cilium agent image pull",              "T_image_pull_start", "T_image_pulled",     "image_pull"),
     ("Kubelet: residual status sync",        "T1c_cni_conflist",   "T4_node_ready",      "kubelet"),
@@ -202,7 +202,7 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
         if s_off is None or e_off is None:
             continue
         dur = max(e_off - s_off, 0.0)
-        if dur <= 1e-3 and label != "Scheduling block (cilium taint)":
+        if dur <= 1e-3:
             continue
         lanes.append((label, s_off, e_off, actor))
 
@@ -279,62 +279,126 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
 
     all_lanes = lanes
 
-    # ---- T1\u2192T1c install-cni decomposition (wall-clock) ----
-    # Built from new enrichment columns: T_pod_scheduled, T_image_pulled,
-    # T_csinode_ready, plus init-container statuses parsed from
-    # init_containers_json. Each segment is mean-offset relative to T1.
+    # ---- T1->T1c "kubelet blocked on CNI" decomposition (wall-clock) ----
+    # Built from enrichment columns + init_containers_json. The whole
+    # T1->T1c window is sliced into contiguous, non-overlapping segments so
+    # the reader can see *exactly* what the kubelet is waiting on at each
+    # point in time. Coloring matches the main chart's CNI lane palette
+    # family (warm tones) so the relationship is visually obvious.
     cni_breakdown: list[tuple[str, float, float, str]] = []  # (label, start, end, color)
     t1c_target = _mean_offset("T1c_cni_conflist")
-    ic_means = _mean_init_container_durations(ok)
     pod_sched_off = _mean_offset("T_pod_scheduled")
     img_pull_start_off = _mean_offset("T_image_pull_start")
     img_pulled_off = _mean_offset("T_image_pulled")
+    # Init-container *absolute* offsets relative to each row's T1 — used to
+    # place init bars at their true position so gaps before/after are real
+    # (instead of being hidden by the previous chain-from-T1c heuristic).
+    if "T1_node_registered" in ok.columns:
+        ic_offsets = _mean_init_container_offsets(ok, ok["T1_node_registered"])
+    else:
+        ic_offsets = []
     if t1c_target is not None:
         t1c_rel = t1c_target - t1_off
-        # Scheduler latency: T1 \u2192 T_pod_scheduled
-        if pod_sched_off is not None:
-            sched = pod_sched_off - t1_off
-            if sched > 5e-3 and sched < t1c_rel:
-                cni_breakdown.append(("scheduler latency", 0.0, sched, "#c7d2fe"))
-        # Image pull window: T_image_pull_start \u2192 T_image_pulled
-        if img_pull_start_off is not None and img_pulled_off is not None:
-            ips = img_pull_start_off - t1_off
-            ipe = img_pulled_off - t1_off
-            if ipe > ips + 5e-3:
-                cni_breakdown.append(("cilium agent image pull", ips, min(ipe, t1c_rel), "#fbbf24"))
-        # Init container chain after image-pulled (or after scheduler if no pull info).
-        # Chain mean durations sequentially ending at T1c.
-        if ic_means:
-            chain_anchor_end = t1c_rel
-            chain_sum = sum(d for _, d in ic_means)
-            anchor_start = chain_anchor_end - chain_sum
-            cursor = anchor_start
-            palette_ic = ["#fed7aa", "#fdba74", "#fb923c", "#f97316",
-                          "#ea580c", "#c2410c", "#9a3412", "#7c2d12"]
-            for i, (name, dur) in enumerate(ic_means):
-                cni_breakdown.append((
-                    f"init: {name}", cursor, cursor + dur,
-                    palette_ic[i % len(palette_ic)],
-                ))
-                cursor += dur
+        # Color families: scheduler wait (lavender), runtime/image pull warm-up
+        # (light orange), image pull (amber, matches Tips/Tip lane), init
+        # containers (orange ramp), final install-cni write (cni-actor orange,
+        # matches top-chart "kubelet blocked on CNI" lane).
+        CNI_ACTOR_COLOR = ACTOR_COLORS["cni"]  # "#fb8c00"
+        palette_ic = ["#fed7aa", "#fdba74", "#fb923c", "#f97316",
+                      "#ea580c", "#c2410c", "#9a3412", "#7c2d12"]
 
-    markers: list[tuple[str, float]] = []
-    for col, glyph in [
+        # Compute fundamental boundaries we know about. Anything we don't
+        # know stays as a generic "kubelet/runtime prep" filler so the strip
+        # remains continuous from 0 to t1c_rel.
+        sched_off = (pod_sched_off - t1_off) if pod_sched_off is not None else None
+        ips_off = (img_pull_start_off - t1_off) if img_pull_start_off is not None else None
+        ipe_off = (img_pulled_off - t1_off) if img_pulled_off is not None else None
+
+        cursor = 0.0
+
+        def _push(label: str, start: float, end: float, color: str) -> None:
+            if end - start > 5e-3:
+                cni_breakdown.append((label, start, end, color))
+
+        # 1) scheduler latency (T1 -> Ts)
+        if sched_off is not None and sched_off > cursor and sched_off <= t1c_rel:
+            _push("scheduler latency\n(kube-scheduler binding)",
+                  cursor, sched_off, "#c7d2fe")
+            cursor = sched_off
+
+        # 2) Ts -> Tips: kubelet prep, sandbox + image-pull initiation
+        if ips_off is not None and ips_off > cursor and ips_off <= t1c_rel:
+            _push("kubelet sandbox + image-pull init",
+                  cursor, ips_off, "#fde68a")
+            cursor = ips_off
+
+        # 3) image pull
+        if ipe_off is not None and ipe_off > cursor and ipe_off <= t1c_rel:
+            _push("cilium agent image pull",
+                  cursor, min(ipe_off, t1c_rel), "#fbbf24")
+            cursor = min(ipe_off, t1c_rel)
+
+        # 4) init container chain (absolute timestamps if available; else
+        #    fall back to chaining mean durations sequentially after cursor).
+        first_init_start: float | None = None
+        last_init_end: float | None = None
+        if ic_offsets:
+            # Squeeze into [cursor, t1c_rel]: drop init bars outside the
+            # window; clip those that straddle it.
+            for name, s_off, e_off in ic_offsets:
+                if e_off <= cursor or s_off >= t1c_rel:
+                    continue
+                first_init_start = s_off if first_init_start is None else min(first_init_start, s_off)
+                last_init_end = e_off if last_init_end is None else max(last_init_end, e_off)
+            if first_init_start is not None and first_init_start > cursor:
+                _push("runc / init-chain spin-up",
+                      cursor, first_init_start, "#fed7aa")
+                cursor = first_init_start
+            for i, (name, s_off, e_off) in enumerate(ic_offsets):
+                s_clip = max(s_off, cursor)
+                e_clip = min(e_off, t1c_rel)
+                if e_clip - s_clip <= 5e-3:
+                    continue
+                _push(f"init: {name}", s_clip, e_clip,
+                      palette_ic[i % len(palette_ic)])
+                cursor = max(cursor, e_clip)
+
+        # 5) tail: cursor -> T1c is the actual install-cni script writing the
+        #    conflist + binaries (or, if no init data, kubelet/runtime tail).
+        if cursor < t1c_rel - 5e-3:
+            tail_label = "install-cni: write /etc/cni/net.d/*.conflist" if ic_offsets \
+                else "kubelet blocked on CNI (no init detail)"
+            _push(tail_label, cursor, t1c_rel, CNI_ACTOR_COLOR)
+
+    # Markers on the main (top) chart: high-level milestones only.
+    # Fine-grained sub-events (Tt, Ts, Tips, Tip, Tcsi, T1c) live entirely
+    # inside the T1->T1c window and are rendered on the CNI zoom subplot.
+    MAIN_MARKERS = [
         ("T1_node_registered", "T1"),
-        ("T_taint_observed", "Tt"),
-        ("T_pod_scheduled", "Ts"),
-        ("T_image_pull_start", "Tips"),
-        ("T_image_pulled", "Tip"),
-        ("T_csinode_ready", "Tcsi"),
         ("T1c_cni_conflist", "T1c"),
         ("T2_cilium_started", "T2"),
         ("T3_cilium_ready", "T3"),
         ("T4_node_ready", "T4"),
         ("T4b_schedulable", "T4b"),
-    ]:
+    ]
+    ZOOM_MARKERS = [
+        ("T_taint_observed", "Tt"),
+        ("T_pod_scheduled", "Ts"),
+        ("T_image_pull_start", "Tips"),
+        ("T_image_pulled", "Tip"),
+        ("T_csinode_ready", "Tcsi"),
+    ]
+    markers: list[tuple[str, float]] = []
+    for col, glyph in MAIN_MARKERS:
         off = _mean_offset(col)
-        if off is not None:
-            markers.append((glyph, off - t1_off))
+        if off is None:
+            continue
+        # Suppress T4b if it coincides with T4 (zero scheduling block).
+        if glyph == "T4b":
+            t4 = _mean_offset("T4_node_ready")
+            if t4 is not None and abs(off - t4) <= 1e-3:
+                continue
+        markers.append((glyph, off - t1_off))
 
     # Layout: main wall-clock Gantt on top, plus optional zoomed subplots
     # (CNI add\u2192Ready decomposition, Cilium-internal bootstrap).
@@ -423,6 +487,18 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
                     arrowprops=dict(arrowstyle="-", color="grey",
                                     linewidth=0.4, shrinkA=0, shrinkB=0),
                 )
+        # Mark fine-grained sub-events inside the zoom (replaces the markers
+        # that used to clutter the main chart).
+        for col, glyph in ZOOM_MARKERS:
+            off = _mean_offset(col)
+            if off is None:
+                continue
+            x = off - t1_off
+            if not (bd_start <= x <= bd_end):
+                continue
+            ax_cni_bd.axvline(x, color="black", linestyle=":", alpha=0.35, linewidth=0.8)
+            ax_cni_bd.text(x, 1.95, glyph, ha="center", va="top",
+                           fontsize=8, color="black")
         # Mark T_csinode_ready inside the zoom if available
         t_csi_off = _mean_offset("T_csinode_ready")
         if t_csi_off is not None:
@@ -434,11 +510,11 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
         ax_cni_bd.set_xlim(bd_start - bd_total * 0.05, bd_end + bd_total * 0.05)
         ax_cni_bd.set_ylim(0, 2.0)
         ax_cni_bd.set_yticks([0.5])
-        ax_cni_bd.set_yticklabels(["CNI add \u2192 T1c\n(zoomed)"], fontsize=8)
-        ax_cni_bd.set_xlabel("seconds since T1 (node registered) — zoomed view of the T1\u2192T1c install-cni window")
+        ax_cni_bd.set_yticklabels(["kubelet blocked\non CNI (zoomed)"], fontsize=8)
+        ax_cni_bd.set_xlabel("seconds since T1 (node registered) \u2014 zoomed view of the T1\u2192T1c window (kubelet blocked on CNI)")
         ax_cni_bd.set_title(
-            f"CNI add \u2192 Node Ready internal breakdown — total T1\u2192T1c {bd_total:.2f}s "
-            f"(scheduler latency + image pull + init container chain)",
+            f"Kubelet blocked on CNI \u2014 T1\u2192T1c {bd_total:.2f}s: "
+            f"scheduler latency \u2192 image pull \u2192 init-container chain \u2192 install-cni conflist write",
             fontsize=9, loc="left",
         )
         ax_cni_bd.grid(True, axis="x", alpha=0.3)
@@ -551,12 +627,89 @@ def _mean_init_container_durations(ok: pd.DataFrame) -> list[tuple[str, float]]:
     Each entry is (name, mean_duration_seconds). Containers with < 5 ms mean
     are filtered out — they'd be invisible in the plot.
     """
+    rows = _init_container_windows(ok)
+    durations: dict[str, list[float]] = {}
+    order: list[str] = []
+    for name, _start, _end, dur in rows:
+        if name not in durations:
+            durations[name] = []
+            order.append(name)
+        durations[name].append(dur)
+    out: list[tuple[str, float]] = []
+    for name in order:
+        vals = durations[name]
+        if not vals:
+            continue
+        mean = sum(vals) / len(vals)
+        if mean >= 5e-3:
+            out.append((name, mean))
+    return out
+
+
+def _mean_init_container_offsets(ok: pd.DataFrame, t1_off_per_row: pd.Series) -> list[tuple[str, float, float]]:
+    """Return per-init-container (name, mean_start_offset_s, mean_end_offset_s)
+    relative to T1, using absolute timestamps in init_containers_json.
+
+    `t1_off_per_row` must be aligned with `ok` and contain each iteration's
+    T1 absolute time as a pandas datetime; rows where T1 is missing are
+    skipped.
+    """
     if "init_containers_json" not in ok.columns:
         return []
     import json as _json
     from datetime import datetime as _dt
-    durations: dict[str, list[float]] = {}
+    starts: dict[str, list[float]] = {}
+    ends: dict[str, list[float]] = {}
     order: list[str] = []
+    t1_series = pd.to_datetime(t1_off_per_row, utc=True, errors="coerce")
+    for raw, t1 in zip(ok["init_containers_json"], t1_series):
+        if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+            continue
+        if pd.isna(t1):
+            continue
+        try:
+            entries = _json.loads(raw)
+        except Exception:
+            continue
+        for entry in entries:
+            name = entry.get("name")
+            sa = entry.get("started_at")
+            fa = entry.get("finished_at")
+            if not (name and sa and fa):
+                continue
+            try:
+                sa_t = _dt.fromisoformat(sa.replace("Z", "+00:00"))
+                fa_t = _dt.fromisoformat(fa.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            s_off = (sa_t - t1.to_pydatetime()).total_seconds()
+            e_off = (fa_t - t1.to_pydatetime()).total_seconds()
+            if name not in starts:
+                starts[name] = []
+                ends[name] = []
+                order.append(name)
+            starts[name].append(s_off)
+            ends[name].append(e_off)
+    out: list[tuple[str, float, float]] = []
+    for name in order:
+        s_mean = sum(starts[name]) / len(starts[name])
+        e_mean = sum(ends[name]) / len(ends[name])
+        if e_mean - s_mean >= 5e-3:
+            out.append((name, s_mean, e_mean))
+    out.sort(key=lambda x: x[1])
+    return out
+
+
+def _init_container_windows(ok: pd.DataFrame) -> list[tuple[str, float, float, float]]:
+    """Internal helper: yield (name, start_epoch, end_epoch, duration) for
+    every init-container row across iterations. Used by both duration and
+    offset helpers.
+    """
+    if "init_containers_json" not in ok.columns:
+        return []
+    import json as _json
+    from datetime import datetime as _dt
+    rows: list[tuple[str, float, float, float]] = []
     for raw in ok["init_containers_json"].dropna():
         try:
             entries = _json.loads(raw)
@@ -574,19 +727,8 @@ def _mean_init_container_durations(ok: pd.DataFrame) -> list[tuple[str, float]]:
             except Exception:
                 continue
             dur = max((fa_t - sa_t).total_seconds(), 0.0)
-            if name not in durations:
-                durations[name] = []
-                order.append(name)
-            durations[name].append(dur)
-    out: list[tuple[str, float]] = []
-    for name in order:
-        vals = durations[name]
-        if not vals:
-            continue
-        mean = sum(vals) / len(vals)
-        if mean >= 5e-3:
-            out.append((name, mean))
-    return out
+            rows.append((name, sa_t.timestamp(), fa_t.timestamp(), dur))
+    return rows
 
 
 def _backfill_taint_observed(df: pd.DataFrame, run_dir: Path) -> None:
