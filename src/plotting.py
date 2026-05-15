@@ -23,8 +23,11 @@ PHASE_COLS = [
 # concurrent processes are happening on the same time-window.
 PROFILE_LANES = [
     ("Cloud / autoscaler + VM bringup",      "T0_pod_created",     "T1_node_registered", "cloud"),
-    ("Kubelet: NetworkPluginNotReady",       "T1_node_registered", "T1c_cni_conflist",   "kubelet"),
-    ("CNI plugin: install-cni \u2192 conflist placed",
+    # T1 \u2192 T1c: kubelet reports NetworkPluginNotReady until the CNI plugin
+    # writes its conflist into /etc/cni/net.d/. Both views (kubelet block,
+    # CNI install-cni progress) describe the same wall-clock window, so we
+    # render a single lane here.
+    ("CNI install-cni \u2192 conflist placed (kubelet blocked on CNI)",
                                               "T1_node_registered", "T1c_cni_conflist",   "cni"),
     ("Kubelet: residual status sync",        "T1c_cni_conflist",   "T4_node_ready",      "kubelet"),
     ("Cilium agent container running",       "T2_cilium_started",  "T3_cilium_ready",    "cilium"),
