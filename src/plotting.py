@@ -157,6 +157,8 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
 
     lanes: list[tuple[str, float, float, str]] = []
     for label, start_col, end_col, actor in PROFILE_LANES:
+        if actor == "cloud":
+            continue  # rendered as a numeric annotation, not a bar
         s_off = _mean_offset(start_col)
         e_off = _mean_offset(end_col)
         if s_off is None or e_off is None:
@@ -169,9 +171,16 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
     if not lanes:
         return None
 
+    # Re-baseline x-axis to T1 (node registered) so the much smaller post-T1
+    # phases are readable. The autoscaler/VM bringup duration is shown as a
+    # numeric annotation in the title instead.
+    t1_off = _mean_offset("T1_node_registered") or 0.0
+    cloud_dur = t1_off  # T1 - T0
+    lanes = [(label, s_off - t1_off, e_off - t1_off, actor)
+             for (label, s_off, e_off, actor) in lanes]
+
     markers: list[tuple[str, float]] = []
     for col, glyph in [
-        ("T0_pod_created", "T0"),
         ("T1_node_registered", "T1"),
         ("T1c_cni_conflist", "T1c"),
         ("T2_cilium_started", "T2"),
@@ -181,7 +190,7 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
     ]:
         off = _mean_offset(col)
         if off is not None:
-            markers.append((glyph, off))
+            markers.append((glyph, off - t1_off))
 
     fig, ax = plt.subplots(figsize=(11, 4 + 0.35 * len(lanes)))
     y_positions = np.arange(len(lanes), 0, -1)  # top-down listing
@@ -205,11 +214,12 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
 
     ax.set_yticks(y_positions)
     ax.set_yticklabels([label for label, _, _, _ in lanes])
-    ax.set_xlabel("seconds since T0 (pod created)")
+    ax.set_xlabel("seconds since T1 (node registered)")
     ax.set_ylim(0.2, len(lanes) + 1.2)
     ax.set_title(
         f"Phase profile {title}\n"
-        "Bars on overlapping x-ranges happen in parallel; back-to-back bars are sequential."
+        f"Cloud / autoscaler + VM bringup (T0\u2192T1): {cloud_dur:.2f}s (not shown)  \u2014  "
+        "bars overlapping on x = parallel; back-to-back = sequential."
     )
     ax.grid(True, axis="x", alpha=0.3)
 
