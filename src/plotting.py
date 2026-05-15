@@ -18,6 +18,28 @@ PHASE_COLS = [
 ]
 
 
+# Profile lanes: each entry is (lane label, start column, end column, actor key).
+# `actor` controls the bar colour so the reader can immediately see which
+# concurrent processes are happening on the same time-window.
+PROFILE_LANES = [
+    ("Cloud / autoscaler + VM bringup",      "T0_pod_created",     "T1_node_registered", "cloud"),
+    ("Kubelet: NetworkPluginNotReady",       "T1_node_registered", "T1c_cni_conflist",   "kubelet"),
+    ("CNI plugin: install-cni \u2192 conflist placed",
+                                              "T1_node_registered", "T1c_cni_conflist",   "cni"),
+    ("Kubelet: residual status sync",        "T1c_cni_conflist",   "T4_node_ready",      "kubelet"),
+    ("Cilium agent container running",       "T2_cilium_started",  "T3_cilium_ready",    "cilium"),
+    ("Scheduling block (cilium taint)",      "T4_node_ready",      "T4b_schedulable",    "scheduler"),
+]
+
+ACTOR_COLORS = {
+    "cloud":     "#9aa0a6",  # grey
+    "kubelet":   "#4285f4",  # blue
+    "cni":       "#fb8c00",  # orange
+    "cilium":    "#34a853",  # green
+    "scheduler": "#ea4335",  # red
+}
+
+
 def _seconds(a: pd.Series, b: pd.Series) -> pd.Series:
     return (pd.to_datetime(a, utc=True, errors="coerce")
             - pd.to_datetime(b, utc=True, errors="coerce")).dt.total_seconds()
@@ -109,7 +131,100 @@ def plot_all(iterations_csv: Path, out_dir: Path, *, title: str = "") -> list[Pa
         ax.grid(True, alpha=0.3); ax.set_ylim(0, 1.02)
         p = out_dir / "cdf.png"; fig.tight_layout(); fig.savefig(p, dpi=140); plt.close(fig); paths.append(p)
 
+    # 6. profile / Gantt: each phase as a swimlane on a shared time axis so the
+    #    reader can see at a glance which lifecycle steps overlap in time
+    #    (vertically stacked = parallel) and which are sequential.
+    p = _plot_phase_profile(ok, out_dir, title=title)
+    if p is not None:
+        paths.append(p)
+
     return paths
+
+
+def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path | None:
+    """Per-run mean-aligned Gantt of every captured phase."""
+    if ok.empty:
+        return None
+
+    def _mean_offset(col: str) -> float | None:
+        if col not in ok.columns:
+            return None
+        s = _seconds(ok[col], ok["T0_pod_created"])
+        s = s[s.notna()]
+        if s.empty:
+            return None
+        return float(s.mean())
+
+    lanes: list[tuple[str, float, float, str]] = []
+    for label, start_col, end_col, actor in PROFILE_LANES:
+        s_off = _mean_offset(start_col)
+        e_off = _mean_offset(end_col)
+        if s_off is None or e_off is None:
+            continue
+        dur = max(e_off - s_off, 0.0)
+        if dur <= 1e-3 and label != "Scheduling block (cilium taint)":
+            continue
+        lanes.append((label, s_off, e_off, actor))
+
+    if not lanes:
+        return None
+
+    markers: list[tuple[str, float]] = []
+    for col, glyph in [
+        ("T0_pod_created", "T0"),
+        ("T1_node_registered", "T1"),
+        ("T1c_cni_conflist", "T1c"),
+        ("T2_cilium_started", "T2"),
+        ("T3_cilium_ready", "T3"),
+        ("T4_node_ready", "T4"),
+        ("T4b_schedulable", "T4b"),
+    ]:
+        off = _mean_offset(col)
+        if off is not None:
+            markers.append((glyph, off))
+
+    fig, ax = plt.subplots(figsize=(11, 4 + 0.35 * len(lanes)))
+    y_positions = np.arange(len(lanes), 0, -1)  # top-down listing
+    used_actors: list[str] = []
+    for (label, s_off, e_off, actor), y in zip(lanes, y_positions):
+        dur = e_off - s_off
+        color = ACTOR_COLORS.get(actor, "#888888")
+        ax.barh(y, max(dur, 0.05), left=s_off, height=0.55, color=color,
+                edgecolor="black", linewidth=0.5)
+        text = f"{dur:.2f}s"
+        ax.text(s_off + dur / 2 if dur > 1.5 else e_off + 0.4, y, text,
+                va="center", ha="center" if dur > 1.5 else "left",
+                fontsize=8, color="white" if dur > 1.5 else "black")
+        if actor not in used_actors:
+            used_actors.append(actor)
+
+    for glyph, off in markers:
+        ax.axvline(off, color="black", linestyle=":", alpha=0.35, linewidth=0.8)
+        ax.text(off, len(lanes) + 0.6, glyph, ha="center", va="bottom",
+                fontsize=8, color="black")
+
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels([label for label, _, _, _ in lanes])
+    ax.set_xlabel("seconds since T0 (pod created)")
+    ax.set_ylim(0.2, len(lanes) + 1.2)
+    ax.set_title(
+        f"Phase profile {title}\n"
+        "Bars on overlapping x-ranges happen in parallel; back-to-back bars are sequential."
+    )
+    ax.grid(True, axis="x", alpha=0.3)
+
+    from matplotlib.patches import Patch
+    legend_handles = [
+        Patch(facecolor=ACTOR_COLORS[a], edgecolor="black", label=a)
+        for a in used_actors
+    ]
+    ax.legend(handles=legend_handles, loc="lower right", fontsize=8, title="actor")
+
+    p = out_dir / "phase_profile.png"
+    fig.tight_layout()
+    fig.savefig(p, dpi=140)
+    plt.close(fig)
+    return p
 
 
 def plot_compare(csvs: list[Path], out_dir: Path) -> list[Path]:

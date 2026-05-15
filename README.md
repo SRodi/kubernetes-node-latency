@@ -223,7 +223,8 @@ results/20260512-085541/
 └── plots/
     ├── box.png                  # distribution per metric
     ├── mean_stddev.png          # mean ± stddev bars
-    ├── phase_stacked.png        # T0..T4 breakdown per iteration
+    ├── phase_stacked.png        # T0..T4 stacked breakdown per iteration
+    ├── phase_profile.png        # Gantt-style swimlane per actor (cloud/kubelet/cni/cilium/scheduler) on a shared time axis — shows which steps run in parallel and which are sequential
     ├── latency_vs_iteration.png # drift / warm-up effects
     └── cdf.png                  # CDF with p50/p90/p99 markers
 ```
