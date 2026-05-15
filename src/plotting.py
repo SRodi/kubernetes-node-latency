@@ -30,7 +30,7 @@ PROFILE_LANES = [
     ("CNI install-cni \u2192 conflist placed (kubelet blocked on CNI)",
                                               "T1_node_registered", "T1c_cni_conflist",   "cni"),
     ("Kubelet: residual status sync",        "T1c_cni_conflist",   "T4_node_ready",      "kubelet"),
-    ("Cilium agent container running",       "T2_cilium_started",  "T3_cilium_ready",    "cilium"),
+    ("Cilium agent bootstrap",               "T2_cilium_started",  "T3_cilium_ready",    "cilium"),
     ("Scheduling block (cilium taint)",      "T4_node_ready",      "T4b_schedulable",    "scheduler"),
 ]
 
@@ -39,7 +39,7 @@ ACTOR_COLORS = {
     "kubelet":       "#4285f4",  # blue
     "cni":           "#fb8c00",  # orange
     "cilium":        "#34a853",  # green
-    "cilium_sub":    "#1b7a36",  # darker green for internal sub-phases
+    "cilium_regen":  "#6087c5",  # mid-blue, lighter than darkest in regen zoom palette
     "scheduler":     "#ea4335",  # red
 }
 
@@ -247,6 +247,34 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
             cilium_breakdown.append((short, cursor, cursor + dur))
             cursor += dur
 
+    # ---- Cilium endpoint regeneration (per-endpoint avg, post-T3) ----
+    # These are *per-endpoint average* durations, not wall-clock — but they
+    # represent the agent's per-endpoint regen budget that runs after T3.
+    # We render them chained as a single lane in the main Gantt anchored at
+    # T3, and as a zoomed subplot below (mirrors the bootstrap layout).
+    regen_means: list[tuple[str, float]] = []
+    for label, col in CILIUM_REGEN_PHASES:
+        m = _mean_offset_metric(ok, col)
+        if m is None or m < 5e-3:
+            continue
+        regen_means.append((label, m))
+    regen_breakdown: list[tuple[str, float, float]] = []
+    regen_total = 0.0
+    if regen_means and t3_off is not None:
+        regen_total = sum(m for _, m in regen_means)
+        cursor = t3_off - t1_off
+        for label, dur in regen_means:
+            short = label.replace("regen.", "")
+            regen_breakdown.append((short, cursor, cursor + dur))
+            cursor += dur
+        # Add a synthetic lane to the main Gantt summarising the whole
+        # post-T3 regen budget. `lanes` has already been rebased to T1, so
+        # we use T1-relative offsets here too.
+        lanes.append((
+            "Cilium endpoint regeneration (per-endpoint avg, post-T3)",
+            t3_off - t1_off, t3_off - t1_off + regen_total, "cilium_regen",
+        ))
+
     all_lanes = lanes
 
     # ---- T1\u2192T1c install-cni decomposition (wall-clock) ----
@@ -309,8 +337,9 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
     # (CNI add\u2192Ready decomposition, Cilium-internal bootstrap).
     has_cilium_bd = bool(cilium_breakdown)
     has_cni_bd = bool(cni_breakdown)
+    has_regen_bd = bool(regen_breakdown)
     n_main = len(all_lanes)
-    sub_count = (1 if has_cni_bd else 0) + (1 if has_cilium_bd else 0)
+    sub_count = (1 if has_cni_bd else 0) + (1 if has_cilium_bd else 0) + (1 if has_regen_bd else 0)
     fig_height = 4 + 0.35 * n_main + 2.0 * sub_count
     if sub_count:
         ratios = [max(n_main, 4)] + [2.0] * sub_count
@@ -325,6 +354,7 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
         sub_axes = []
     ax_cni_bd = sub_axes.pop(0) if has_cni_bd else None
     ax_bd = sub_axes.pop(0) if has_cilium_bd else None
+    ax_regen = sub_axes.pop(0) if has_regen_bd else None
 
     y_positions = np.arange(n_main, 0, -1)  # top-down listing
     used_actors: list[str] = []
@@ -350,21 +380,10 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
     ax.set_xlabel("seconds since T1 (node registered)")
     ax.set_ylim(0.2, n_main + 1.2)
 
-    regen_bits: list[str] = []
-    for label, col in CILIUM_REGEN_PHASES:
-        m = _mean_offset_metric(ok, col)
-        if m is not None and m >= 5e-3:
-            regen_bits.append(f"{label.replace('regen.','')}={m:.2f}s")
-    regen_note = (
-        "endpoint-regen avg (per-endpoint, post-T3): " + ", ".join(regen_bits)
-    ) if regen_bits else ""
-
     title_lines = [
         f"Phase profile {title}",
         f"Cloud / autoscaler + VM bringup (T0\u2192T1): {cloud_dur:.2f}s (not shown)",
     ]
-    if regen_note:
-        title_lines.append(regen_note)
     title_lines.append("bars overlapping on x = parallel; back-to-back = sequential.")
     ax.set_title("\n".join(title_lines), fontsize=9, loc="center")
     ax.grid(True, axis="x", alpha=0.3)
@@ -374,7 +393,7 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
         Patch(facecolor=ACTOR_COLORS[a], edgecolor="black", label=a)
         for a in used_actors
     ]
-    ax.legend(handles=legend_handles, loc="lower right", fontsize=8, title="actor")
+    ax.legend(handles=legend_handles, loc="lower left", fontsize=8, title="actor")
 
     # ---- T1\u2192T1c install-cni decomposition (zoomed) ----
     if has_cni_bd and ax_cni_bd is not None:
@@ -456,14 +475,54 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
         ax_bd.set_xlim(bd_start - bd_total * 0.05, bd_end + bd_total * 0.05)
         ax_bd.set_ylim(0, 2.0)
         ax_bd.set_yticks([0.5])
-        ax_bd.set_yticklabels(["Cilium bootstrap\n(zoomed)"], fontsize=9)
+        ax_bd.set_yticklabels(["Cilium agent\nbootstrap"], fontsize=9)
         ax_bd.set_xlabel("seconds since T1 (node registered) — zoomed view of the cilium-agent bootstrap window")
         ax_bd.set_title(
-            f"Cilium agent internal breakdown — image-pull / cont start "
+            f"Cilium agent bootstrap \u2014 container-start \u2192 bootstrap gap "
             f"{pre_bs_dur:.2f}s, then bootstrap phases (zoomed) total {bd_total:.2f}s",
             fontsize=9, loc="left",
         )
         ax_bd.grid(True, axis="x", alpha=0.3)
+
+    # ---- Cilium endpoint regeneration (zoomed, per-endpoint avg) ----
+    if has_regen_bd and ax_regen is not None:
+        palette = ["#bfdbfe", "#93c5fd", "#60a5fa", "#3b82f6", "#2563eb",
+                   "#1d4ed8", "#1e40af", "#1e3a8a"]
+        bd_start = regen_breakdown[0][1]
+        bd_end = regen_breakdown[-1][2]
+        bd_total = bd_end - bd_start
+        for i, (label, s, e) in enumerate(regen_breakdown):
+            dur = e - s
+            color = palette[i % len(palette)]
+            ax_regen.barh(0.5, dur, left=s, height=0.7, color=color,
+                          edgecolor="black", linewidth=0.4)
+            rel = dur / bd_total if bd_total > 0 else 0
+            inline = rel > 0.20
+            txt = f"{label}\n{dur*1000:.0f}ms" if dur < 0.5 else f"{label}\n{dur:.2f}s"
+            if inline:
+                ax_regen.text(s + dur / 2, 0.5, txt, ha="center", va="center",
+                              fontsize=7,
+                              color="white" if i >= 4 else "black")
+            else:
+                y_label = 1.05 + 0.30 * (i % 2)
+                ax_regen.annotate(
+                    txt,
+                    xy=(s + dur / 2, 0.85),
+                    xytext=(s + dur / 2, y_label),
+                    ha="center", va="bottom", fontsize=7, color="black",
+                    arrowprops=dict(arrowstyle="-", color="grey",
+                                    linewidth=0.4, shrinkA=0, shrinkB=0),
+                )
+        ax_regen.set_xlim(bd_start - bd_total * 0.05, bd_end + bd_total * 0.05)
+        ax_regen.set_ylim(0, 2.0)
+        ax_regen.set_yticks([0.5])
+        ax_regen.set_yticklabels(["Cilium endpoint\nregeneration"], fontsize=8)
+        ax_regen.set_xlabel("seconds since T1 (node registered) \u2014 per-endpoint avg, anchored at T3")
+        ax_regen.set_title(
+            f"Cilium endpoint regeneration (per-endpoint avg, post-T3) \u2014 total {bd_total:.2f}s",
+            fontsize=9, loc="left",
+        )
+        ax_regen.grid(True, axis="x", alpha=0.3)
 
     p = out_dir / "phase_profile.png"
     fig.tight_layout()
