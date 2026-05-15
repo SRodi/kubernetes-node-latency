@@ -131,6 +131,18 @@ def _cmd_plot(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_report(args: argparse.Namespace) -> int:
+    from .report import build_report
+    results_dir = Path(args.results_dir or "results")
+    out_dir = Path(args.out_dir or "analysis")
+    md, docx = build_report(args.run_ids, last=args.last,
+                             results_dir=results_dir, out_dir=out_dir)
+    print("wrote:")
+    print(f"  {md}")
+    print(f"  {docx}")
+    return 0
+
+
 def _cmd_clean(args: argparse.Namespace) -> int:
     base = Path(args.base_dir or "results")
     removed = 0
@@ -185,6 +197,19 @@ def main(argv: list[str] | None = None) -> int:
     pc = sub.add_parser("clean", help="remove all run dirs under results/")
     pc.add_argument("--base-dir", default=None)
     pc.set_defaults(func=_cmd_clean)
+
+    prp = sub.add_parser("report",
+                          help="generate an analysis report (md + docx) for one or more runs")
+    prp.add_argument("run_ids", nargs="*",
+                      help="specific run dir names under results/; "
+                           "omit to use --last N")
+    prp.add_argument("--last", type=int, default=None,
+                      help="select the last N runs by directory name (timestamp-prefixed)")
+    prp.add_argument("--results-dir", default=None,
+                      help="root of run directories (default: results/)")
+    prp.add_argument("--out-dir", default=None,
+                      help="output directory for the report files (default: analysis/)")
+    prp.set_defaults(func=_cmd_report)
 
     args = p.parse_args(argv)
     _setup_logging(args.verbose)

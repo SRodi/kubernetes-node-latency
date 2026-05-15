@@ -239,6 +239,24 @@ Re-analyze or re-plot without re-running, and overlay multiple runs:
     --compare results/aks-run results/aks-byocni-run
 ```
 
+Generate a programmatic comparison report (Markdown + Word .docx) under
+`analysis/` at the repo root, embedding each run's `phase_profile.png` at the
+top:
+
+```bash
+# specific runs
+.venv/bin/python -m src.cli report 20260514-164726 20260514-164732
+
+# last 2 runs (sorted by run-id timestamp)
+.venv/bin/python -m src.cli report --last 2
+```
+
+This replaces the prompt-driven workflow in `docs/analysis-prompt.md` with a
+deterministic build that computes the KPI table, Cilium configmap diff,
+container image deltas, and anomaly counts from `raw_events.jsonl`. The
+auto-generated headline is purely numeric — bring your own narrative if you
+want prose inferences.
+
 ### Deep Cilium capture (`--deep-cilium`)
 
 Append `--deep-cilium` to any `run` command to scrape the Cilium agent's
@@ -279,7 +297,7 @@ after each iteration. Override the image / namespace via
 
 ```
 src/
-├── cli.py             argparse entrypoint (run|analyze|plot|clean)
+├── cli.py             argparse entrypoint (run|analyze|plot|report|clean)
 ├── config.py          YAML + dataclass config
 ├── runner.py          iteration loop
 ├── collectors.py      K8s watchers, T0..T4 capture, cordon helpers

@@ -1,5 +1,18 @@
 # Run Analysis Prompt
 
+> **Prefer the deterministic CLI:**
+>
+> ```bash
+> python -m src.cli report --last 2
+> python -m src.cli report 20260514-164726 20260514-164732
+> ```
+>
+> The CLI writes `analysis/<basename>.md` + `analysis/<basename>.docx`,
+> embeds each run's `phase_profile.png` at the top, and computes the KPI
+> table, Cilium config diff, image-tag deltas, and anomaly counts directly
+> from the run files. Use this prompt only when you need narrative
+> inferences (the "why") on top of the numeric report.
+
 Use this file to instruct Copilot (or any agent with repo read access) to analyze
 one or more runs produced by this harness. Typical invocation:
 
