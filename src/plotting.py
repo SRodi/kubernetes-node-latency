@@ -389,15 +389,21 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
         ("T_csinode_ready", "Tcsi"),
     ]
     markers: list[tuple[str, float]] = []
+    t4_off = _mean_offset("T4_node_ready")
+    t4b_off = _mean_offset("T4b_schedulable")
+    t4_t4b_coincide = (
+        t4_off is not None and t4b_off is not None
+        and abs(t4_off - t4b_off) <= 1e-3
+    )
     for col, glyph in MAIN_MARKERS:
         off = _mean_offset(col)
         if off is None:
             continue
-        # Suppress T4b if it coincides with T4 (zero scheduling block).
-        if glyph == "T4b":
-            t4 = _mean_offset("T4_node_ready")
-            if t4 is not None and abs(off - t4) <= 1e-3:
-                continue
+        # When T4 and T4b are the same instant (e.g. GKE without a cilium
+        # taint), drop the plain T4 marker so the prominent T4b line below
+        # is the only one drawn at that x.
+        if glyph == "T4" and t4_t4b_coincide:
+            continue
         markers.append((glyph, off - t1_off))
 
     # Layout: main wall-clock Gantt on top, plus optional zoomed subplots
@@ -438,20 +444,42 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
             used_actors.append(actor)
 
     for glyph, off in markers:
-        ax.axvline(off, color="black", linestyle=":", alpha=0.35, linewidth=0.8)
-        ax.text(off, n_main + 0.6, glyph, ha="center", va="bottom",
-                fontsize=8, color="black")
+        # Render T4b prominently: it marks when the node becomes schedulable
+        # (cilium taint removed) and is the primary user-facing readiness
+        # outcome of the run.
+        if glyph == "T4b":
+            ax.axvline(off, color=ACTOR_COLORS["scheduler"], linestyle="-",
+                       alpha=0.85, linewidth=1.6)
+            label = "T4 = T4b\n(pod schedulable)" if t4_t4b_coincide else "T4b\n(pod schedulable)"
+            # Place outside the chart, just above the top spine.
+            ax.annotate(
+                label,
+                xy=(off, 1.0), xycoords=("data", "axes fraction"),
+                xytext=(0, 4), textcoords="offset points",
+                ha="center", va="bottom", fontsize=8,
+                color=ACTOR_COLORS["scheduler"], fontweight="bold",
+                annotation_clip=False,
+            )
+        else:
+            ax.axvline(off, color="black", linestyle=":", alpha=0.35, linewidth=0.8)
+            ax.text(off, n_main + 0.6, glyph, ha="center", va="bottom",
+                    fontsize=8, color="black")
 
     ax.set_yticks(y_positions)
     ax.set_yticklabels([label for label, _, _, _ in all_lanes], fontsize=9)
     ax.set_xlabel("seconds since T1 (node registered)")
     ax.set_ylim(0.2, n_main + 1.2)
 
+    # Emphasise the T0->T1 cloud bringup latency as a prominent suptitle so
+    # the reader immediately sees the dominant (and not-to-scale) cost.
+    fig.suptitle(
+        f"Cloud / autoscaler + VM bringup  T0\u2192T1 = {cloud_dur:.2f}s  (not shown on x-axis)",
+        fontsize=13, fontweight="bold", color="#111111", y=0.995,
+    )
     title_lines = [
         f"Phase profile {title}",
-        f"Cloud / autoscaler + VM bringup (T0\u2192T1): {cloud_dur:.2f}s (not shown)",
+        "bars overlapping on x = parallel; back-to-back = sequential.",
     ]
-    title_lines.append("bars overlapping on x = parallel; back-to-back = sequential.")
     ax.set_title("\n".join(title_lines), fontsize=9, loc="center")
     ax.grid(True, axis="x", alpha=0.3)
 
