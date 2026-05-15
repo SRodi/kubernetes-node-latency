@@ -268,7 +268,7 @@ def _run_wait_for_node_ready(monkeypatch, probe_name, events):
     class FakeCore:
         def list_node(self, **kw): return None
     c = Collector(core=FakeCore(), probe=get_probe(probe_name), sink=S())  # type: ignore[arg-type]
-    t4, t4b, t1c = c.wait_for_node_ready("n1", timeout_s=5)
+    t4, t4b, t1c, _t_csi, _t_taint = c.wait_for_node_ready("n1", timeout_s=5)
     return t4, t4b, t1c, [k for k, _ in sink_calls]
 
 

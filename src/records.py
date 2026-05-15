@@ -46,6 +46,25 @@ class IterationRecord:
     # window T1c − T1 is the real CNI-induced Node-Ready delay.
     T1c_cni_conflist: datetime | None = None
 
+    # T1\u2192T1c internal decomposition — populated by Collector enrichment.
+    # First time the kubelet's Ready=False message stopped reporting
+    # `CSINode is not yet initialized`. Independent of the CNI phrase,
+    # captured from the same watch loop. None if never observed.
+    T_csinode_ready: datetime | None = None
+    # First time we observed any of the probe's blocking taints on the new
+    # node (e.g. `node.cilium.io/agent-not-ready`). Proxy for when
+    # cilium-operator stamped the taint.
+    T_taint_observed: datetime | None = None
+    # Cilium DS pod scheduling / image-pull / init-container timings,
+    # populated by `Collector.collect_pod_lifecycle` after T3.
+    T_pod_scheduled: datetime | None = None
+    T_pod_initialized: datetime | None = None
+    T_image_pull_start: datetime | None = None
+    T_image_pulled: datetime | None = None
+    # Per init container: [{"name": str, "started_at": iso|None,
+    #                       "finished_at": iso|None}, ...]
+    init_containers: list[dict] | None = None
+
     status: str = "pending"  # pending|success|timeout|error
     error: str | None = None
 
@@ -55,6 +74,24 @@ class IterationRecord:
 
     def to_row(self) -> dict:
         from .cilium_deep import headline_to_columns
+        import json as _json
+        # Serialize init_containers: list[dict] with datetime values \u2192 list[dict] iso strings.
+        init_serial: str | None = None
+        ic_durations: dict[str, float] = {}
+        if self.init_containers:
+            slim = []
+            for ic in self.init_containers:
+                name = ic.get("name") or ""
+                sa = ic.get("started_at")
+                fa = ic.get("finished_at")
+                sa_iso = iso(sa) if isinstance(sa, datetime) else sa
+                fa_iso = iso(fa) if isinstance(fa, datetime) else fa
+                slim.append({"name": name, "started_at": sa_iso, "finished_at": fa_iso})
+                if isinstance(sa, datetime) and isinstance(fa, datetime):
+                    safe_name = name.replace("-", "_")
+                    ic_durations[f"initc_{safe_name}_s"] = max(
+                        (fa - sa).total_seconds(), 0.0)
+            init_serial = _json.dumps(slim, separators=(",", ":"))
         row = {
             "iteration": self.iteration,
             "run_id": self.run_id,
@@ -109,6 +146,40 @@ class IterationRecord:
             ),
             "status": self.status,
             "error": self.error,
+            # T1\u2192T1c decomposition columns
+            "T_csinode_ready": iso(self.T_csinode_ready),
+            "T_taint_observed": iso(self.T_taint_observed),
+            "T_pod_scheduled": iso(self.T_pod_scheduled),
+            "T_pod_initialized": iso(self.T_pod_initialized),
+            "T_image_pull_start": iso(self.T_image_pull_start),
+            "T_image_pulled": iso(self.T_image_pulled),
+            "init_containers_json": init_serial,
+            # Derived seconds relative to T1 (None when either anchor is missing).
+            "csinode_block_s": (
+                max(delta(self.T_csinode_ready, self.T1_node_registered) or 0.0, 0.0)
+                if (self.T_csinode_ready and self.T1_node_registered) else None
+            ),
+            "taint_observed_offset_s": (
+                delta(self.T_taint_observed, self.T1_node_registered)
+                if (self.T_taint_observed and self.T1_node_registered) else None
+            ),
+            "pod_scheduling_lag_s": (
+                max(delta(self.T_pod_scheduled, self.T1_node_registered) or 0.0, 0.0)
+                if (self.T_pod_scheduled and self.T1_node_registered) else None
+            ),
+            "image_pull_s": (
+                max(delta(self.T_image_pulled, self.T_image_pull_start) or 0.0, 0.0)
+                if (self.T_image_pull_start and self.T_image_pulled) else None
+            ),
+            "image_pulled_offset_s": (
+                delta(self.T_image_pulled, self.T1_node_registered)
+                if (self.T_image_pulled and self.T1_node_registered) else None
+            ),
+            "pod_initialized_offset_s": (
+                delta(self.T_pod_initialized, self.T1_node_registered)
+                if (self.T_pod_initialized and self.T1_node_registered) else None
+            ),
         }
+        row.update(ic_durations)
         row.update(headline_to_columns(self.deep_cilium))
         return row

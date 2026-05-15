@@ -86,6 +86,7 @@ def plot_all(iterations_csv: Path, out_dir: Path, *, title: str = "") -> list[Pa
     # iterations.csv files predating the expanded bootstrap schema still get
     # the new sub-phase columns populated for plotting.
     _backfill_cilium_deep(df, iterations_csv.parent)
+    _backfill_taint_observed(df, iterations_csv.parent)
     out_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
     ok = _ok(df)
@@ -248,9 +249,52 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
 
     all_lanes = lanes
 
+    # ---- T1\u2192T1c install-cni decomposition (wall-clock) ----
+    # Built from new enrichment columns: T_pod_scheduled, T_image_pulled,
+    # T_csinode_ready, plus init-container statuses parsed from
+    # init_containers_json. Each segment is mean-offset relative to T1.
+    cni_breakdown: list[tuple[str, float, float, str]] = []  # (label, start, end, color)
+    t1c_target = _mean_offset("T1c_cni_conflist")
+    ic_means = _mean_init_container_durations(ok)
+    pod_sched_off = _mean_offset("T_pod_scheduled")
+    img_pull_start_off = _mean_offset("T_image_pull_start")
+    img_pulled_off = _mean_offset("T_image_pulled")
+    if t1c_target is not None:
+        t1c_rel = t1c_target - t1_off
+        # Scheduler latency: T1 \u2192 T_pod_scheduled
+        if pod_sched_off is not None:
+            sched = pod_sched_off - t1_off
+            if sched > 5e-3 and sched < t1c_rel:
+                cni_breakdown.append(("scheduler latency", 0.0, sched, "#c7d2fe"))
+        # Image pull window: T_image_pull_start \u2192 T_image_pulled
+        if img_pull_start_off is not None and img_pulled_off is not None:
+            ips = img_pull_start_off - t1_off
+            ipe = img_pulled_off - t1_off
+            if ipe > ips + 5e-3:
+                cni_breakdown.append(("image pull", ips, min(ipe, t1c_rel), "#fde68a"))
+        # Init container chain after image-pulled (or after scheduler if no pull info).
+        # Chain mean durations sequentially ending at T1c.
+        if ic_means:
+            chain_anchor_end = t1c_rel
+            chain_sum = sum(d for _, d in ic_means)
+            anchor_start = chain_anchor_end - chain_sum
+            cursor = anchor_start
+            palette_ic = ["#fed7aa", "#fdba74", "#fb923c", "#f97316",
+                          "#ea580c", "#c2410c", "#9a3412", "#7c2d12"]
+            for i, (name, dur) in enumerate(ic_means):
+                cni_breakdown.append((
+                    f"init: {name}", cursor, cursor + dur,
+                    palette_ic[i % len(palette_ic)],
+                ))
+                cursor += dur
+
     markers: list[tuple[str, float]] = []
     for col, glyph in [
         ("T1_node_registered", "T1"),
+        ("T_taint_observed", "Tt"),
+        ("T_pod_scheduled", "Ts"),
+        ("T_image_pulled", "Tip"),
+        ("T_csinode_ready", "Tcsi"),
         ("T1c_cni_conflist", "T1c"),
         ("T2_cilium_started", "T2"),
         ("T3_cilium_ready", "T3"),
@@ -261,19 +305,26 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
         if off is not None:
             markers.append((glyph, off - t1_off))
 
-    # Layout: main wall-clock Gantt on top, optional zoomed Cilium-internal
-    # breakdown below (only when --deep-cilium data is available).
-    has_breakdown = bool(cilium_breakdown)
+    # Layout: main wall-clock Gantt on top, plus optional zoomed subplots
+    # (CNI add\u2192Ready decomposition, Cilium-internal bootstrap).
+    has_cilium_bd = bool(cilium_breakdown)
+    has_cni_bd = bool(cni_breakdown)
     n_main = len(all_lanes)
-    fig_height = 4 + 0.35 * n_main + (2.0 if has_breakdown else 0)
-    if has_breakdown:
-        fig, (ax, ax_bd) = plt.subplots(
-            2, 1, figsize=(12, fig_height),
-            gridspec_kw={"height_ratios": [max(n_main, 4), 2.0]},
+    sub_count = (1 if has_cni_bd else 0) + (1 if has_cilium_bd else 0)
+    fig_height = 4 + 0.35 * n_main + 2.0 * sub_count
+    if sub_count:
+        ratios = [max(n_main, 4)] + [2.0] * sub_count
+        fig, axes = plt.subplots(
+            1 + sub_count, 1, figsize=(12, fig_height),
+            gridspec_kw={"height_ratios": ratios},
         )
+        ax = axes[0]
+        sub_axes = list(axes[1:])
     else:
         fig, ax = plt.subplots(figsize=(12, fig_height))
-        ax_bd = None
+        sub_axes = []
+    ax_cni_bd = sub_axes.pop(0) if has_cni_bd else None
+    ax_bd = sub_axes.pop(0) if has_cilium_bd else None
 
     y_positions = np.arange(n_main, 0, -1)  # top-down listing
     used_actors: list[str] = []
@@ -325,8 +376,53 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
     ]
     ax.legend(handles=legend_handles, loc="lower right", fontsize=8, title="actor")
 
+    # ---- T1\u2192T1c install-cni decomposition (zoomed) ----
+    if has_cni_bd and ax_cni_bd is not None:
+        bd_start = min(s for _, s, _, _ in cni_breakdown)
+        bd_end = max(e for _, _, e, _ in cni_breakdown)
+        bd_total = max(bd_end - bd_start, 1e-3)
+        for i, (label, s, e, color) in enumerate(cni_breakdown):
+            dur = e - s
+            ax_cni_bd.barh(0.5, dur, left=s, height=0.7, color=color,
+                           edgecolor="black", linewidth=0.4)
+            rel = dur / bd_total if bd_total > 0 else 0
+            inline = rel > 0.18
+            txt = f"{label}\n{dur*1000:.0f}ms" if dur < 0.5 else f"{label}\n{dur:.2f}s"
+            if inline:
+                ax_cni_bd.text(s + dur / 2, 0.5, txt, ha="center", va="center",
+                               fontsize=7, color="black")
+            else:
+                y_label = 1.05 + 0.30 * (i % 2)
+                ax_cni_bd.annotate(
+                    txt,
+                    xy=(s + dur / 2, 0.85),
+                    xytext=(s + dur / 2, y_label),
+                    ha="center", va="bottom", fontsize=7, color="black",
+                    arrowprops=dict(arrowstyle="-", color="grey",
+                                    linewidth=0.4, shrinkA=0, shrinkB=0),
+                )
+        # Mark T_csinode_ready inside the zoom if available
+        t_csi_off = _mean_offset("T_csinode_ready")
+        if t_csi_off is not None:
+            x = t_csi_off - t1_off
+            if bd_start <= x <= bd_end:
+                ax_cni_bd.axvline(x, color="#1d4ed8", linestyle="--", linewidth=1.2)
+                ax_cni_bd.text(x, 1.7, "CSINode ready", color="#1d4ed8",
+                               fontsize=7, ha="center", va="top")
+        ax_cni_bd.set_xlim(bd_start - bd_total * 0.05, bd_end + bd_total * 0.05)
+        ax_cni_bd.set_ylim(0, 2.0)
+        ax_cni_bd.set_yticks([0.5])
+        ax_cni_bd.set_yticklabels(["CNI add \u2192 T1c\n(zoomed)"], fontsize=8)
+        ax_cni_bd.set_xlabel("seconds since T1 (node registered) — zoomed view of the T1\u2192T1c install-cni window")
+        ax_cni_bd.set_title(
+            f"CNI add \u2192 Node Ready internal breakdown — total T1\u2192T1c {bd_total:.2f}s "
+            f"(scheduler latency + image pull + init container chain)",
+            fontsize=9, loc="left",
+        )
+        ax_cni_bd.grid(True, axis="x", alpha=0.3)
+
     # ---- Cilium internal breakdown (zoomed) ----
-    if has_breakdown and ax_bd is not None:
+    if has_cilium_bd and ax_bd is not None:
         # palette for distinguishable segments; cycle if more than 10 phases
         palette = ["#a8d5a8", "#85c785", "#5fb35f", "#3e9b3e", "#1f7a1f",
                    "#107510", "#0e6b0e", "#0c620c", "#0a580a", "#084e08"]
@@ -384,6 +480,110 @@ def _mean_offset_metric(ok: pd.DataFrame, col: str) -> float | None:
     if s.empty:
         return None
     return float(s.mean())
+
+
+def _mean_init_container_durations(ok: pd.DataFrame) -> list[tuple[str, float]]:
+    """Parse init_containers_json (per iteration) and return mean durations
+    per init-container name, ordered by the canonical first-seen ordering.
+
+    Each entry is (name, mean_duration_seconds). Containers with < 5 ms mean
+    are filtered out — they'd be invisible in the plot.
+    """
+    if "init_containers_json" not in ok.columns:
+        return []
+    import json as _json
+    from datetime import datetime as _dt
+    durations: dict[str, list[float]] = {}
+    order: list[str] = []
+    for raw in ok["init_containers_json"].dropna():
+        try:
+            entries = _json.loads(raw)
+        except Exception:
+            continue
+        for entry in entries:
+            name = entry.get("name")
+            sa = entry.get("started_at")
+            fa = entry.get("finished_at")
+            if not (name and sa and fa):
+                continue
+            try:
+                sa_t = _dt.fromisoformat(sa.replace("Z", "+00:00"))
+                fa_t = _dt.fromisoformat(fa.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            dur = max((fa_t - sa_t).total_seconds(), 0.0)
+            if name not in durations:
+                durations[name] = []
+                order.append(name)
+            durations[name].append(dur)
+    out: list[tuple[str, float]] = []
+    for name in order:
+        vals = durations[name]
+        if not vals:
+            continue
+        mean = sum(vals) / len(vals)
+        if mean >= 5e-3:
+            out.append((name, mean))
+    return out
+
+
+def _backfill_taint_observed(df: pd.DataFrame, run_dir: Path) -> None:
+    """Populate T_taint_observed + taint_observed_offset_s for historical runs
+    by scanning raw_events.jsonl for the first `node_blocking_taint_present`
+    event per iteration. Mutates `df` in place. No-op when columns already
+    have values (i.e. run was captured with the new collector) or events
+    file is missing.
+    """
+    import json as _json
+    from datetime import datetime as _dt
+    if df.empty or "iteration" not in df.columns:
+        return
+    if "T_taint_observed" in df.columns and df["T_taint_observed"].notna().any():
+        return
+    events_path = run_dir / "raw_events.jsonl"
+    if not events_path.exists():
+        return
+    first_taint: dict[int, str] = {}
+    current_iter: int | None = None
+    try:
+        with events_path.open() as f:
+            for line in f:
+                try:
+                    ev = _json.loads(line)
+                except Exception:
+                    continue
+                kind = ev.get("kind")
+                if kind == "iteration_start":
+                    current_iter = int(ev.get("iteration", 0)) or None
+                elif kind == "node_blocking_taint_present" and current_iter is not None:
+                    if current_iter not in first_taint:
+                        first_taint[current_iter] = ev.get("ts")
+                elif kind == "iteration_end":
+                    current_iter = None
+    except Exception:
+        return
+    if not first_taint:
+        return
+    if "T_taint_observed" not in df.columns:
+        df["T_taint_observed"] = None
+    if "taint_observed_offset_s" not in df.columns:
+        df["taint_observed_offset_s"] = None
+    for idx, row in df.iterrows():
+        it = row.get("iteration")
+        if pd.isna(it):
+            continue
+        ts = first_taint.get(int(it))
+        if not ts:
+            continue
+        df.at[idx, "T_taint_observed"] = ts
+        t1 = row.get("T1_node_registered")
+        if isinstance(t1, str) and t1:
+            try:
+                t1_dt = _dt.fromisoformat(t1.replace("Z", "+00:00"))
+                taint_dt = _dt.fromisoformat(ts.replace("Z", "+00:00"))
+                df.at[idx, "taint_observed_offset_s"] = (taint_dt - t1_dt).total_seconds()
+            except Exception:
+                pass
 
 
 def _backfill_cilium_deep(df: pd.DataFrame, run_dir: Path) -> None:

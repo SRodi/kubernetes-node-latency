@@ -40,6 +40,11 @@ KPI_METRICS = [
     ("node_startup_latency_s",        "node_startup_latency_s (mean / p90)"),
     ("time_to_schedulable_s",         "time_to_schedulable_s (mean / p90)"),
     ("cni_conflist_install_s",        "cni_conflist_install_s (mean / p90)"),
+    # T1\u2192T1c decomposition (from enrichment collector)
+    ("pod_scheduling_lag_s",          "  \u21b3 pod scheduling lag (mean)"),
+    ("image_pull_s",                  "  \u21b3 image pull (mean)"),
+    ("csinode_block_s",               "  \u21b3 CSINode-ready offset (mean)"),
+    ("taint_observed_offset_s",       "  \u21b3 cilium taint first-seen offset (mean)"),
     ("post_conflist_ready_s",         "post_conflist_ready_s (mean)"),
     ("cilium_init_duration_s",        "cilium_init_duration_s (mean)"),
     ("cni_induced_delay_s",           "cni_induced_delay_s (mean)"),
@@ -158,8 +163,9 @@ def load_run(run_dir: Path) -> RunData:
         # iter-NNN/cilium_deep_headline.json payloads (older iterations.csv
         # files predate the schema; re-parse the source JSONs so reports get
         # the rich Cilium detail without rerunning the harness).
-        from .plotting import _backfill_cilium_deep
+        from .plotting import _backfill_cilium_deep, _backfill_taint_observed
         _backfill_cilium_deep(df, run_dir)
+        _backfill_taint_observed(df, run_dir)
         rd.iterations = _augment_derived(df)
     else:
         rd.missing.append("iterations.csv")

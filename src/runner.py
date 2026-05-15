@@ -140,9 +140,10 @@ def run_iterations(cfg: Config, handle: ClusterHandle, provider: ClusterProvider
                 rec.node_name, rec.T1_node_registered = collector.wait_for_new_node(
                     before, timeout_s=cfg.per_iteration_timeout_s,
                     not_before=rec.T0_pod_created)
-                rec.T4_node_ready, rec.T4b_schedulable, rec.T1c_cni_conflist = (
-                    collector.wait_for_node_ready(
-                        rec.node_name, timeout_s=cfg.per_iteration_timeout_s))
+                rec.T4_node_ready, rec.T4b_schedulable, rec.T1c_cni_conflist, \
+                    rec.T_csinode_ready, rec.T_taint_observed = (
+                        collector.wait_for_node_ready(
+                            rec.node_name, timeout_s=cfg.per_iteration_timeout_s))
 
                 agent = None if probe.skip else collector.find_agent_pod(rec.node_name, timeout_s=120)
                 if probe.skip:
@@ -161,6 +162,19 @@ def run_iterations(cfg: Config, handle: ClusterHandle, provider: ClusterProvider
                     if rec.T3_cilium_ready is None:
                         rec.T3_cilium_ready = collector.t3_ready_from_logs(
                             agent, tail_lines=cfg.cni.log_tail_lines)
+                    # T1\u2192T1c enrichment: re-read pod for init container
+                    # statuses and grab pod-scoped events for image-pull and
+                    # PodScheduled timestamps. Best-effort.
+                    try:
+                        lc = collector.collect_pod_lifecycle(
+                            agent.metadata.name, probe.namespace)
+                        rec.T_pod_scheduled = lc.get("T_pod_scheduled")
+                        rec.T_pod_initialized = lc.get("T_pod_initialized")
+                        rec.T_image_pull_start = lc.get("T_image_pull_start")
+                        rec.T_image_pulled = lc.get("T_image_pulled")
+                        rec.init_containers = lc.get("init_containers") or None
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("pod-lifecycle enrichment failed for iter %d: %s", i, e)
                 else:
                     sink.write("cni_probe_unavailable",
                                {"node": rec.node_name, "probe": probe.name})
