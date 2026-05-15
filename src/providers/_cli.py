@@ -11,7 +11,15 @@ log = logging.getLogger(__name__)
 
 
 def run(cmd: list[str], *, check: bool = True, env: dict | None = None,
-        capture: bool = False, cwd: str | Path | None = None) -> subprocess.CompletedProcess:
+        capture: bool = False, cwd: str | Path | None = None,
+        timeout: float | None = 1800.0) -> subprocess.CompletedProcess:
+    """Shell out to a cloud CLI with a hard upper-bound timeout.
+
+    ``timeout`` defaults to 30 minutes — long enough for cluster create on
+    every supported provider, short enough that a stalled CLI eventually
+    surfaces a ``TimeoutExpired`` instead of hanging the harness forever.
+    Callers that need an unbounded wait can pass ``timeout=None``.
+    """
     log.info("$ %s", " ".join(shlex.quote(c) for c in cmd))
     return subprocess.run(
         cmd,
@@ -20,6 +28,7 @@ def run(cmd: list[str], *, check: bool = True, env: dict | None = None,
         text=True,
         capture_output=capture,
         cwd=str(cwd) if cwd else None,
+        timeout=timeout,
     )
 
 

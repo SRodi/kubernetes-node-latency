@@ -44,7 +44,15 @@ def _extract_log_ts(line: str) -> datetime | None:
 
 
 class EventSink:
-    """Append-only JSONL writer of every notable event for offline replay."""
+    """Append-only JSONL writer of every notable event for offline replay.
+
+    Usable as a context manager so the underlying file handle is released
+    deterministically even when the runner crashes between sink creation and
+    the iteration loop:
+
+        with EventSink(path) as sink:
+            sink.write(...)
+    """
 
     def __init__(self, path: Path):
         self.path = path
@@ -54,10 +62,28 @@ class EventSink:
         self._fp.write(json.dumps({"kind": kind, "ts": utcnow().isoformat(), **obj}) + "\n")
 
     def close(self) -> None:
+        if self._fp is None:
+            return
+        fp, self._fp = self._fp, None  # type: ignore[assignment]
         try:
-            self._fp.close()
-        except Exception:
-            pass
+            fp.close()
+        except OSError as e:
+            # Disk full / read-only FS / broken pipe — caller deserves to know
+            # raw_events.jsonl may be truncated.
+            logging.getLogger(__name__).error(
+                "EventSink close failed for %s: %s", self.path, e)
+            raise
+
+    def __enter__(self) -> "EventSink":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        try:
+            self.close()
+        except OSError:
+            # Already logged inside close(); don't mask the original exception.
+            if exc_type is None:
+                raise
 
 
 def _container_started_at(pod: client.V1Pod, container_name: str) -> datetime | None:

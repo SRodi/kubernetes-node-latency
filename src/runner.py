@@ -102,21 +102,20 @@ def run_iterations(cfg: Config, handle: ClusterHandle, provider: ClusterProvider
     core = load_kube(handle.kubeconfig)
     apps = client.AppsV1Api()
     probe = provider.cni_probe()
-    sink = EventSink(run_dir / "raw_events.jsonl")
-
-    # One-shot snapshot of Cilium agent + operator configuration. Best-effort:
-    # it must never break the run.
-    try:
-        from . import cilium_config as _cc
-        _cc.snapshot(core, apps,
-                     namespace=probe.namespace,
-                     agent_label_selector=probe.label_selector,
-                     out_dir=run_dir / "cilium_config")
-    except Exception as e:  # noqa: BLE001
-        log.warning("cilium config snapshot failed: %s", e)
 
     records: list[IterationRecord] = []
-    try:
+    with EventSink(run_dir / "raw_events.jsonl") as sink:
+        # One-shot snapshot of Cilium agent + operator configuration.
+        # Best-effort: it must never break the run.
+        try:
+            from . import cilium_config as _cc
+            _cc.snapshot(core, apps,
+                         namespace=probe.namespace,
+                         agent_label_selector=probe.label_selector,
+                         out_dir=run_dir / "cilium_config")
+        except Exception as e:  # noqa: BLE001
+            log.warning("cilium config snapshot failed: %s", e)
+
         for i in range(1, cfg.iterations + 1):
             rec = IterationRecord(iteration=i, run_id=run_id,
                                   provider=provider.name, region=handle.region)
@@ -214,6 +213,4 @@ def run_iterations(cfg: Config, handle: ClusterHandle, provider: ClusterProvider
                 sink.write("iteration_end", {"iteration": i, **rec.to_row()})
                 if i < cfg.iterations:
                     time.sleep(cfg.node_settle_seconds)
-    finally:
-        sink.close()
     return records

@@ -12,11 +12,18 @@ log = logging.getLogger(__name__)
 
 
 def _run(cmd: list[str], *, env: dict | None = None, capture: bool = False,
-         check: bool = True) -> subprocess.CompletedProcess:
+         check: bool = True, timeout: float | None = 1800.0) -> subprocess.CompletedProcess:
+    """Shell out with a hard upper-bound timeout (default 30 min).
+
+    A stalled ``az`` / ``helm`` / ``kubectl`` invocation will raise
+    ``subprocess.TimeoutExpired`` instead of hanging the harness forever.
+    Pass ``timeout=None`` for genuinely unbounded waits.
+    """
     log.info("$ %s", " ".join(shlex.quote(c) for c in cmd))
     try:
         return subprocess.run(cmd, env=env, text=True,
-                              capture_output=capture, check=check)
+                              capture_output=capture, check=check,
+                              timeout=timeout)
     except subprocess.CalledProcessError as e:
         # When capture=True, the actual stderr from az/helm/kubectl is
         # swallowed by CalledProcessError's default repr. Surface it so
