@@ -23,12 +23,23 @@ METRICS = [
     # Tier-1 deep-Cilium headlines — silently skipped when the column is
     # absent or all-null (i.e. --deep-cilium not set).
     "cilium_bootstrap_total_s",
+    "cilium_bootstrap_early_init_s",
     "cilium_bootstrap_k8s_init_s",
-    "cilium_bootstrap_restore_s",
-    "cilium_bootstrap_bpf_base_s",
+    "cilium_bootstrap_daemon_init_s",
     "cilium_bootstrap_ipam_s",
-    "cilium_bootstrap_proxy_s",
+    "cilium_bootstrap_maps_init_s",
+    "cilium_bootstrap_bpf_base_s",
+    "cilium_bootstrap_restore_s",
+    "cilium_bootstrap_cleanup_s",
+    "cilium_bootstrap_fqdn_s",
+    "cilium_bootstrap_enable_conntrack_s",
+    "cilium_bootstrap_health_check_s",
     "cilium_endpoint_regen_avg_s",
+    "cilium_endpoint_regen_bpf_compilation_s",
+    "cilium_endpoint_regen_bpf_wait_for_elf_s",
+    "cilium_endpoint_regen_bpf_load_prog_s",
+    "cilium_endpoint_regen_waiting_for_lock_s",
+    "cilium_endpoint_regen_map_sync_s",
 ]
 
 

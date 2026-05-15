@@ -45,8 +45,16 @@ KPI_METRICS = [
     ("cni_induced_delay_s",           "cni_induced_delay_s (mean)"),
     ("cilium_scheduling_block_s",     "cilium_scheduling_block_s (mean / p90)"),
     ("cilium_bootstrap_total_s",      "bootstrap.overall (mean, range)"),
-    ("cilium_bootstrap_bpf_base_s",   "bootstrap.bpf_base (mean)"),
-    ("cilium_endpoint_regen_avg_s",   "endpoint_regen_avg (mean)"),
+    ("cilium_bootstrap_early_init_s", "bootstrap.earlyInit (mean)"),
+    ("cilium_bootstrap_k8s_init_s",   "bootstrap.k8sInit (mean)"),
+    ("cilium_bootstrap_ipam_s",       "bootstrap.ipam (mean)"),
+    ("cilium_bootstrap_maps_init_s",  "bootstrap.mapsInit (mean)"),
+    ("cilium_bootstrap_bpf_base_s",   "bootstrap.bpfBase (mean)"),
+    ("cilium_bootstrap_restore_s",    "bootstrap.restore (mean)"),
+    ("cilium_endpoint_regen_avg_s",                "endpoint_regen avg (per-endpoint, mean)"),
+    ("cilium_endpoint_regen_bpf_compilation_s",    "endpoint_regen bpfCompilation (mean)"),
+    ("cilium_endpoint_regen_bpf_wait_for_elf_s",   "endpoint_regen bpfWaitForELF (mean)"),
+    ("cilium_endpoint_regen_waiting_for_lock_s",   "endpoint_regen waitingForLock (mean)"),
 ]
 
 # Anomaly event kinds worth surfacing (count > 0 → mention).
@@ -145,7 +153,14 @@ def load_run(run_dir: Path) -> RunData:
 
     csv = run_dir / "iterations.csv"
     if csv.exists():
-        rd.iterations = _augment_derived(pd.read_csv(csv))
+        df = pd.read_csv(csv)
+        # Backfill expanded cilium bootstrap sub-phase columns from any
+        # iter-NNN/cilium_deep_headline.json payloads (older iterations.csv
+        # files predate the schema; re-parse the source JSONs so reports get
+        # the rich Cilium detail without rerunning the harness).
+        from .plotting import _backfill_cilium_deep
+        _backfill_cilium_deep(df, run_dir)
+        rd.iterations = _augment_derived(df)
     else:
         rd.missing.append("iterations.csv")
 

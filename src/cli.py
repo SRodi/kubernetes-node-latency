@@ -117,14 +117,27 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
 
 
 def _cmd_plot(args: argparse.Namespace) -> int:
-    run_dir = Path(args.results_dir)
-    paths = plot_all(run_dir / "iterations.csv", run_dir / "plots")
-    print("wrote:")
-    for p in paths:
-        print(f"  {p}")
+    from .report import resolve_runs
+    if args.last is not None:
+        base = Path(args.base_dir or "results")
+        run_dirs = resolve_runs([], last=args.last, base_dir=base)
+    elif args.results_dir:
+        run_dirs = [Path(args.results_dir)]
+    else:
+        print("must provide results_dir or --last N", file=sys.stderr)
+        return 2
+    all_paths: list[Path] = []
+    for run_dir in run_dirs:
+        paths = plot_all(run_dir / "iterations.csv", run_dir / "plots")
+        print(f"wrote ({run_dir.name}):")
+        for p in paths:
+            print(f"  {p}")
+        all_paths.extend(paths)
     if args.compare:
+        # Compare overlays the first run_dir against the listed extras.
+        base_run = run_dirs[0]
         csvs = [Path(d) / "iterations.csv" for d in args.compare]
-        cmp_paths = plot_compare([run_dir / "iterations.csv", *csvs], run_dir / "plots")
+        cmp_paths = plot_compare([base_run / "iterations.csv", *csvs], base_run / "plots")
         print("comparison:")
         for p in cmp_paths:
             print(f"  {p}")
@@ -189,7 +202,12 @@ def main(argv: list[str] | None = None) -> int:
     pa.set_defaults(func=_cmd_analyze)
 
     pp = sub.add_parser("plot", help="(re)generate plots for an existing run dir")
-    pp.add_argument("results_dir")
+    pp.add_argument("results_dir", nargs="?", default=None,
+                    help="run dir under results/ (omit when using --last)")
+    pp.add_argument("--last", type=int, default=None,
+                    help="(re)plot the last N runs by directory name")
+    pp.add_argument("--base-dir", default=None,
+                    help="root of run directories when using --last (default: results/)")
     pp.add_argument("--compare", nargs="*", default=[],
                     help="additional run dirs to overlay on the comparison CDF")
     pp.set_defaults(func=_cmd_plot)

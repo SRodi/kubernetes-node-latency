@@ -426,12 +426,23 @@ def collect(core: client.CoreV1Api, *, agent_pod, probe, node_name: str,
 
 HEADLINE_COLUMNS = (
     "cilium_bootstrap_total_s",
+    "cilium_bootstrap_early_init_s",
     "cilium_bootstrap_k8s_init_s",
-    "cilium_bootstrap_restore_s",
-    "cilium_bootstrap_bpf_base_s",
+    "cilium_bootstrap_daemon_init_s",
     "cilium_bootstrap_ipam_s",
-    "cilium_bootstrap_proxy_s",
+    "cilium_bootstrap_maps_init_s",
+    "cilium_bootstrap_bpf_base_s",
+    "cilium_bootstrap_restore_s",
+    "cilium_bootstrap_cleanup_s",
+    "cilium_bootstrap_fqdn_s",
+    "cilium_bootstrap_enable_conntrack_s",
+    "cilium_bootstrap_health_check_s",
     "cilium_endpoint_regen_avg_s",
+    "cilium_endpoint_regen_bpf_compilation_s",
+    "cilium_endpoint_regen_bpf_wait_for_elf_s",
+    "cilium_endpoint_regen_bpf_load_prog_s",
+    "cilium_endpoint_regen_waiting_for_lock_s",
+    "cilium_endpoint_regen_map_sync_s",
     "cilium_identity_count",
     "cilium_version",
 )
@@ -444,14 +455,33 @@ def headline_to_columns(headline: dict[str, Any] | None) -> dict[str, Any]:
     metrics = headline.get("metrics") or {}
     regen = (metrics.get("endpoint_regeneration_avg_s") or {})
     regen_avg = regen.get("total") or (sum(regen.values()) / len(regen) if regen else None)
+    # Cilium publishes bootstrap timings in camelCase under
+    # `cilium_bootstrap_seconds`; older builds used snake_case. Accept both.
+    def _b(*names: str) -> float | None:
+        for n in names:
+            v = b.get(n)
+            if v is not None:
+                return v
+        return None
     return {
-        "cilium_bootstrap_total_s": b.get("total"),
-        "cilium_bootstrap_k8s_init_s": b.get("k8sInit") or b.get("k8s_init"),
-        "cilium_bootstrap_restore_s": b.get("restoreState") or b.get("restore_state"),
-        "cilium_bootstrap_bpf_base_s": b.get("bpfBase") or b.get("bpf_base"),
-        "cilium_bootstrap_ipam_s": b.get("ipam"),
-        "cilium_bootstrap_proxy_s": b.get("proxyInit") or b.get("proxy_init"),
+        "cilium_bootstrap_total_s":           _b("overall", "total"),
+        "cilium_bootstrap_early_init_s":      _b("earlyInit", "early_init"),
+        "cilium_bootstrap_k8s_init_s":        _b("k8sInit", "k8s_init"),
+        "cilium_bootstrap_daemon_init_s":     _b("daemonInit", "daemon_init"),
+        "cilium_bootstrap_ipam_s":            _b("ipam"),
+        "cilium_bootstrap_maps_init_s":       _b("mapsInit", "maps_init"),
+        "cilium_bootstrap_bpf_base_s":        _b("bpfBase", "bpf_base"),
+        "cilium_bootstrap_restore_s":         _b("restore", "restoreState", "restore_state"),
+        "cilium_bootstrap_cleanup_s":         _b("cleanup"),
+        "cilium_bootstrap_fqdn_s":            _b("fqdn"),
+        "cilium_bootstrap_enable_conntrack_s": _b("enableConntrack", "enable_conntrack"),
+        "cilium_bootstrap_health_check_s":    _b("healthCheck", "health_check"),
         "cilium_endpoint_regen_avg_s": regen_avg,
+        "cilium_endpoint_regen_bpf_compilation_s":   regen.get("bpfCompilation"),
+        "cilium_endpoint_regen_bpf_wait_for_elf_s":  regen.get("bpfWaitForELF"),
+        "cilium_endpoint_regen_bpf_load_prog_s":     regen.get("bpfLoadProg"),
+        "cilium_endpoint_regen_waiting_for_lock_s":  regen.get("waitingForLock"),
+        "cilium_endpoint_regen_map_sync_s":           regen.get("mapSync"),
         "cilium_identity_count": metrics.get("identity_count"),
         "cilium_version": headline.get("cilium_version"),
     }
