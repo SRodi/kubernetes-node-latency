@@ -30,7 +30,7 @@ PROFILE_LANES = [
     ("Scheduler latency",                    "T1_node_registered", "T_pod_scheduled",    "scheduler_wait"),
     ("Kubelet sandbox + image-pull init",    "T_pod_scheduled",    "T_image_pull_start", "sandbox"),
     ("Cilium agent image pull",              "T_image_pull_start", "T_image_pulled",     "image_pull"),
-    ("Kubelet blocked on CNI (post image-pull)",
+    ("Cilium init-container chain",
                                               "T_image_pulled",    "T1c_cni_conflist",   "cni"),
     ("Kubelet: residual status sync",        "T1c_cni_conflist",   "T4_node_ready",      "kubelet"),
     ("Cilium agent bootstrap",               "T2_cilium_started",  "T3_cilium_ready",    "cilium"),
@@ -47,6 +47,7 @@ ACTOR_COLORS = {
     "scheduler":       "#ea4335",  # red (post-Ready taint block)
     "scheduler_wait":  "#c7d2fe",  # lavender (T1->Ts pre-bind)
     "sandbox":         "#fde68a",  # pale amber (kubelet pre-pull setup)
+    "kubelet_main":    "#93c5fd",  # light blue (kubelet starting agent main container)
 }
 
 # Cilium bootstrap sub-phases in the canonical execution order published by
@@ -283,59 +284,131 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
 
     all_lanes = lanes
 
-    # ---- "Kubelet blocked on CNI" zoom: Tip -> T1c only ----
-    # The pre-image-pull portion (scheduler latency, sandbox prep, image pull)
-    # is now explicit on the main chart, so the zoom focuses on the runc /
-    # init-container / install-cni-write tail, where the labels would
-    # otherwise be unreadable.
-    cni_breakdown: list[tuple[str, float, float, str]] = []  # (label, start, end, color)
-    t1c_target = _mean_offset("T1c_cni_conflist")
-    img_pulled_off = _mean_offset("T_image_pulled")
+    # Pre-compute init-container offsets (T1-relative) once — used by both
+    # the "agent main container startup" main-chart lane below and the
+    # init-chain zoom subplot further down.
     if "T1_node_registered" in ok.columns:
         ic_offsets = _mean_init_container_offsets(ok, ok["T1_node_registered"])
     else:
         ic_offsets = []
-    if t1c_target is not None and img_pulled_off is not None:
-        t1c_rel = t1c_target - t1_off
+    last_init_end_t1 = max((e for _n, _s, e in ic_offsets), default=None)
+
+    # Anchor the chain end to max(last init finished_at, T1c). Kubelet init
+    # container `finished_at` is 1s-resolution, and the last init (e.g.
+    # install-cni-binaries on upstream Cilium) is the one that writes
+    # /etc/cni/net.d/*.conflist — our T1c watcher typically observes the
+    # conflist a couple of seconds AFTER the kubelet's rounded
+    # finished_at, so the last init is logically still running until T1c.
+    # Snapping the chain end to T1c (when present and later) closes that
+    # visual gap on the main chart and the zoom alike.
+    t1c_off = _mean_offset("T1c_cni_conflist")
+    t1c_rel = (t1c_off - t1_off) if t1c_off is not None else None
+    if last_init_end_t1 is not None and t1c_rel is not None and t1c_rel > last_init_end_t1:
+        last_init_end_t1 = t1c_rel
+
+    # Make the main-chart "Cilium init-container chain" lane match the zoom
+    # exactly: extend it from its PROFILE_LANES default (Tip -> T1c) to
+    # Tip -> last_init_end. On managed-Cilium variants the conflist is
+    # pre-baked, so T1c fires mid-chain — using T1c as the lane end would
+    # hide most of the chain on the top chart.
+    if last_init_end_t1 is not None:
+        for i, (lbl, s_off, e_off, actor) in enumerate(all_lanes):
+            if actor == "cni":
+                if last_init_end_t1 > e_off:
+                    all_lanes[i] = (lbl, s_off, last_init_end_t1, actor)
+                break
+
+    # ---- Synthetic main-chart lane: "Agent main container startup" ----
+    # Spans the gap between the last init container finishing and the Cilium
+    # agent main container reporting T2. On managed-Cilium variants where
+    # T1c fires mid-chain (conflist pre-baked into the node image), this
+    # gap is the most accurate visual representation of the kubelet ->
+    # agent handover and is what the user sees as "why is T2 so much later
+    # than T1c?". Rendered as a thin lane just before the agent bootstrap.
+    if last_init_end_t1 is not None and t2_off is not None:
+        main_start = last_init_end_t1
+        main_end = t2_off - t1_off
+        if main_end - main_start > 5e-3:
+            # Insert before the Cilium agent bootstrap lane so the visual
+            # ordering stays last-init -> main-startup -> bootstrap.
+            insert_at = len(all_lanes)
+            for i, (lbl, _s, _e, _a) in enumerate(all_lanes):
+                if lbl == "Cilium agent bootstrap":
+                    insert_at = i
+                    break
+            all_lanes.insert(insert_at, (
+                "Agent main container startup",
+                main_start, main_end, "kubelet_main",
+            ))
+
+    # ---- "Cilium init-container chain" zoom: Tip -> end of last init ----
+    # The pre-image-pull portion (scheduler latency, sandbox prep, image pull)
+    # is explicit on the main chart, so the zoom focuses on the per-init-
+    # container chain. We extend the right edge to the LAST init container's
+    # end (not just T1c) because managed-Cilium variants (e.g. AKS Azure CNI
+    # Powered by Cilium) ship /etc/cni/net.d/05-cilium.conflist pre-baked in
+    # the node image: T1c fires while most init containers are still waiting
+    # to run, and the bulk of the chain lives in the T1c->T2 gap. T1c itself
+    # is rendered inside the zoom as a dotted marker so it remains visible.
+    # The kubelet->main-container handover (last_init.end -> T2) is left to
+    # the main chart's T2 marker so the init zoom stays focused on the
+    # init-container chain only.
+    #
+    # Kubelet init-container timestamps are 1s-resolution, so the naive
+    # `finished_at - started_at` of each container often rounds to 0. We
+    # instead derive durations from consecutive `started_at` deltas — i.e.
+    # each container's duration is the time until the NEXT one starts (or,
+    # for the last one, its own `finished_at - started_at`). This recovers
+    # realistic per-container costs.
+    cni_breakdown: list[tuple[str, float, float, str]] = []  # (label, start, end, color)
+    img_pulled_off = _mean_offset("T_image_pulled")
+    if ic_offsets and img_pulled_off is not None:
         zoom_start = img_pulled_off - t1_off
-        if t1c_rel - zoom_start > 5e-3:
-            CNI_ACTOR_COLOR = ACTOR_COLORS["cni"]  # "#fb8c00"
+        # ic_offsets are already T1-relative; the zoom axis is also
+        # T1-relative, so use the value directly.
+        last_init_end = last_init_end_t1 if last_init_end_t1 is not None else zoom_start
+        if last_init_end - zoom_start > 5e-3:
             palette_ic = ["#fed7aa", "#fdba74", "#fb923c", "#f97316",
                           "#ea580c", "#c2410c", "#9a3412", "#7c2d12"]
-
-            cursor = zoom_start
 
             def _push(label: str, start: float, end: float, color: str) -> None:
                 if end - start > 5e-3:
                     cni_breakdown.append((label, start, end, color))
 
-            # Clip init containers to [zoom_start, t1c_rel].
-            first_init_start: float | None = None
-            if ic_offsets:
-                for _name, s_off, _e_off in ic_offsets:
-                    if s_off <= zoom_start or s_off >= t1c_rel:
-                        continue
-                    first_init_start = s_off if first_init_start is None else min(first_init_start, s_off)
-                if first_init_start is not None and first_init_start > cursor:
+            # Use successive start offsets (clipped to the window) to compute
+            # realistic per-init durations. The last init keeps its own
+            # finished_at (the zoom's right edge).
+            chain: list[tuple[str, float, float]] = []
+            ic_in_window = [(n, s, e) for n, s, e in ic_offsets
+                            if s < last_init_end and e > zoom_start]
+            if ic_in_window:
+                starts = [max(s, zoom_start) for _n, s, _e in ic_in_window]
+                names = [n for n, _s, _e in ic_in_window]
+                fa_ends = [e for _n, _s, e in ic_in_window]
+                for i, name in enumerate(names):
+                    s = starts[i]
+                    if i + 1 < len(starts):
+                        e = starts[i + 1]
+                    else:
+                        # Last init: extend through last_init_end (which is
+                        # snapped to T1c when T1c > rounded finished_at, so
+                        # the bar visually closes the gap to the conflist
+                        # appearing on disk).
+                        e = max(fa_ends[i], last_init_end)
+                    e = min(e, last_init_end)
+                    chain.append((name, s, e))
+
+            cursor = zoom_start
+            if chain:
+                first_init_start = chain[0][1]
+                if first_init_start > cursor:
                     _push("runc / init-chain spin-up",
                           cursor, first_init_start, "#fed7aa")
                     cursor = first_init_start
-                for i, (name, s_off, e_off) in enumerate(ic_offsets):
-                    s_clip = max(s_off, cursor)
-                    e_clip = min(e_off, t1c_rel)
-                    if e_clip - s_clip <= 5e-3:
-                        continue
-                    _push(f"init: {name}", s_clip, e_clip,
+                for i, (name, s, e) in enumerate(chain):
+                    _push(f"init: {name}", s, e,
                           palette_ic[i % len(palette_ic)])
-                    cursor = max(cursor, e_clip)
-
-            # Tail: cursor -> T1c is the install-cni script writing the
-            # conflist + binaries (or, if no init detail, just the
-            # generic kubelet/runtime tail).
-            if cursor < t1c_rel - 5e-3:
-                tail_label = "install-cni: write /etc/cni/net.d/*.conflist" if ic_offsets \
-                    else "kubelet blocked on CNI (no init detail)"
-                _push(tail_label, cursor, t1c_rel, CNI_ACTOR_COLOR)
+                    cursor = max(cursor, e)
 
     # Markers on the main (top) chart: high-level milestones only.
     # Fine-grained sub-events (Tt, Ts, Tips, Tip, Tcsi, T1c) live entirely
@@ -427,6 +500,17 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
                 color=ACTOR_COLORS["scheduler"], fontweight="bold",
                 annotation_clip=False,
             )
+        elif glyph == "T1c":
+            # T1c (conflist written / discovered on disk) is a key transition
+            # marker: kubelet stops reporting "no CNI" after this point.
+            # Render it as a colored dashed line so the reader can see how
+            # it relates to the init-container chain on the lane below
+            # (especially on managed-Cilium variants where T1c falls
+            # mid-chain because the conflist is pre-baked into the image).
+            ax.axvline(off, color="#b91c1c", linestyle="--", alpha=0.85,
+                       linewidth=1.2)
+            ax.text(off, n_main + 0.6, glyph, ha="center", va="bottom",
+                    fontsize=8, color="#b91c1c", fontweight="bold")
         else:
             ax.axvline(off, color="black", linestyle=":", alpha=0.35, linewidth=0.8)
             ax.text(off, n_main + 0.6, glyph, ha="center", va="bottom",
@@ -494,6 +578,17 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
             ax_cni_bd.axvline(x, color="black", linestyle=":", alpha=0.35, linewidth=0.8)
             ax_cni_bd.text(x, 1.95, glyph, ha="center", va="top",
                            fontsize=8, color="black")
+        # Mark T1c (conflist on disk) inside the zoom. Vital context now
+        # that the zoom extends past T1c on managed-Cilium variants where
+        # the conflist is pre-baked into the node image and T1c fires
+        # before most of the init chain runs.
+        t1c_off = _mean_offset("T1c_cni_conflist")
+        if t1c_off is not None:
+            x = t1c_off - t1_off
+            if bd_start <= x <= bd_end:
+                ax_cni_bd.axvline(x, color="#b91c1c", linestyle="--", linewidth=1.2)
+                ax_cni_bd.text(x, 1.7, "T1c (conflist)", color="#b91c1c",
+                               fontsize=7, ha="center", va="top")
         # Mark T_csinode_ready inside the zoom if available
         t_csi_off = _mean_offset("T_csinode_ready")
         if t_csi_off is not None:
@@ -505,13 +600,13 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
         ax_cni_bd.set_xlim(bd_start - bd_total * 0.05, bd_end + bd_total * 0.05)
         ax_cni_bd.set_ylim(0, 2.0)
         ax_cni_bd.set_yticks([0.5])
-        ax_cni_bd.set_yticklabels(["post image-pull\nblocked on CNI"], fontsize=8)
+        ax_cni_bd.set_yticklabels(["init-container\nchain"], fontsize=8)
         ax_cni_bd.set_xlabel(
-            "seconds since T1 (node registered) \u2014 zoom of the post image-pull window"
+            "seconds since T1 (node registered) \u2014 zoom of the Cilium init-container chain"
         )
         ax_cni_bd.set_title(
-            f"Kubelet blocked on CNI (post image-pull) \u2014 Tip\u2192T1c {bd_total:.2f}s: "
-            f"runc spin-up \u2192 init-container chain \u2192 install-cni conflist write",
+            f"Cilium init-container chain ({bd_total:.2f}s, Tip\u2192last init end): "
+            f"per-init durations derived from consecutive start offsets",
             fontsize=9, loc="left",
         )
         ax_cni_bd.grid(True, axis="x", alpha=0.3)
@@ -691,8 +786,11 @@ def _mean_init_container_offsets(ok: pd.DataFrame, t1_off_per_row: pd.Series) ->
     for name in order:
         s_mean = sum(starts[name]) / len(starts[name])
         e_mean = sum(ends[name]) / len(ends[name])
-        if e_mean - s_mean >= 5e-3:
-            out.append((name, s_mean, e_mean))
+        # Keep all init containers even if their (finished_at - started_at)
+        # rounds to 0 — the zoom recomputes per-init durations from
+        # consecutive start offsets, which is more accurate than the
+        # 1s-resolution finished_at.
+        out.append((name, s_mean, e_mean))
     out.sort(key=lambda x: x[1])
     return out
 
