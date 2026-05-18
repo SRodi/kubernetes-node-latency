@@ -100,6 +100,18 @@ def plot_all(iterations_csv: Path, out_dir: Path, *, title: str = "") -> list[Pa
     if ok.empty:
         return paths
 
+    # Derive a `(provider @ region)` title from the CSV when not supplied
+    # (e.g. when `plot_all` is invoked via `src.cli plot <results_dir>` for
+    # post-hoc regeneration). The cluster identifier is what the reader uses
+    # to disambiguate side-by-side plots across providers.
+    if not title:
+        prov = ok["provider"].dropna().iloc[0] if "provider" in ok.columns and not ok["provider"].dropna().empty else None
+        reg = ok["region"].dropna().iloc[0] if "region" in ok.columns and not ok["region"].dropna().empty else None
+        if prov and reg:
+            title = f"({prov} @ {reg})"
+        elif prov:
+            title = f"({prov})"
+
     metrics_df = ok[[c for c in METRICS if c in ok.columns]].apply(pd.to_numeric, errors="coerce")
 
     # 1. box plot
@@ -605,6 +617,7 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
             "seconds since T1 (node registered) \u2014 zoom of the Cilium init-container chain"
         )
         ax_cni_bd.set_title(
+            f"{title + '  ' if title else ''}"
             f"Cilium init-container chain ({bd_total:.2f}s, Tip\u2192last init end): "
             f"per-init durations derived from consecutive start offsets",
             fontsize=9, loc="left",
@@ -649,6 +662,7 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
         ax_bd.set_yticklabels(["Cilium agent\nbootstrap"], fontsize=9)
         ax_bd.set_xlabel("seconds since T1 (node registered) — zoomed view of the cilium-agent bootstrap window")
         ax_bd.set_title(
+            f"{title + '  ' if title else ''}"
             f"Cilium agent bootstrap \u2014 container-start \u2192 bootstrap gap "
             f"{pre_bs_dur:.2f}s, then bootstrap phases (zoomed) total {bd_total:.2f}s",
             fontsize=9, loc="left",
@@ -690,6 +704,7 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
         ax_regen.set_yticklabels(["Cilium endpoint\nregeneration"], fontsize=8)
         ax_regen.set_xlabel("seconds since T1 (node registered) \u2014 per-endpoint avg, anchored at T3")
         ax_regen.set_title(
+            f"{title + '  ' if title else ''}"
             f"Cilium endpoint regeneration (per-endpoint avg, post-T3) \u2014 total {bd_total:.2f}s",
             fontsize=9, loc="left",
         )
