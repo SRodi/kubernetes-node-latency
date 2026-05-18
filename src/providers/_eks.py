@@ -110,3 +110,55 @@ def eksctl_delete_cluster(cluster: str, region: str, *, wait: bool = False) -> N
     if not wait:
         cmd.append("--wait=false")
     eksctl(cmd, check=False)
+
+
+def eks_find_nodegroup_asg(cluster: str, region: str, nodegroup: str) -> str | None:
+    """Return the underlying Auto Scaling Group name for an EKS managed
+    nodegroup, or ``None`` if it can't be resolved.
+
+    EKS managed nodegroups own exactly one ASG; we need its name to attach
+    ``k8s.io/cluster-autoscaler/node-template/label/*`` tags so the
+    Cluster Autoscaler can perform scale-from-0 decisions when a trigger
+    pod uses ``nodeSelector`` to pin to this pool.
+    """
+    res = aws([
+        "eks", "describe-nodegroup",
+        "--cluster-name", cluster,
+        "--region", region,
+        "--nodegroup-name", nodegroup,
+        "--query", "nodegroup.resources.autoScalingGroups[0].name",
+        "--output", "text",
+    ], capture=True, check=False)
+    name = (res.stdout or "").strip()
+    if not name or name == "None":
+        return None
+    return name
+
+
+def asg_add_node_template_tags(asg_name: str, region: str,
+                               labels: dict[str, str] | None = None,
+                               taints: list[str] | None = None) -> None:
+    """Add ``k8s.io/cluster-autoscaler/node-template/{label,taint}/*`` tags
+    to an ASG so Cluster Autoscaler can scale it from 0.
+
+    Without these tags, CA's predicate check (``pod fits on hypothetical
+    future node?``) fails when the trigger pod uses ``nodeSelector`` or
+    tolerations the live ASG hasn't yet produced a node for.
+    """
+    tags: list[str] = []
+    for k, v in (labels or {}).items():
+        tags.append(
+            f"ResourceId={asg_name},ResourceType=auto-scaling-group,"
+            f"Key=k8s.io/cluster-autoscaler/node-template/label/{k},"
+            f"Value={v},PropagateAtLaunch=false"
+        )
+    for t in (taints or []):
+        tags.append(
+            f"ResourceId={asg_name},ResourceType=auto-scaling-group,"
+            f"Key=k8s.io/cluster-autoscaler/node-template/taint/{t.split('=', 1)[0]},"
+            f"Value={t.split('=', 1)[1] if '=' in t else ''},PropagateAtLaunch=false"
+        )
+    if not tags:
+        return
+    aws(["autoscaling", "create-or-update-tags",
+         "--region", region, "--tags", *tags])

@@ -119,6 +119,25 @@ class EKSEniCiliumProvider(ClusterProvider):
         ]
         _eks.eksctl(np_args)
 
+        # 5a. Tag the latencypool ASG with node-template hints so the
+        # Cluster Autoscaler can perform scale-from-0 decisions. Without
+        # these tags CA's predicate check fails for trigger pods that pin
+        # to this pool via `nodeSelector: {nodepool: latencypool}` — the
+        # ASG has 0 nodes, so CA has no live node to derive labels from
+        # and EKS-API label discovery is not enabled with the default
+        # ASG-tag autoDiscovery used by the upstream chart.
+        asg = _eks.eks_find_nodegroup_asg(cluster, region, up.name)
+        if asg:
+            log.info("tagging ASG %s with node-template/label/nodepool=%s "
+                     "for scale-from-0", asg, up.name)
+            _eks.asg_add_node_template_tags(
+                asg, region,
+                labels={"nodepool": up.name},
+            )
+        else:
+            log.warning("could not resolve ASG for nodegroup %s — "
+                        "scale-from-0 may not work", up.name)
+
         # 6. Cluster Autoscaler (so the latencypool ASG actually scales from 0).
         ca = e.cluster_autoscaler
         if ca.enabled:
