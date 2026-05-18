@@ -69,4 +69,7 @@ aks:
     cilium_values:
       kubeProxyReplacement: "true"
       operator.replicas: "1"
+      # Required for --deep-cilium: agent metrics on :9962, operator on :9963.
+      prometheus.enabled: "true"
+      operator.prometheus.enabled: "true"
     install_timeout_s: 600

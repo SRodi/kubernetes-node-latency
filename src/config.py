@@ -61,9 +61,14 @@ class AKSSystemPoolCfg:
 class AKSByocniCfg:
     cilium_chart_version: str = "1.19.3"
     cilium_repo_url: str = "https://helm.cilium.io/"
+    # prometheus.enabled + operator.prometheus.enabled are required for
+    # --deep-cilium (the in-cluster scraper reads cilium-agent metrics on
+    # port 9962 and operator metrics on 9963). Cheap to leave on always.
     cilium_values: dict = dc.field(default_factory=lambda: {
         "kubeProxyReplacement": "true",
         "operator.replicas": "1",
+        "prometheus.enabled": "true",
+        "operator.prometheus.enabled": "true",
     })
     install_timeout_s: int = 600
 
