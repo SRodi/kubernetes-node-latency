@@ -157,6 +157,14 @@ class EKSClusterAutoscalerCfg:
         "extraArgs.scan-interval": "10s",
         "extraArgs.scale-down-unneeded-time": "1m",
         "extraArgs.scale-down-delay-after-add": "1m",
+        # Run CA in the host's network namespace so AWS SDK calls (IMDS,
+        # autoscaling endpoint, EC2 endpoint) bypass Cilium's BPF kpr
+        # service rules and the pod-network egress path. Without this CA
+        # silently hangs after the boot-time ASG discovery — it never
+        # reaches the autoscaling API to scale the latencypool ASG from
+        # 0. dnsPolicy must switch with it so in-cluster DNS still works.
+        "hostNetwork": "true",
+        "dnsPolicy": "ClusterFirstWithHostNet",
     })
     install_timeout_s: int = 600
 

@@ -111,4 +111,11 @@ eks:
       extraArgs.scan-interval: "10s"
       extraArgs.scale-down-unneeded-time: "1m"
       extraArgs.scale-down-delay-after-add: "1m"
+      # hostNetwork is required: with Cilium kpr + ENI mode the CA pod
+      # otherwise silently hangs after boot-time ASG discovery because
+      # IMDS / EC2 / autoscaling API calls don't survive Cilium's BPF
+      # service path. Running in the host netns bypasses Cilium for CA
+      # while leaving the rest of the pod traffic on Cilium.
+      hostNetwork: "true"
+      dnsPolicy: "ClusterFirstWithHostNet"
     install_timeout_s: 600
