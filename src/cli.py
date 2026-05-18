@@ -36,6 +36,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
         cfg.aks.node_provisioning = args.aks_node_provisioning
     if args.aks_resource_group is not None:
         cfg.aks.resource_group = args.aks_resource_group
+    if args.aws_region is not None:
+        cfg.eks.region = args.aws_region
     if args.deep_cilium:
         cfg.cni.deep = True
     run_id = args.run_id or time.strftime("%Y%m%d-%H%M%S")
@@ -177,6 +179,7 @@ def main(argv: list[str] | None = None) -> int:
     pr.add_argument("--provider", default=None,
                     choices=["gke_autopilot", "gke_standard_dpv2",
                              "aks_overlay_cilium", "aks_byocni", "aks_kubenet",
+                             "eks_eni_cilium",
                              "existing"])
     pr.add_argument("--region", default=None)
     pr.add_argument("--iterations", type=int, default=None)
@@ -187,6 +190,9 @@ def main(argv: list[str] | None = None) -> int:
     pr.add_argument("--aks-resource-group", default=None,
                     help="AKS only: override the resource group name "
                          "(default: node-latency-rg from config.yaml)")
+    pr.add_argument("--aws-region", default=None,
+                    help="EKS only: override the AWS region "
+                         "(default: top-level --region, then config.yaml)")
     pr.add_argument("--existing-cluster", default=None,
                     help="reuse current kubeconfig context with this cluster name")
     pr.add_argument("--keep-cluster", action="store_true")

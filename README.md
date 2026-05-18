@@ -114,6 +114,7 @@ Per-provider prerequisites:
 | `gke_autopilot`, `gke_standard_dpv2` | `gcloud` authenticated |
 | `aks_overlay_cilium`, `aks_kubenet` | `az` logged in (`az login`), `kubectl` |
 | `aks_byocni` | `az` logged in, `kubectl`, `helm` |
+| `eks_eni_cilium` | `aws` configured (`aws configure` / env / IRSA), `eksctl`, `kubectl`, `helm` |
 | `existing` | a working `kubeconfig` for the target cluster |
 
 ## Run
@@ -142,6 +143,9 @@ One command per supported scenario:
 
 # AKS kubenet (legacy, no Cilium agent — T2/T3 emitted as null)
 .venv/bin/python -m src.cli run --provider aks_kubenet       --region westeurope --iterations 10
+
+# EKS with Cilium in ENI mode (replaces AWS VPC CNI; per Isovalent 2025/06/19 guide)
+.venv/bin/python -m src.cli run --provider eks_eni_cilium    --aws-region us-east-1 --iterations 10
 
 # Re-use a cluster you already created
 .venv/bin/python -m src.cli run --provider existing --iterations 5
@@ -341,11 +345,13 @@ src/
 │   ├── _aks_base.py        shared AKS create / credentials / delete plumbing
 │   ├── _az.py              az CLI wrappers
 │   ├── _cli.py             gcloud helpers (in-flight op wait, retry)
+│   ├── _eks.py             eksctl / aws / helm / kubectl wrappers
 │   ├── gke_autopilot.py
 │   ├── gke_standard_dpv2.py
 │   ├── aks_overlay_cilium.py
 │   ├── aks_byocni.py
 │   ├── aks_kubenet.py
+│   ├── eks_eni_cilium.py
 │   └── existing.py
 └── cni/               CNI ready-signal probes
     ├── cilium_dpv2.py     # GKE Dataplane V2 (anetd)
@@ -390,6 +396,7 @@ harness at it via the `existing` provider:
   | `aks_overlay_cilium` / `aks_byocni` / `aks_kubenet` (`cluster_autoscaler`, default) | AKS cluster-autoscaler scales VMSS from `min=0` |
   | `aks_overlay_cilium` / `aks_byocni` / `aks_kubenet` (`nap`) | AKS Node Auto-Provisioning |
   | `aks_overlay_cilium` / `aks_byocni` / `aks_kubenet` (`manual`) | Harness scales nodepool +1 directly |
+  | `eks_eni_cilium` | EKS Cluster Autoscaler scales the `latencypool` ASG from `min=0` |
 
   As a result, `T1 − T0` is not strictly apples-to-apples: CA-driven runs
   include the autoscaler scan/decision time on top of cloud VM provisioning.

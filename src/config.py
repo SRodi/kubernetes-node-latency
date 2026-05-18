@@ -102,6 +102,77 @@ class GKEStandardCfg:
 
 
 @dc.dataclass
+class EKSNodePoolCfg:
+    name: str = "latencypool"
+    # m6i.2xlarge = 8 vCPU / 32 GiB RAM — parity with AKS Standard_D8s_v5
+    # and GKE ek-standard-8 so per-node headroom doesn't skew comparisons.
+    instance_type: str = "m6i.2xlarge"
+    min_count: int = 0
+    max_count: int = 50
+    node_count: int = 0
+
+
+@dc.dataclass
+class EKSSystemPoolCfg:
+    name: str = "systempool"
+    instance_type: str = "m6i.2xlarge"
+    node_count: int = 1
+
+
+@dc.dataclass
+class EKSCiliumCfg:
+    chart_version: str = "1.19.3"
+    repo_url: str = "https://helm.cilium.io/"
+    # ENI-mode values per https://cilium.io/blog/2025/06/19/eks-eni-install/.
+    # - eni.enabled + ipam.mode=eni: Cilium talks to the EC2 API directly to
+    #   allocate ENIs and assign secondary IPs to pods (each pod gets a real
+    #   VPC IP, same model as the AWS VPC CNI it replaced).
+    # - routingMode=native: traffic between pods on different nodes is routed
+    #   via the VPC fabric (no overlay encap).
+    # - egressMasqueradeInterfaces=eth+: SNAT egress to non-VPC destinations.
+    # - kubeProxyReplacement=true: Cilium provides Services; we delete the
+    #   kube-proxy DaemonSet in the provider.
+    # - prometheus.enabled + operator.prometheus.enabled: required by the
+    #   --deep-cilium scraper (agent :9962, operator :9963).
+    values: dict = dc.field(default_factory=lambda: {
+        "eni.enabled": "true",
+        "ipam.mode": "eni",
+        "routingMode": "native",
+        "egressMasqueradeInterfaces": "eth+",
+        "kubeProxyReplacement": "true",
+        "operator.replicas": "1",
+        "prometheus.enabled": "true",
+        "operator.prometheus.enabled": "true",
+    })
+    install_timeout_s: int = 600
+
+
+@dc.dataclass
+class EKSClusterAutoscalerCfg:
+    enabled: bool = True
+    repo_url: str = "https://kubernetes.github.io/autoscaler"
+    chart_version: str | None = None  # null = chart's latest
+    values: dict = dc.field(default_factory=lambda: {
+        "rbac.serviceAccount.name": "cluster-autoscaler",
+        "extraArgs.scan-interval": "10s",
+        "extraArgs.scale-down-unneeded-time": "1m",
+        "extraArgs.scale-down-delay-after-add": "1m",
+    })
+    install_timeout_s: int = 600
+
+
+@dc.dataclass
+class EKSCfg:
+    region: str | None = None  # falls back to top-level region
+    kubernetes_version: str | None = None  # null = eksctl default
+    system_node_pool: EKSSystemPoolCfg = dc.field(default_factory=EKSSystemPoolCfg)
+    user_node_pool: EKSNodePoolCfg = dc.field(default_factory=EKSNodePoolCfg)
+    cilium: EKSCiliumCfg = dc.field(default_factory=EKSCiliumCfg)
+    cluster_autoscaler: EKSClusterAutoscalerCfg = dc.field(
+        default_factory=EKSClusterAutoscalerCfg)
+
+
+@dc.dataclass
 class OutputCfg:
     base_dir: str = "results"
     show_plots: bool = False
@@ -124,6 +195,7 @@ class Config:
     cni: CNICfg = dc.field(default_factory=CNICfg)
     aks: AKSCfg = dc.field(default_factory=AKSCfg)
     gke_standard: GKEStandardCfg = dc.field(default_factory=GKEStandardCfg)
+    eks: EKSCfg = dc.field(default_factory=EKSCfg)
     output: OutputCfg = dc.field(default_factory=OutputCfg)
 
     @classmethod
@@ -144,8 +216,15 @@ class Config:
         aks = AKSCfg(system_node_pool=sys_pool, user_node_pool=usr_pool,
                      byocni=byocni, **aks_raw)
         gke_std = GKEStandardCfg(**(data.pop("gke_standard", {}) or {}))
+        eks_raw = data.pop("eks", {}) or {}
+        eks_sys = EKSSystemPoolCfg(**(eks_raw.pop("system_node_pool", {}) or {}))
+        eks_usr = EKSNodePoolCfg(**(eks_raw.pop("user_node_pool", {}) or {}))
+        eks_cilium = EKSCiliumCfg(**(eks_raw.pop("cilium", {}) or {}))
+        eks_ca = EKSClusterAutoscalerCfg(**(eks_raw.pop("cluster_autoscaler", {}) or {}))
+        eks = EKSCfg(system_node_pool=eks_sys, user_node_pool=eks_usr,
+                     cilium=eks_cilium, cluster_autoscaler=eks_ca, **eks_raw)
         return cls(trigger_pod=tp, cni=cni, aks=aks, gke_standard=gke_std,
-                   output=out, **data)
+                   eks=eks, output=out, **data)
 
     def merge_cli(self, **overrides: Any) -> "Config":
         for k, v in overrides.items():
