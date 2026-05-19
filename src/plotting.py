@@ -35,6 +35,11 @@ PROFILE_LANES = [
     ("Kubelet: residual status sync",        "T1c_cni_conflist",   "T4_node_ready",      "kubelet"),
     ("Cilium agent bootstrap",               "T2_cilium_started",  "T3_cilium_ready",    "cilium"),
     ("Scheduling block (cilium taint)",      "T4_node_ready",      "T4b_schedulable",    "scheduler"),
+    # Trigger pod's CNI ADD + sandbox setup: from when the scheduler bound the
+    # trigger pod to the new node, to when its first container reports Running.
+    # This is the workload-side analogue of cilium IPAM and is what gates the
+    # "node became useful" moment for actual workloads.
+    ("Trigger pod sandbox / CNI ADD",        "T_trigger_scheduled", "T5_pod_running",    "trigger_pod"),
 ]
 
 ACTOR_COLORS = {
@@ -48,6 +53,7 @@ ACTOR_COLORS = {
     "scheduler_wait":  "#c7d2fe",  # lavender (T1->Ts pre-bind)
     "sandbox":         "#fde68a",  # pale amber (kubelet pre-pull setup)
     "kubelet_main":    "#93c5fd",  # light blue (kubelet starting agent main container)
+    "trigger_pod":     "#a855f7",  # purple (trigger pod CNI ADD / sandbox setup)
 }
 
 # Cilium bootstrap sub-phases in the canonical execution order published by
@@ -481,6 +487,8 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
         ("T3_cilium_ready", "T3"),
         ("T4_node_ready", "T4"),
         ("T4b_schedulable", "T4b"),
+        ("T_trigger_scheduled", "Tts"),
+        ("T5_pod_running", "T5"),
     ]
     ZOOM_MARKERS = [
         ("T_csinode_ready", "Tcsi"),
@@ -558,6 +566,26 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
                 color=ACTOR_COLORS["scheduler"], fontweight="bold",
                 annotation_clip=False,
             )
+        elif glyph == "T5":
+            # T5 is the workload-side "node became useful" moment — trigger
+            # pod's first container Running. Render as prominently as T4b but
+            # in trigger_pod purple so the two milestones (scheduler-ready vs
+            # workload-running) are visually distinct.
+            ax.axvline(off, color=ACTOR_COLORS["trigger_pod"], linestyle="-",
+                       alpha=0.85, linewidth=1.6)
+            ax.annotate(
+                "T5\n(pod running)",
+                xy=(off, 1.0), xycoords=("data", "axes fraction"),
+                xytext=(0, 4), textcoords="offset points",
+                ha="center", va="bottom", fontsize=8,
+                color=ACTOR_COLORS["trigger_pod"], fontweight="bold",
+                annotation_clip=False,
+            )
+        elif glyph == "Tts":
+            # Trigger-pod scheduled: subtle dotted line in trigger_pod colour
+            # so the reader can see where the T4b -> T5 sandbox window opens.
+            ax.axvline(off, color=ACTOR_COLORS["trigger_pod"], linestyle=":",
+                       alpha=0.6, linewidth=1.0)
         elif glyph == "T1c":
             # T1c (conflist written / discovered on disk) is a key transition
             # marker: kubelet stops reporting "no CNI" after this point.
@@ -589,7 +617,7 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
         f"Phase profile {title}",
         "bars overlapping on x = parallel; back-to-back = sequential.",
     ]
-    ax.set_title("\n".join(title_lines), fontsize=9, loc="center")
+    ax.set_title("\n".join(title_lines), fontsize=9, loc="center", pad=22)
     ax.grid(True, axis="x", alpha=0.3)
 
     from matplotlib.patches import Patch
