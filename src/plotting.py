@@ -35,6 +35,11 @@ PROFILE_LANES = [
     ("Kubelet: residual status sync",        "T1c_cni_conflist",   "T4_node_ready",      "kubelet"),
     ("Cilium agent bootstrap",               "T2_cilium_started",  "T3_cilium_ready",    "cilium"),
     ("Scheduling block (cilium taint)",      "T4_node_ready",      "T4b_schedulable",    "scheduler"),
+    # Trigger pod's CNI ADD + sandbox setup: from when the scheduler bound the
+    # trigger pod to the new node, to when its first container reports Running.
+    # This is the workload-side analogue of cilium IPAM and is what gates the
+    # "node became useful" moment for actual workloads.
+    ("Trigger pod sandbox / CNI ADD",        "T_trigger_scheduled", "T5_pod_running",    "trigger_pod"),
 ]
 
 ACTOR_COLORS = {
@@ -48,6 +53,7 @@ ACTOR_COLORS = {
     "scheduler_wait":  "#c7d2fe",  # lavender (T1->Ts pre-bind)
     "sandbox":         "#fde68a",  # pale amber (kubelet pre-pull setup)
     "kubelet_main":    "#93c5fd",  # light blue (kubelet starting agent main container)
+    "trigger_pod":     "#a855f7",  # purple (trigger pod CNI ADD / sandbox setup)
 }
 
 # Cilium bootstrap sub-phases in the canonical execution order published by
@@ -134,44 +140,90 @@ def plot_all(iterations_csv: Path, out_dir: Path, *, title: str = "") -> list[Pa
     ax.grid(True, axis="y", alpha=0.3)
     p = out_dir / "mean_stddev.png"; fig.tight_layout(); fig.savefig(p, dpi=140); plt.close(fig); paths.append(p)
 
-    # 3. stacked phase per iteration (always sums to node_startup_latency_s = T4 - T0).
-    #    Cilium agent init (T3 - T2) is overlaid as a separate line because it
-    #    can complete BEFORE or AFTER T4 (e.g. on GKE Autopilot it lands after).
-    phases = pd.DataFrame({label: _seconds(ok[b], ok[a]).clip(lower=0)
-                           for a, b, label in PHASE_COLS
-                           if a in ok.columns and b in ok.columns})
-    if not phases.empty:
-        fig, ax = plt.subplots(figsize=(10, 5))
-        bottom = np.zeros(len(phases))
-        x = np.arange(1, len(phases) + 1)
-        for col in phases.columns:
-            vals = phases[col].fillna(0).values
-            ax.bar(x, vals, bottom=bottom, label=col)
-            bottom += vals
-        cilium = pd.to_numeric(ok.get("cilium_init_duration_s"), errors="coerce")
-        if cilium is not None and cilium.notna().any():
-            ax.plot(x, cilium.values, color="black", marker="D", linewidth=1.2,
-                    label="cilium agent init (T3 \u2212 T2, parallel)")
-        ax.set_xlabel("iteration"); ax.set_ylabel("seconds")
-        ax.set_title(
-            f"Phase breakdown per iteration {title}\n"
-            "stack = node startup latency (T4 \u2212 T0); diamonds = cilium init duration"
-        )
-        ax.legend(loc="upper right", fontsize=8)
-        ax.grid(True, axis="y", alpha=0.3)
+    # 3. stacked phase per iteration — split into two panels so the
+    #    IaaS-side (T0 -> T1) variance doesn't dominate the K8s-networking
+    #    bars visually. Top panel: VM provision + node registered (T0->T1).
+    #    Bottom panel: K8s networking (T1 -> T5_pod_running), the part
+    #    that's actually comparable across providers.
+    iaas_dur = _seconds(ok.get("T1_node_registered"), ok.get("T0_pod_created")).clip(lower=0) \
+        if ("T1_node_registered" in ok.columns and "T0_pod_created" in ok.columns) \
+        else pd.Series(dtype=float)
+    k8s_phases = pd.DataFrame()
+    if {"T1_node_registered", "T1c_cni_conflist", "T4_node_ready",
+        "T4b_schedulable"}.issubset(ok.columns):
+        k8s_phases["T1 -> T1c (CNI conflist)"] = _seconds(
+            ok["T1c_cni_conflist"], ok["T1_node_registered"]).clip(lower=0)
+        k8s_phases["T1c -> T4 (kubelet ready)"] = _seconds(
+            ok["T4_node_ready"], ok["T1c_cni_conflist"]).clip(lower=0)
+        k8s_phases["T4 -> T4b (sched. block)"] = _seconds(
+            ok["T4b_schedulable"], ok["T4_node_ready"]).clip(lower=0)
+        if "T5_pod_running" in ok.columns:
+            k8s_phases["T4b -> T5 (sandbox / CNI ADD)"] = _seconds(
+                ok["T5_pod_running"], ok["T4b_schedulable"]).clip(lower=0)
+    if not k8s_phases.empty or not iaas_dur.empty:
+        fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(10, 7), sharex=True,
+                                             gridspec_kw={"height_ratios": [1, 2]})
+        x = np.arange(1, max(len(iaas_dur), len(k8s_phases)) + 1)
+        if not iaas_dur.empty:
+            ax_top.bar(x, iaas_dur.fillna(0).values, color=ACTOR_COLORS["cloud"],
+                       label="T0 -> T1 (IaaS: autoscaler + VM + kubelet boot)")
+            ax_top.set_ylabel("seconds")
+            ax_top.set_title(
+                f"IaaS-side: cloud autoscaler + VM provisioning {title}\n"
+                "(high variance — not directly comparable across clouds)")
+            ax_top.legend(loc="upper right", fontsize=8)
+            ax_top.grid(True, axis="y", alpha=0.3)
+        if not k8s_phases.empty:
+            bottom = np.zeros(len(k8s_phases))
+            x2 = np.arange(1, len(k8s_phases) + 1)
+            palette = [ACTOR_COLORS["cni"], ACTOR_COLORS["kubelet"],
+                       ACTOR_COLORS["scheduler"], ACTOR_COLORS["cilium"]]
+            for i, col in enumerate(k8s_phases.columns):
+                vals = k8s_phases[col].fillna(0).values
+                ax_bot.bar(x2, vals, bottom=bottom, label=col,
+                           color=palette[i % len(palette)])
+                bottom += vals
+            cilium = pd.to_numeric(ok.get("cilium_init_duration_s"), errors="coerce")
+            if cilium is not None and cilium.notna().any():
+                ax_bot.plot(x2, cilium.values, color="black", marker="D",
+                            linewidth=1.2,
+                            label="cilium agent init (T3 \u2212 T2, parallel)")
+            ax_bot.set_xlabel("iteration"); ax_bot.set_ylabel("seconds")
+            ax_bot.set_title(
+                "K8s networking: T1 -> T5_pod_running "
+                "(directly comparable across providers)")
+            ax_bot.legend(loc="upper right", fontsize=8)
+            ax_bot.grid(True, axis="y", alpha=0.3)
         p = out_dir / "phase_stacked.png"; fig.tight_layout(); fig.savefig(p, dpi=140); plt.close(fig); paths.append(p)
 
-    # 4. latency vs iteration
-    if "node_startup_latency_s" in metrics_df:
-        fig, ax = plt.subplots(figsize=(9, 4))
-        ax.plot(range(1, len(metrics_df) + 1), metrics_df["node_startup_latency_s"], marker="o")
-        ax.set_xlabel("iteration"); ax.set_ylabel("seconds")
-        ax.set_title(f"Node startup latency vs iteration {title}")
-        ax.grid(True, alpha=0.3)
-        p = out_dir / "latency_vs_iteration.png"; fig.tight_layout(); fig.savefig(p, dpi=140); plt.close(fig); paths.append(p)
+    # 4. latency vs iteration — show BOTH the IaaS T0->T1 line and the
+    #    K8s-networking T1->T5 line so the reader sees they're independent.
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    x = range(1, len(metrics_df) + 1)
+    plotted = False
+    if "node_register_latency_s" in metrics_df:
+        ax.plot(x, metrics_df["node_register_latency_s"], marker="s",
+                color=ACTOR_COLORS["cloud"], label="T0->T1 (IaaS)")
+        plotted = True
+    if "time_to_runnable_s" in metrics_df:
+        ax.plot(x, metrics_df["time_to_runnable_s"], marker="o",
+                color=ACTOR_COLORS["cilium"],
+                label="T1->T5 time_to_runnable (K8s networking)")
+        plotted = True
+    if not plotted and "node_startup_latency_s" in metrics_df:
+        ax.plot(x, metrics_df["node_startup_latency_s"], marker="o",
+                label="T0->T4 (legacy)")
+    ax.set_xlabel("iteration"); ax.set_ylabel("seconds")
+    ax.set_title(f"Per-iteration latency {title}")
+    ax.legend(loc="upper right", fontsize=8)
+    ax.grid(True, alpha=0.3)
+    p = out_dir / "latency_vs_iteration.png"; fig.tight_layout(); fig.savefig(p, dpi=140); plt.close(fig); paths.append(p)
 
-    # 5. CDF
-    s = metrics_df.get("node_startup_latency_s")
+    # 5. CDF — prefer time_to_runnable_s (T1-anchored, IaaS-noise excluded).
+    cdf_metric = "time_to_runnable_s" if "time_to_runnable_s" in metrics_df \
+        and pd.to_numeric(metrics_df["time_to_runnable_s"], errors="coerce").dropna().size \
+        else "node_startup_latency_s"
+    s = metrics_df.get(cdf_metric)
     if s is not None and s.dropna().size:
         s = s.dropna().sort_values().reset_index(drop=True)
         cdf = (np.arange(1, len(s) + 1)) / len(s)
@@ -181,8 +233,8 @@ def plot_all(iterations_csv: Path, out_dir: Path, *, title: str = "") -> list[Pa
             v = float(s.quantile(q))
             ax.axvline(v, linestyle="--", alpha=0.4)
             ax.text(v, q, f" {label}={v:.1f}s", va="center")
-        ax.set_xlabel("node startup latency (s)"); ax.set_ylabel("CDF")
-        ax.set_title(f"CDF of node startup latency {title}")
+        ax.set_xlabel(f"{cdf_metric} (s)"); ax.set_ylabel("CDF")
+        ax.set_title(f"CDF of {cdf_metric} {title}")
         ax.grid(True, alpha=0.3); ax.set_ylim(0, 1.02)
         p = out_dir / "cdf.png"; fig.tight_layout(); fig.savefig(p, dpi=140); plt.close(fig); paths.append(p)
 
@@ -202,13 +254,19 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
         return None
 
     def _mean_offset(col: str) -> float | None:
+        """Median offset (seconds) of `col` relative to T0, across iterations.
+
+        Despite the historical name, this returns the **median** — median is
+        robust to cold-pool tails (e.g. GKE Autopilot T1: 7s vs 170s in the
+        same run); mean would visually distort the Gantt.
+        """
         if col not in ok.columns:
             return None
         s = _seconds(ok[col], ok["T0_pod_created"])
         s = s[s.notna()]
         if s.empty:
             return None
-        return float(s.mean())
+        return float(s.median())
 
     lanes: list[tuple[str, float, float, str]] = []
     for label, start_col, end_col, actor in PROFILE_LANES:
@@ -435,6 +493,8 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
         ("T3_cilium_ready", "T3"),
         ("T4_node_ready", "T4"),
         ("T4b_schedulable", "T4b"),
+        ("T_trigger_scheduled", "Tts"),
+        ("T5_pod_running", "T5"),
     ]
     ZOOM_MARKERS = [
         ("T_csinode_ready", "Tcsi"),
@@ -512,6 +572,26 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
                 color=ACTOR_COLORS["scheduler"], fontweight="bold",
                 annotation_clip=False,
             )
+        elif glyph == "T5":
+            # T5 is the workload-side "node became useful" moment — trigger
+            # pod's first container Running. Render as prominently as T4b but
+            # in trigger_pod purple so the two milestones (scheduler-ready vs
+            # workload-running) are visually distinct.
+            ax.axvline(off, color=ACTOR_COLORS["trigger_pod"], linestyle="-",
+                       alpha=0.85, linewidth=1.6)
+            ax.annotate(
+                "T5\n(pod running)",
+                xy=(off, 1.0), xycoords=("data", "axes fraction"),
+                xytext=(0, 4), textcoords="offset points",
+                ha="center", va="bottom", fontsize=8,
+                color=ACTOR_COLORS["trigger_pod"], fontweight="bold",
+                annotation_clip=False,
+            )
+        elif glyph == "Tts":
+            # Trigger-pod scheduled: subtle dotted line in trigger_pod colour
+            # so the reader can see where the T4b -> T5 sandbox window opens.
+            ax.axvline(off, color=ACTOR_COLORS["trigger_pod"], linestyle=":",
+                       alpha=0.6, linewidth=1.0)
         elif glyph == "T1c":
             # T1c (conflist written / discovered on disk) is a key transition
             # marker: kubelet stops reporting "no CNI" after this point.
@@ -543,7 +623,7 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
         f"Phase profile {title}",
         "bars overlapping on x = parallel; back-to-back = sequential.",
     ]
-    ax.set_title("\n".join(title_lines), fontsize=9, loc="center")
+    ax.set_title("\n".join(title_lines), fontsize=9, loc="center", pad=22)
     ax.grid(True, axis="x", alpha=0.3)
 
     from matplotlib.patches import Patch
@@ -718,20 +798,24 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
 
 
 def _mean_offset_metric(ok: pd.DataFrame, col: str) -> float | None:
-    """Mean of a numeric metric column (not a timestamp delta)."""
+    """Median of a numeric metric column (not a timestamp delta).
+
+    Name kept for backward compat; implementation is median, matching the
+    phase_profile/Gantt mean->median switch for cold-tail robustness.
+    """
     if col not in ok.columns:
         return None
     s = pd.to_numeric(ok[col], errors="coerce").dropna()
     if s.empty:
         return None
-    return float(s.mean())
+    return float(s.median())
 
 
 def _mean_init_container_durations(ok: pd.DataFrame) -> list[tuple[str, float]]:
-    """Parse init_containers_json (per iteration) and return mean durations
+    """Parse init_containers_json (per iteration) and return median durations
     per init-container name, ordered by the canonical first-seen ordering.
 
-    Each entry is (name, mean_duration_seconds). Containers with < 5 ms mean
+    Each entry is (name, median_duration_seconds). Containers with < 5 ms median
     are filtered out — they'd be invisible in the plot.
     """
     rows = _init_container_windows(ok)
@@ -747,15 +831,18 @@ def _mean_init_container_durations(ok: pd.DataFrame) -> list[tuple[str, float]]:
         vals = durations[name]
         if not vals:
             continue
-        mean = sum(vals) / len(vals)
-        if mean >= 5e-3:
-            out.append((name, mean))
+        median = float(pd.Series(vals).median())
+        if median >= 5e-3:
+            out.append((name, median))
     return out
 
 
 def _mean_init_container_offsets(ok: pd.DataFrame, t1_off_per_row: pd.Series) -> list[tuple[str, float, float]]:
-    """Return per-init-container (name, mean_start_offset_s, mean_end_offset_s)
+    """Return per-init-container (name, median_start_offset_s, median_end_offset_s)
     relative to T1, using absolute timestamps in init_containers_json.
+
+    Despite the historical name, aggregates with **median** for cold-tail
+    robustness (consistent with the phase_profile main-marker offsets).
 
     `t1_off_per_row` must be aligned with `ok` and contain each iteration's
     T1 absolute time as a pandas datetime; rows where T1 is missing are
@@ -799,13 +886,13 @@ def _mean_init_container_offsets(ok: pd.DataFrame, t1_off_per_row: pd.Series) ->
             ends[name].append(e_off)
     out: list[tuple[str, float, float]] = []
     for name in order:
-        s_mean = sum(starts[name]) / len(starts[name])
-        e_mean = sum(ends[name]) / len(ends[name])
+        s_med = float(pd.Series(starts[name]).median())
+        e_med = float(pd.Series(ends[name]).median())
         # Keep all init containers even if their (finished_at - started_at)
         # rounds to 0 — the zoom recomputes per-init durations from
         # consecutive start offsets, which is more accurate than the
         # 1s-resolution finished_at.
-        out.append((name, s_mean, e_mean))
+        out.append((name, s_med, e_med))
     out.sort(key=lambda x: x[1])
     return out
 
@@ -937,21 +1024,300 @@ def _backfill_cilium_deep(df: pd.DataFrame, run_dir: Path) -> None:
                 df.at[idx, col] = val
 
 
+def _run_label(csv_path: Path) -> str:
+    """Resolve a readable provider/region label from a run dir."""
+    meta_p = csv_path.parent / "run_metadata.json"
+    if meta_p.exists():
+        try:
+            import json
+            m = json.loads(meta_p.read_text())
+            provider = (m.get("config") or {}).get("provider")
+            region = (m.get("cluster") or {}).get("region")
+            argv = m.get("cli_argv") or []
+            extras = []
+            if "--aks-node-provisioning" in argv:
+                try:
+                    extras.append(argv[argv.index("--aks-node-provisioning") + 1])
+                except IndexError:
+                    pass
+            if provider:
+                parts = [provider]
+                if region:
+                    parts.append(region)
+                if extras:
+                    parts.append("/".join(extras))
+                return " · ".join(parts)
+        except Exception:
+            pass
+    return csv_path.parent.name
+
+
+def _plot_compare_phase_decomposition(csvs: list[Path], out_dir: Path) -> Path | None:
+    """Cross-provider stacked-bar decomposition of the post-T1 K8s networking
+    budget, with a Cilium-bootstrap drill-down and a known-suspects strip.
+
+    Each row in the top panel is one run (one provider). Segments left-to-right
+    show p50 seconds spent in each phase between T1 and T5_pod_running.
+    """
+    runs: list[tuple[str, pd.DataFrame]] = []
+    for csv in csvs:
+        try:
+            df = _ok(pd.read_csv(csv))
+        except Exception:
+            continue
+        if df.empty:
+            continue
+        runs.append((_run_label(csv), df))
+    if not runs:
+        return None
+
+    def _p(df: pd.DataFrame, col: str, q: float) -> float:
+        if col not in df.columns:
+            return float("nan")
+        s = pd.to_numeric(df[col], errors="coerce").dropna()
+        return float(s.quantile(q)) if not s.empty else float("nan")
+
+    def _delta_p50(df: pd.DataFrame, end: str, start: str) -> float:
+        if end not in df.columns or start not in df.columns:
+            return float("nan")
+        e = pd.to_datetime(df[end], errors="coerce", utc=True)
+        s = pd.to_datetime(df[start], errors="coerce", utc=True)
+        d = (e - s).dt.total_seconds().clip(lower=0).dropna()
+        return float(d.median()) if not d.empty else float("nan")
+
+    # ---- Panel A data: phase decomposition ----
+    PHASES = [
+        ("T1->T1c CNI conflist",        "T1c_cni_conflist",    "T1_node_registered",  ACTOR_COLORS["cni"]),
+        ("T1c->T2 kubelet -> agent",    "T2_cilium_started",   "T1c_cni_conflist",    ACTOR_COLORS["kubelet_main"]),
+        ("T2->T3 cilium bootstrap",     "T3_cilium_ready",     "T2_cilium_started",   ACTOR_COLORS["cilium"]),
+        ("T3->T4 kubelet residual",     "T4_node_ready",       "T3_cilium_ready",     ACTOR_COLORS["kubelet"]),
+        ("T4->T4b sched. block (taint)","T4b_schedulable",     "T4_node_ready",       ACTOR_COLORS["scheduler"]),
+        ("T4b->T5 sandbox / CNI ADD",   "T5_pod_running",      "T4b_schedulable",     ACTOR_COLORS["trigger_pod"]),
+    ]
+    rows_a: list[tuple[str, list[float], float, float, float]] = []
+    for label, df in runs:
+        seg = [max(_delta_p50(df, end, start), 0.0) for _name, end, start, _c in PHASES]
+        ttr_p50 = _p(df, "time_to_runnable_s", 0.5)
+        ttr_p25 = _p(df, "time_to_runnable_s", 0.25)
+        ttr_p75 = _p(df, "time_to_runnable_s", 0.75)
+        if any(not np.isfinite(v) for v in seg) or not np.isfinite(ttr_p50):
+            # Fallback: synthesise total from segments if time_to_runnable_s is missing
+            ttr_p50 = float(np.nansum(seg)) if any(np.isfinite(v) for v in seg) else float("nan")
+            ttr_p25 = ttr_p50
+            ttr_p75 = ttr_p50
+        rows_a.append((label, [v if np.isfinite(v) else 0.0 for v in seg],
+                       ttr_p50, ttr_p25, ttr_p75))
+    rows_a.sort(key=lambda r: r[2])  # ascending by p50 — fastest first at top
+
+    # ---- Panel B data: Cilium bootstrap sub-phases ----
+    rows_b: list[tuple[str, list[float]]] = []
+    for label, df in runs:
+        seg = [max(_p(df, col, 0.5), 0.0) if np.isfinite(_p(df, col, 0.5)) else 0.0
+               for _l, col in CILIUM_BOOTSTRAP_PHASES]
+        if sum(seg) > 0:
+            rows_b.append((label, seg))
+
+    # ---- Panel C data: known suspects ----
+    SUSPECTS = [
+        ("cilium-agent image pull (s)",    "#fbbf24"),
+        ("CNI conflist install (s)",       "#fb8c00"),  # synth: T1c-T1
+        ("Agent main container startup (s)", ACTOR_COLORS["kubelet_main"]),  # synth: T2 - last_init.finished_at
+        ("Sched. block taint (s)",         ACTOR_COLORS["scheduler"]),
+    ]
+
+    def _agent_main_startup_p50(df: pd.DataFrame) -> float:
+        """Median over iterations of (T2_cilium_started - max(init.finished_at)).
+        Mirrors the synthetic 'Agent main container startup' lane in phase_profile.
+        """
+        if "init_containers_json" not in df.columns or "T2_cilium_started" not in df.columns:
+            return float("nan")
+        import json as _json
+        from datetime import datetime as _dt
+        deltas: list[float] = []
+        t2_series = pd.to_datetime(df["T2_cilium_started"], errors="coerce", utc=True)
+        for raw, t2 in zip(df["init_containers_json"], t2_series):
+            if raw is None or (isinstance(raw, float) and pd.isna(raw)) or pd.isna(t2):
+                continue
+            try:
+                entries = _json.loads(raw)
+            except Exception:
+                continue
+            last_end = None
+            for ic in entries:
+                fa = ic.get("finished_at")
+                if not fa:
+                    continue
+                try:
+                    fa_dt = _dt.fromisoformat(fa.replace("Z", "+00:00"))
+                except Exception:
+                    continue
+                if last_end is None or fa_dt > last_end:
+                    last_end = fa_dt
+            if last_end is None:
+                continue
+            delta = (t2.to_pydatetime() - last_end).total_seconds()
+            if delta >= 0:
+                deltas.append(delta)
+        if not deltas:
+            return float("nan")
+        return float(pd.Series(deltas).median())
+
+    rows_c: list[tuple[str, list[float]]] = []
+    for label, df in runs:
+        vals = [
+            _p(df, "image_pull_s", 0.5),
+            _delta_p50(df, "T1c_cni_conflist", "T1_node_registered"),
+            _agent_main_startup_p50(df),
+            _p(df, "cilium_scheduling_block_s", 0.5),
+        ]
+        rows_c.append((label, [v if np.isfinite(v) else 0.0 for v in vals]))
+
+    # ---- Figure layout ----
+    n = len(rows_a)
+    h_a = max(2.2, 0.45 * n + 1.5)
+    h_b = max(2.0, 0.40 * len(rows_b) + 1.2)
+    h_c = max(2.0, 0.50 * len(rows_c) + 1.0)
+    fig, axes = plt.subplots(
+        3, 1, figsize=(16, h_a + h_b + h_c),
+        gridspec_kw={"height_ratios": [h_a, h_b, h_c]},
+    )
+    ax_a, ax_b, ax_c = axes
+
+    # --- Panel A: stacked phase decomposition ---
+    y = np.arange(n)
+    cursor = np.zeros(n)
+    for i, (phase_label, _end, _start, color) in enumerate(PHASES):
+        widths = np.array([r[1][i] for r in rows_a])
+        ax_a.barh(y, widths, left=cursor, color=color, edgecolor="white",
+                  linewidth=0.6, label=phase_label)
+        for j, w in enumerate(widths):
+            if w >= 1.0:
+                ax_a.text(cursor[j] + w / 2, y[j], f"{w:.1f}",
+                          ha="center", va="center", fontsize=8,
+                          color="white", fontweight="bold")
+        cursor += widths
+    # IQR whisker on total
+    for j, (_lab, _seg, p50, p25, p75) in enumerate(rows_a):
+        ax_a.errorbar(p50, y[j], xerr=[[max(p50 - p25, 0)], [max(p75 - p50, 0)]],
+                      fmt="none", ecolor="#333", capsize=3, linewidth=1.0)
+        ax_a.text(cursor[j] + 0.6, y[j],
+                  f"p50 {p50:.1f}s  (p25 {p25:.1f}  p75 {p75:.1f})",
+                  va="center", fontsize=8, color="#333")
+    ax_a.set_yticks(y); ax_a.set_yticklabels([r[0] for r in rows_a], fontsize=9)
+    ax_a.invert_yaxis()
+    ax_a.set_xlabel("seconds since T1 (node registered)  —  p50 across iterations")
+    ax_a.set_title(
+        "K8s networking phase decomposition — provider comparison (p50)",
+        fontsize=11, fontweight="bold",
+    )
+    ax_a.grid(True, axis="x", alpha=0.3)
+    ax_a.legend(loc="center left", bbox_to_anchor=(1.02, 0.5),
+                fontsize=8, framealpha=0.95, title="phase")
+
+    # --- Panel B: Cilium bootstrap sub-phases ---
+    if rows_b:
+        yb = np.arange(len(rows_b))
+        cursor_b = np.zeros(len(rows_b))
+        palette_b = [
+            "#a7f3d0", "#6ee7b7", "#34d399", "#fde68a", "#10b981",
+            "#059669", "#047857", "#065f46", "#bef264", "#a3e635", "#84cc16",
+        ]
+        for i, (lbl, _col) in enumerate(CILIUM_BOOTSTRAP_PHASES):
+            widths = np.array([r[1][i] for r in rows_b])
+            if widths.sum() <= 0:
+                continue
+            color = palette_b[i % len(palette_b)]
+            ax_b.barh(yb, widths, left=cursor_b, color=color,
+                      edgecolor="white", linewidth=0.5,
+                      label=lbl.replace("bootstrap.", ""))
+            for j, w in enumerate(widths):
+                if w >= 0.5:
+                    ax_b.text(cursor_b[j] + w / 2, yb[j], f"{w:.1f}",
+                              ha="center", va="center", fontsize=7, color="#111")
+            cursor_b += widths
+        for j, (_lab, seg) in enumerate(rows_b):
+            tot = sum(seg)
+            ax_b.text(tot + 0.2, yb[j], f"{tot:.1f}s",
+                      va="center", fontsize=8, color="#333")
+        ax_b.set_yticks(yb); ax_b.set_yticklabels([r[0] for r in rows_b], fontsize=9)
+        ax_b.invert_yaxis()
+        ax_b.set_xlabel("seconds (sum of cilium-agent bootstrap sub-phases, p50)")
+        ax_b.set_title("Cilium agent bootstrap drill-down (T2 -> T3)",
+                       fontsize=10, fontweight="bold")
+        ax_b.grid(True, axis="x", alpha=0.3)
+        ax_b.legend(loc="center left", bbox_to_anchor=(1.02, 0.5),
+                    fontsize=7, framealpha=0.95, title="bootstrap phase")
+    else:
+        ax_b.text(0.5, 0.5, "no cilium bootstrap data in selected runs",
+                  ha="center", va="center", transform=ax_b.transAxes,
+                  fontsize=10, color="#888")
+        ax_b.set_axis_off()
+
+    # --- Panel C: known suspects grouped bars ---
+    yc = np.arange(len(rows_c))
+    n_sus = len(SUSPECTS)
+    width = 0.78 / n_sus
+    for i, (sname, scolor) in enumerate(SUSPECTS):
+        vals = np.array([r[1][i] for r in rows_c])
+        offset = (i - (n_sus - 1) / 2.0) * width
+        ax_c.barh(yc + offset, vals, height=width, color=scolor,
+                  edgecolor="black", linewidth=0.4, label=sname)
+        for j, v in enumerate(vals):
+            if v > 0.05:
+                ax_c.text(v + 0.2, yc[j] + offset, f"{v:.1f}",
+                          va="center", fontsize=7, color="#333")
+    ax_c.set_yticks(yc); ax_c.set_yticklabels([r[0] for r in rows_c], fontsize=9)
+    ax_c.invert_yaxis()
+    ax_c.set_xlabel("seconds (p50)")
+    ax_c.set_title("Known suspects — image pull, CNI conflist install, agent-main startup, sched-block taint",
+                   fontsize=10, fontweight="bold")
+    ax_c.grid(True, axis="x", alpha=0.3)
+    ax_c.legend(loc="center left", bbox_to_anchor=(1.02, 0.5),
+                fontsize=8, framealpha=0.95, title="suspect")
+
+    fig.suptitle(
+        "Networking-only comparison (T1-anchored, IaaS variance excluded)",
+        fontsize=12, fontweight="bold", y=0.995,
+    )
+    fig.tight_layout(rect=(0, 0, 0.83, 0.985))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    p = out_dir / "compare_phase_decomposition.png"
+    fig.savefig(p, dpi=140); plt.close(fig)
+    return p
+
+
 def plot_compare(csvs: list[Path], out_dir: Path) -> list[Path]:
-    """Overlay node-startup-latency CDF across multiple runs (cross-provider compare)."""
+    """Overlay headline-latency CDF across multiple runs and emit a
+    cross-provider phase decomposition figure (cross-provider compare)."""
     out_dir.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(9, 5))
+    cdf_metric = "time_to_runnable_s"
+    # Fall back to legacy metric if no run carries the new T1-anchored column.
+    any_runnable = False
+    for csv in csvs:
+        try:
+            cols = pd.read_csv(csv, nrows=1).columns
+        except Exception:
+            continue
+        if "time_to_runnable_s" in cols:
+            any_runnable = True; break
+    if not any_runnable:
+        cdf_metric = "node_startup_latency_s"
     for csv in csvs:
         df = pd.read_csv(csv)
         ok = _ok(df)
-        s = pd.to_numeric(ok.get("node_startup_latency_s"), errors="coerce").dropna().sort_values()
+        s = pd.to_numeric(ok.get(cdf_metric), errors="coerce").dropna().sort_values()
         if s.empty:
             continue
         cdf = np.arange(1, len(s) + 1) / len(s)
-        label = csv.parent.name
+        label = _run_label(csv)
         ax.plot(s.values, cdf, marker=".", label=label)
-    ax.set_xlabel("node startup latency (s)"); ax.set_ylabel("CDF")
-    ax.set_title("Node startup latency CDF — comparison")
-    ax.grid(True, alpha=0.3); ax.legend()
+    ax.set_xlabel(f"{cdf_metric} (s)"); ax.set_ylabel("CDF")
+    ax.set_title(f"{cdf_metric} CDF — provider comparison")
+    ax.grid(True, alpha=0.3); ax.legend(fontsize=8)
     p = out_dir / "compare_cdf.png"; fig.tight_layout(); fig.savefig(p, dpi=140); plt.close(fig)
-    return [p]
+    out: list[Path] = [p]
+    decomp = _plot_compare_phase_decomposition(csvs, out_dir)
+    if decomp is not None:
+        out.append(decomp)
+    return out

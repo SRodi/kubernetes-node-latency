@@ -203,6 +203,21 @@ def run_iterations(cfg: Config, handle: ClusterHandle, provider: ClusterProvider
                 rec.error = repr(e)
                 log.exception("iteration %d errored", i)
             finally:
+                # Trigger-pod lifecycle capture — read pod state BEFORE
+                # delete_pod so we can record T_trigger_scheduled and
+                # T5_pod_running (the workload-side moment kubelet finished
+                # CNI ADD). Best-effort; never raises. Guarded by
+                # locals().get() because `collector` may not be defined
+                # yet if we errored before instantiation.
+                _coll = locals().get("collector")
+                if rec.pod_name and rec.T0_pod_created is not None and _coll is not None:
+                    try:
+                        tp = _coll.collect_trigger_pod_status(
+                            rec.pod_name, cfg.trigger_pod.namespace)
+                        rec.T_trigger_scheduled = tp.get("T_trigger_scheduled")
+                        rec.T5_pod_running = tp.get("T5_pod_running")
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("trigger-pod status capture failed for iter %d: %s", i, e)
                 if rec.pod_name:
                     delete_pod(core, rec.pod_name, cfg.trigger_pod.namespace)
                 # Best-effort uncordon so leftover nodes can be reused/reaped normally.

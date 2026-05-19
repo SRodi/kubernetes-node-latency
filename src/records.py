@@ -65,6 +65,19 @@ class IterationRecord:
     #                       "finished_at": iso|None}, ...]
     init_containers: list[dict] | None = None
 
+    # Trigger-pod lifecycle (the workload pod the harness submits each
+    # iteration to force a new node). Captured post-iteration so we can
+    # measure the actual "K8s networking" cost a workload sees: from node
+    # registered (T1) to the trigger pod's first container in Running.
+    # `T_trigger_scheduled` is pod.status.conditions[PodScheduled]; it can
+    # legitimately precede `T1c_cni_conflist` because the scheduler binds
+    # purely on Node Ready and does not gate on CNI conflist presence.
+    # `T5_pod_running` is the first container's
+    # status.state.running.startedAt — the moment kubelet successfully
+    # invoked CNI ADD and the pod sandbox is wired with an IP.
+    T_trigger_scheduled: datetime | None = None
+    T5_pod_running: datetime | None = None
+
     status: str = "pending"  # pending|success|timeout|error
     error: str | None = None
 
@@ -178,6 +191,54 @@ class IterationRecord:
             "pod_initialized_offset_s": (
                 delta(self.T_pod_initialized, self.T1_node_registered)
                 if (self.T_pod_initialized and self.T1_node_registered) else None
+            ),
+            # Trigger pod lifecycle (workload pod, not the cilium-agent DS).
+            "T_trigger_scheduled": iso(self.T_trigger_scheduled),
+            "T5_pod_running": iso(self.T5_pod_running),
+            # K8s-networking headline KPI: T1 -> trigger pod's first
+            # container Running. Excludes IaaS / VM-bringup noise (T0->T1)
+            # and is the cleanest cross-provider measure of CNI + kubelet
+            # wiring + cilium IPAM costs the workload actually pays.
+            "time_to_runnable_s": (
+                max(delta(self.T5_pod_running, self.T1_node_registered) or 0.0, 0.0)
+                if (self.T5_pod_running and self.T1_node_registered) else None
+            ),
+            # CNI ADD + sandbox setup as observed by kubelet on the trigger
+            # pod: from scheduler binding to first container Running. This
+            # is the workload-pod analogue of `cilium_bootstrap_ipam_s`
+            # (which is the *agent's* view) and reflects the real-world
+            # cost of CNI ADD on the new node.
+            "sandbox_setup_s": (
+                max(delta(self.T5_pod_running, self.T_trigger_scheduled) or 0.0, 0.0)
+                if (self.T5_pod_running and self.T_trigger_scheduled) else None
+            ),
+            # T1-anchored versions of the canonical markers. These are the
+            # numbers to compare across providers when the focus is on
+            # K8s networking rather than IaaS provisioning. All are None
+            # when either anchor is missing.
+            "T1c_s_from_T1": (
+                delta(self.T1c_cni_conflist, self.T1_node_registered)
+                if (self.T1c_cni_conflist and self.T1_node_registered) else None
+            ),
+            "T2_s_from_T1": (
+                delta(self.T2_cilium_started, self.T1_node_registered)
+                if (self.T2_cilium_started and self.T1_node_registered) else None
+            ),
+            "T3_s_from_T1": (
+                delta(self.T3_cilium_ready, self.T1_node_registered)
+                if (self.T3_cilium_ready and self.T1_node_registered) else None
+            ),
+            "T4_s_from_T1": (
+                delta(self.T4_node_ready, self.T1_node_registered)
+                if (self.T4_node_ready and self.T1_node_registered) else None
+            ),
+            "T4b_s_from_T1": (
+                delta(self.T4b_schedulable, self.T1_node_registered)
+                if (self.T4b_schedulable and self.T1_node_registered) else None
+            ),
+            "T5_s_from_T1": (
+                delta(self.T5_pod_running, self.T1_node_registered)
+                if (self.T5_pod_running and self.T1_node_registered) else None
             ),
         }
         row.update(ic_durations)
