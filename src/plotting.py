@@ -134,44 +134,90 @@ def plot_all(iterations_csv: Path, out_dir: Path, *, title: str = "") -> list[Pa
     ax.grid(True, axis="y", alpha=0.3)
     p = out_dir / "mean_stddev.png"; fig.tight_layout(); fig.savefig(p, dpi=140); plt.close(fig); paths.append(p)
 
-    # 3. stacked phase per iteration (always sums to node_startup_latency_s = T4 - T0).
-    #    Cilium agent init (T3 - T2) is overlaid as a separate line because it
-    #    can complete BEFORE or AFTER T4 (e.g. on GKE Autopilot it lands after).
-    phases = pd.DataFrame({label: _seconds(ok[b], ok[a]).clip(lower=0)
-                           for a, b, label in PHASE_COLS
-                           if a in ok.columns and b in ok.columns})
-    if not phases.empty:
-        fig, ax = plt.subplots(figsize=(10, 5))
-        bottom = np.zeros(len(phases))
-        x = np.arange(1, len(phases) + 1)
-        for col in phases.columns:
-            vals = phases[col].fillna(0).values
-            ax.bar(x, vals, bottom=bottom, label=col)
-            bottom += vals
-        cilium = pd.to_numeric(ok.get("cilium_init_duration_s"), errors="coerce")
-        if cilium is not None and cilium.notna().any():
-            ax.plot(x, cilium.values, color="black", marker="D", linewidth=1.2,
-                    label="cilium agent init (T3 \u2212 T2, parallel)")
-        ax.set_xlabel("iteration"); ax.set_ylabel("seconds")
-        ax.set_title(
-            f"Phase breakdown per iteration {title}\n"
-            "stack = node startup latency (T4 \u2212 T0); diamonds = cilium init duration"
-        )
-        ax.legend(loc="upper right", fontsize=8)
-        ax.grid(True, axis="y", alpha=0.3)
+    # 3. stacked phase per iteration — split into two panels so the
+    #    IaaS-side (T0 -> T1) variance doesn't dominate the K8s-networking
+    #    bars visually. Top panel: VM provision + node registered (T0->T1).
+    #    Bottom panel: K8s networking (T1 -> T5_pod_running), the part
+    #    that's actually comparable across providers.
+    iaas_dur = _seconds(ok.get("T1_node_registered"), ok.get("T0_pod_created")).clip(lower=0) \
+        if ("T1_node_registered" in ok.columns and "T0_pod_created" in ok.columns) \
+        else pd.Series(dtype=float)
+    k8s_phases = pd.DataFrame()
+    if {"T1_node_registered", "T1c_cni_conflist", "T4_node_ready",
+        "T4b_schedulable"}.issubset(ok.columns):
+        k8s_phases["T1 -> T1c (CNI conflist)"] = _seconds(
+            ok["T1c_cni_conflist"], ok["T1_node_registered"]).clip(lower=0)
+        k8s_phases["T1c -> T4 (kubelet ready)"] = _seconds(
+            ok["T4_node_ready"], ok["T1c_cni_conflist"]).clip(lower=0)
+        k8s_phases["T4 -> T4b (sched. block)"] = _seconds(
+            ok["T4b_schedulable"], ok["T4_node_ready"]).clip(lower=0)
+        if "T5_pod_running" in ok.columns:
+            k8s_phases["T4b -> T5 (sandbox / CNI ADD)"] = _seconds(
+                ok["T5_pod_running"], ok["T4b_schedulable"]).clip(lower=0)
+    if not k8s_phases.empty or not iaas_dur.empty:
+        fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(10, 7), sharex=True,
+                                             gridspec_kw={"height_ratios": [1, 2]})
+        x = np.arange(1, max(len(iaas_dur), len(k8s_phases)) + 1)
+        if not iaas_dur.empty:
+            ax_top.bar(x, iaas_dur.fillna(0).values, color=ACTOR_COLORS["cloud"],
+                       label="T0 -> T1 (IaaS: autoscaler + VM + kubelet boot)")
+            ax_top.set_ylabel("seconds")
+            ax_top.set_title(
+                f"IaaS-side: cloud autoscaler + VM provisioning {title}\n"
+                "(high variance — not directly comparable across clouds)")
+            ax_top.legend(loc="upper right", fontsize=8)
+            ax_top.grid(True, axis="y", alpha=0.3)
+        if not k8s_phases.empty:
+            bottom = np.zeros(len(k8s_phases))
+            x2 = np.arange(1, len(k8s_phases) + 1)
+            palette = [ACTOR_COLORS["cni"], ACTOR_COLORS["kubelet"],
+                       ACTOR_COLORS["scheduler"], ACTOR_COLORS["cilium"]]
+            for i, col in enumerate(k8s_phases.columns):
+                vals = k8s_phases[col].fillna(0).values
+                ax_bot.bar(x2, vals, bottom=bottom, label=col,
+                           color=palette[i % len(palette)])
+                bottom += vals
+            cilium = pd.to_numeric(ok.get("cilium_init_duration_s"), errors="coerce")
+            if cilium is not None and cilium.notna().any():
+                ax_bot.plot(x2, cilium.values, color="black", marker="D",
+                            linewidth=1.2,
+                            label="cilium agent init (T3 \u2212 T2, parallel)")
+            ax_bot.set_xlabel("iteration"); ax_bot.set_ylabel("seconds")
+            ax_bot.set_title(
+                "K8s networking: T1 -> T5_pod_running "
+                "(directly comparable across providers)")
+            ax_bot.legend(loc="upper right", fontsize=8)
+            ax_bot.grid(True, axis="y", alpha=0.3)
         p = out_dir / "phase_stacked.png"; fig.tight_layout(); fig.savefig(p, dpi=140); plt.close(fig); paths.append(p)
 
-    # 4. latency vs iteration
-    if "node_startup_latency_s" in metrics_df:
-        fig, ax = plt.subplots(figsize=(9, 4))
-        ax.plot(range(1, len(metrics_df) + 1), metrics_df["node_startup_latency_s"], marker="o")
-        ax.set_xlabel("iteration"); ax.set_ylabel("seconds")
-        ax.set_title(f"Node startup latency vs iteration {title}")
-        ax.grid(True, alpha=0.3)
-        p = out_dir / "latency_vs_iteration.png"; fig.tight_layout(); fig.savefig(p, dpi=140); plt.close(fig); paths.append(p)
+    # 4. latency vs iteration — show BOTH the IaaS T0->T1 line and the
+    #    K8s-networking T1->T5 line so the reader sees they're independent.
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    x = range(1, len(metrics_df) + 1)
+    plotted = False
+    if "node_register_latency_s" in metrics_df:
+        ax.plot(x, metrics_df["node_register_latency_s"], marker="s",
+                color=ACTOR_COLORS["cloud"], label="T0->T1 (IaaS)")
+        plotted = True
+    if "time_to_runnable_s" in metrics_df:
+        ax.plot(x, metrics_df["time_to_runnable_s"], marker="o",
+                color=ACTOR_COLORS["cilium"],
+                label="T1->T5 time_to_runnable (K8s networking)")
+        plotted = True
+    if not plotted and "node_startup_latency_s" in metrics_df:
+        ax.plot(x, metrics_df["node_startup_latency_s"], marker="o",
+                label="T0->T4 (legacy)")
+    ax.set_xlabel("iteration"); ax.set_ylabel("seconds")
+    ax.set_title(f"Per-iteration latency {title}")
+    ax.legend(loc="upper right", fontsize=8)
+    ax.grid(True, alpha=0.3)
+    p = out_dir / "latency_vs_iteration.png"; fig.tight_layout(); fig.savefig(p, dpi=140); plt.close(fig); paths.append(p)
 
-    # 5. CDF
-    s = metrics_df.get("node_startup_latency_s")
+    # 5. CDF — prefer time_to_runnable_s (T1-anchored, IaaS-noise excluded).
+    cdf_metric = "time_to_runnable_s" if "time_to_runnable_s" in metrics_df \
+        and pd.to_numeric(metrics_df["time_to_runnable_s"], errors="coerce").dropna().size \
+        else "node_startup_latency_s"
+    s = metrics_df.get(cdf_metric)
     if s is not None and s.dropna().size:
         s = s.dropna().sort_values().reset_index(drop=True)
         cdf = (np.arange(1, len(s) + 1)) / len(s)
@@ -181,8 +227,8 @@ def plot_all(iterations_csv: Path, out_dir: Path, *, title: str = "") -> list[Pa
             v = float(s.quantile(q))
             ax.axvline(v, linestyle="--", alpha=0.4)
             ax.text(v, q, f" {label}={v:.1f}s", va="center")
-        ax.set_xlabel("node startup latency (s)"); ax.set_ylabel("CDF")
-        ax.set_title(f"CDF of node startup latency {title}")
+        ax.set_xlabel(f"{cdf_metric} (s)"); ax.set_ylabel("CDF")
+        ax.set_title(f"CDF of {cdf_metric} {title}")
         ax.grid(True, alpha=0.3); ax.set_ylim(0, 1.02)
         p = out_dir / "cdf.png"; fig.tight_layout(); fig.savefig(p, dpi=140); plt.close(fig); paths.append(p)
 

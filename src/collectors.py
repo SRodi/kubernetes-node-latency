@@ -445,6 +445,49 @@ class Collector:
         return out
 
 
+    def collect_trigger_pod_status(self, pod_name: str, namespace: str) -> dict:
+        """Capture the trigger (workload) pod's scheduled + running
+        timestamps. Read at the end of an iteration, just before deletion,
+        so we record kubelet's view of CNI ADD completion on a *workload*
+        pod — distinct from the cilium-agent DS pod measured elsewhere.
+
+        Returns a dict with optional keys (any may be absent):
+            T_trigger_scheduled  datetime   pod.status.conditions[PodScheduled]
+            T5_pod_running       datetime   first containerStatus state.running.startedAt
+                                            (== "sandbox wired with an IP")
+
+        Best-effort: never raises.
+        """
+        out: dict = {}
+        try:
+            pod = self.core.read_namespaced_pod(name=pod_name, namespace=namespace)
+        except Exception as e:  # noqa: BLE001
+            self.sink.write("trigger_pod_read_error",
+                            {"pod": pod_name, "error": str(e)[:200]})
+            return out
+        for c in (pod.status.conditions or []):
+            if c.type == "PodScheduled" and c.status == "True":
+                ts = _parse_k8s_time(c.last_transition_time)
+                if ts:
+                    out["T_trigger_scheduled"] = ts
+                break
+        # First container Running startedAt — workload-side moment the
+        # pod sandbox was wired up and the container could start.
+        for cs in (pod.status.container_statuses or []):
+            run = cs.state and cs.state.running
+            if run and run.started_at:
+                ts = _parse_k8s_time(run.started_at)
+                if ts:
+                    out["T5_pod_running"] = ts
+                    break
+        self.sink.write("trigger_pod_status_collected",
+                        {"pod": pod_name,
+                         "have_scheduled": "T_trigger_scheduled" in out,
+                         "have_running": "T5_pod_running" in out,
+                         "phase": getattr(pod.status, "phase", None)})
+        return out
+
+
     def t3_ready_from_logs(self, pod: client.V1Pod, tail_lines: int,
                            *, retries: int = 6) -> datetime | None:
         """Fallback T3: scan agent logs for ready_regex with exponential backoff."""

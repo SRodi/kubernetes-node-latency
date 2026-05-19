@@ -11,6 +11,21 @@ from tabulate import tabulate
 from .records import IterationRecord
 
 METRICS = [
+    # ---- Headline (K8s-networking) — anchored at T1 to exclude IaaS noise ----
+    # `time_to_runnable_s` (T5 − T1) is the recommended lead metric for
+    # cross-provider comparison: it captures everything kubelet + CNI + the
+    # cilium agent + IPAM do between node-registered and the workload pod
+    # transitioning to Running, with the cloud-side autoscaler + VM bringup
+    # (T0 → T1) explicitly excluded.
+    "time_to_runnable_s",
+    "T1c_s_from_T1",
+    "T2_s_from_T1",
+    "T3_s_from_T1",
+    "T4_s_from_T1",
+    "T4b_s_from_T1",
+    "T5_s_from_T1",
+    "sandbox_setup_s",
+    # ---- Legacy / supporting (T0-anchored or component-level) ----
     "node_startup_latency_s",
     "time_to_schedulable_s",
     "node_register_latency_s",
@@ -46,6 +61,19 @@ METRICS = [
     "cilium_endpoint_regen_map_sync_s",
 ]
 
+# Metrics to feature in the headline "K8s networking" table in summary.md.
+# All are T1-anchored so the IaaS-side variance (T0 -> T1) is excluded.
+HEADLINE_METRICS = [
+    "time_to_runnable_s",
+    "T1c_s_from_T1",
+    "T2_s_from_T1",
+    "T3_s_from_T1",
+    "T4_s_from_T1",
+    "T4b_s_from_T1",
+    "T5_s_from_T1",
+    "sandbox_setup_s",
+]
+
 
 def to_dataframe(records: Iterable[IterationRecord]) -> pd.DataFrame:
     return pd.DataFrame([r.to_row() for r in records])
@@ -64,13 +92,20 @@ def aggregate(df: pd.DataFrame) -> pd.DataFrame:
                 continue
             rows.append({"metric": m, "count": 0})
             continue
+        # Use median + IQR (p25/p50/p75) alongside mean+stddev because
+        # the IaaS-side T0->T1 variance can make mean+stddev misleading
+        # (e.g. GKE Autopilot cold-pool runs span 7-170s on T1). Median
+        # + IQR is more robust to those tails and is what summary.md
+        # leads with for K8s-networking metrics.
         rows.append({
             "metric": m,
             "count": int(s.count()),
             "mean": round(float(s.mean()), 3),
             "stddev": round(float(s.std(ddof=1)) if s.count() > 1 else 0.0, 3),
             "min": round(float(s.min()), 3),
+            "p25": round(float(s.quantile(0.25)), 3),
             "p50": round(float(s.quantile(0.50)), 3),
+            "p75": round(float(s.quantile(0.75)), 3),
             "p90": round(float(s.quantile(0.90)), 3),
             "p99": round(float(s.quantile(0.99)), 3),
             "max": round(float(s.max()), 3),
@@ -87,6 +122,19 @@ def write_outputs(records: list[IterationRecord], out_dir: Path,
     summary = aggregate(df)
     summary.to_csv(out_dir / "summary.csv", index=False)
 
+    # Headline (K8s-networking) view — T1-anchored, IaaS-noise excluded.
+    headline = summary[summary["metric"].isin(HEADLINE_METRICS)].copy()
+    if not headline.empty and "p50" in headline.columns:
+        # Order rows in the canonical lifecycle order rather than METRICS order.
+        headline["__ord"] = headline["metric"].map(
+            {m: i for i, m in enumerate(HEADLINE_METRICS)})
+        headline = headline.sort_values("__ord").drop(columns="__ord")
+        headline_cols = [c for c in ["metric", "count", "p25", "p50", "p75", "mean", "stddev"]
+                         if c in headline.columns]
+        headline_view = headline[headline_cols]
+    else:
+        headline_view = headline
+
     md_lines = [
         f"# Node Startup Latency — Run `{run_id}`",
         "",
@@ -94,7 +142,18 @@ def write_outputs(records: list[IterationRecord], out_dir: Path,
         f"- Region: **{region}**",
         f"- Iterations: **{len(df)}** (success: {(df['status'] == 'success').sum()})",
         "",
-        "## Aggregate (seconds)",
+        "## K8s networking (T1-anchored, IaaS-noise excluded)",
+        "",
+        "Headline metric: `time_to_runnable_s` = T5_pod_running − T1_node_registered.",
+        "This is the only number that's apples-to-apples across providers — it",
+        "excludes cloud autoscaler / VM bringup variance (T0 → T1) and isolates",
+        "the cost of kubelet + CNI + cilium agent + IPAM wiring on a fresh node.",
+        "Use **p50** (median) as the comparison point; p25/p75 show the spread.",
+        "",
+        tabulate(headline_view, headers="keys", tablefmt="github",
+                 showindex=False, floatfmt=".2f"),
+        "",
+        "## All metrics (median + IQR + mean ± stddev)",
         "",
         tabulate(summary, headers="keys", tablefmt="github", showindex=False),
         "",
@@ -102,11 +161,10 @@ def write_outputs(records: list[IterationRecord], out_dir: Path,
         "",
         tabulate(df[[
             "iteration", "node_name", "status",
-            "node_startup_latency_s", "time_to_schedulable_s",
-            "node_register_latency_s", "node_ready_after_register_s",
-            "cni_conflist_install_s", "post_conflist_ready_s",
-            "cilium_init_duration_s", "cni_induced_delay_s",
-            "cilium_scheduling_block_s",
+            "time_to_runnable_s", "T1c_s_from_T1", "T2_s_from_T1",
+            "T3_s_from_T1", "T4_s_from_T1", "T4b_s_from_T1", "T5_s_from_T1",
+            "sandbox_setup_s",
+            "node_startup_latency_s", "node_register_latency_s",
         ]], headers="keys", tablefmt="github", showindex=False, floatfmt=".2f"),
         "",
     ]
