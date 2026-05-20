@@ -352,6 +352,24 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
             t3_off - t1_off, t3_off - t1_off + regen_total, "cilium_regen",
         ))
 
+    # ---- Image pulls on this node (per-image rows, T1-relative) ----
+    # Aggregate across iterations: one row per distinct image, with one bar
+    # per pull instance (so the same image pulled across N iterations
+    # stacks vertically with N bars on the same y row).
+    pulls_rows = _node_image_pulls_aggregated(ok, ok.get("T1_node_registered", pd.Series(dtype=object)))
+    image_pulls_by_image: dict[str, list[dict]] = {}
+    for p in pulls_rows:
+        image_pulls_by_image.setdefault(p["image"], []).append(p)
+    # Ordering: sort images by median start_off so the chronologically
+    # earliest pulls appear at the top of the sub-panel.
+    pull_image_order: list[str] = []
+    if image_pulls_by_image:
+        pull_image_order = sorted(
+            image_pulls_by_image.keys(),
+            key=lambda im: float(np.median([r["start_off"] for r in image_pulls_by_image[im]])),
+        )
+    has_pulls_bd = bool(pull_image_order)
+
     all_lanes = lanes
 
     # Pre-compute init-container offsets (T1-relative) once — used by both
@@ -524,10 +542,26 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
     has_cni_bd = bool(cni_breakdown)
     has_regen_bd = bool(regen_breakdown)
     n_main = len(all_lanes)
-    sub_count = (1 if has_cni_bd else 0) + (1 if has_cilium_bd else 0) + (1 if has_regen_bd else 0)
-    fig_height = 4 + 0.35 * n_main + 2.0 * sub_count
+    n_pull_rows = len(pull_image_order)
+    sub_count = (
+        (1 if has_cni_bd else 0)
+        + (1 if has_cilium_bd else 0)
+        + (1 if has_regen_bd else 0)
+        + (1 if has_pulls_bd else 0)
+    )
+    # Pull sub-panel height scales with number of distinct images.
+    pulls_ratio = max(2.0, min(0.6 * n_pull_rows + 1.0, 8.0)) if has_pulls_bd else 0.0
+    fig_height = 4 + 0.35 * n_main + 2.0 * (sub_count - (1 if has_pulls_bd else 0)) + pulls_ratio * 0.9
     if sub_count:
-        ratios = [max(n_main, 4)] + [2.0] * sub_count
+        ratios = [max(n_main, 4)]
+        if has_cni_bd:
+            ratios.append(2.0)
+        if has_cilium_bd:
+            ratios.append(2.0)
+        if has_regen_bd:
+            ratios.append(2.0)
+        if has_pulls_bd:
+            ratios.append(pulls_ratio)
         fig, axes = plt.subplots(
             1 + sub_count, 1, figsize=(12, fig_height),
             gridspec_kw={"height_ratios": ratios},
@@ -540,6 +574,7 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
     ax_cni_bd = sub_axes.pop(0) if has_cni_bd else None
     ax_bd = sub_axes.pop(0) if has_cilium_bd else None
     ax_regen = sub_axes.pop(0) if has_regen_bd else None
+    ax_pulls = sub_axes.pop(0) if has_pulls_bd else None
 
     y_positions = np.arange(n_main, 0, -1)  # top-down listing
     used_actors: list[str] = []
@@ -790,6 +825,101 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str) -> Path 
         )
         ax_regen.grid(True, axis="x", alpha=0.3)
 
+    # ---- Image pulls on this node (image-centric Gantt) ----
+    if has_pulls_bd and ax_pulls is not None:
+        from .image_family import FAMILY_COLORS, DEFAULT_FAMILY
+        n_pull_rows = len(pull_image_order)
+        # Top-to-bottom listing (chronological); newest images at bottom.
+        y_pulls = np.arange(n_pull_rows, 0, -1)
+        used_fams: list[str] = []
+        all_starts: list[float] = []
+        all_ends: list[float] = []
+        for y, image in zip(y_pulls, pull_image_order):
+            instances = image_pulls_by_image[image]
+            fam = instances[0].get("family") or DEFAULT_FAMILY
+            color = FAMILY_COLORS.get(fam, FAMILY_COLORS[DEFAULT_FAMILY])
+            if fam not in used_fams:
+                used_fams.append(fam)
+            # Bars per pull instance (stack with small y jitter when N>1).
+            n_inst = len(instances)
+            jitter_h = 0.55 if n_inst == 1 else max(0.55 / n_inst, 0.10)
+            for i, inst in enumerate(instances):
+                s = inst["start_off"]
+                e = inst["end_off"]
+                dur = max(e - s, 0.05)
+                # Stack vertically within the row when multiple instances.
+                if n_inst == 1:
+                    y_pos = y
+                else:
+                    offset = (i - (n_inst - 1) / 2) * jitter_h
+                    y_pos = y + offset
+                ax_pulls.barh(y_pos, dur, left=s, height=jitter_h,
+                              color=color, edgecolor="black", linewidth=0.3,
+                              alpha=0.85)
+                all_starts.append(s)
+                all_ends.append(e)
+            # Median-duration annotation for the image row.
+            med_dur = float(np.median([inst["duration_s"] for inst in instances]))
+            med_end = float(np.median([inst["end_off"] for inst in instances]))
+            ax_pulls.text(med_end + 0.3, y, f"{med_dur:.2f}s",
+                          va="center", ha="left", fontsize=7, color="black")
+
+        # Truncate very long image refs for tick labels (keep tag).
+        def _short(ref: str, maxlen: int = 60) -> str:
+            if len(ref) <= maxlen:
+                return ref
+            # Keep repo basename + tag.
+            if "/" in ref:
+                tail = ref.rsplit("/", 1)[-1]
+                if len(tail) <= maxlen - 4:
+                    return ".../" + tail
+            return ref[: maxlen - 1] + "\u2026"
+
+        ax_pulls.set_yticks(y_pulls)
+        ax_pulls.set_yticklabels([_short(im) for im in pull_image_order],
+                                 fontsize=7)
+        # Overlay vertical lines at T1/T1c/T2/T3/T4 for context.
+        overlay = [
+            (0.0, "T1", "black"),
+            (t1c_rel, "T1c", "#b91c1c"),
+            ((t2_off - t1_off) if t2_off is not None else None, "T2", "#16a34a"),
+            ((t3_off - t1_off) if t3_off is not None else None, "T3", "#15803d"),
+            ((t4_off - t1_off) if t4_off is not None else None, "T4", "#475569"),
+        ]
+        for x, glyph, col in overlay:
+            if x is None:
+                continue
+            ax_pulls.axvline(x, color=col, linestyle=":", alpha=0.5, linewidth=0.8)
+            ax_pulls.text(x, n_pull_rows + 0.4, glyph, ha="center", va="bottom",
+                          fontsize=7, color=col)
+        if all_starts and all_ends:
+            span = max(all_ends) - min(all_starts)
+            pad = max(span * 0.05, 0.5)
+            ax_pulls.set_xlim(min(all_starts) - pad, max(all_ends) + pad)
+        ax_pulls.set_ylim(0.2, n_pull_rows + 1.0)
+        ax_pulls.set_xlabel("seconds since T1 (node registered)")
+        # Headline stats for the title.
+        critical_p50 = _mean_offset_metric(ok, "image_pulls_critical_s")
+        total_p50 = _mean_offset_metric(ok, "image_pulls_total_s")
+        crit_str = f"{critical_p50:.2f}s" if critical_p50 is not None else "n/a"
+        tot_str = f"{total_p50:.2f}s" if total_p50 is not None else "n/a"
+        ax_pulls.set_title(
+            f"{title + '  ' if title else ''}"
+            f"Image pulls on this node (n={n_pull_rows} distinct, "
+            f"critical-path p50 = {crit_str}, sum-of-durations p50 = {tot_str})",
+            fontsize=9, loc="left",
+        )
+        ax_pulls.grid(True, axis="x", alpha=0.3)
+        # Per-family legend.
+        from matplotlib.patches import Patch
+        fam_handles = [
+            Patch(facecolor=FAMILY_COLORS.get(f, FAMILY_COLORS[DEFAULT_FAMILY]),
+                  edgecolor="black", label=f)
+            for f in used_fams
+        ]
+        ax_pulls.legend(handles=fam_handles, loc="lower right", fontsize=7,
+                        title="family", ncol=min(len(fam_handles), 4))
+
     p = out_dir / "phase_profile.png"
     fig.tight_layout()
     fig.savefig(p, dpi=140)
@@ -897,7 +1027,62 @@ def _mean_init_container_offsets(ok: pd.DataFrame, t1_off_per_row: pd.Series) ->
     return out
 
 
-def _init_container_windows(ok: pd.DataFrame) -> list[tuple[str, float, float, float]]:
+def _node_image_pulls_aggregated(ok: pd.DataFrame, t1_off_per_row: pd.Series) -> list[dict]:
+    """Aggregate per-iteration `node_image_pulls_json` payloads into a list of
+    per-image rows (image-centric), each carrying T1-relative offsets.
+
+    Returns one dict per (image, iteration_pull_instance):
+      {image, family, t1_off, start_off, end_off, duration_s}
+    where `start_off`/`end_off` are seconds since T1 for that iteration.
+
+    The caller (phase_profile) groups by image to draw "one row per distinct
+    image; multiple bars stack vertically when an image is pulled multiple
+    times across iterations".
+    """
+    if "node_image_pulls_json" not in ok.columns:
+        return []
+    import json as _json
+    from datetime import datetime as _dt
+    out: list[dict] = []
+    # Align T1 offsets (seconds since epoch) to each row in `ok`.
+    t1_series = pd.to_datetime(ok.get("T1_node_registered"), errors="coerce", utc=True)
+    for (idx, raw), t1_ts in zip(ok["node_image_pulls_json"].items(), t1_series):
+        if not isinstance(raw, str) or not raw:
+            continue
+        if pd.isna(t1_ts):
+            continue
+        try:
+            entries = _json.loads(raw)
+        except Exception:
+            continue
+        t1_epoch = t1_ts.timestamp()
+        for e in entries:
+            tpl = e.get("t_pulling")
+            tpd = e.get("t_pulled")
+            if not (tpl and tpd):
+                continue
+            try:
+                s_t = _dt.fromisoformat(tpl.replace("Z", "+00:00"))
+                e_t = _dt.fromisoformat(tpd.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            s_off = s_t.timestamp() - t1_epoch
+            e_off = e_t.timestamp() - t1_epoch
+            dur = e.get("duration_s")
+            if not isinstance(dur, (int, float)):
+                dur = max(e_off - s_off, 0.0)
+            out.append({
+                "image": e.get("image") or "",
+                "family": e.get("family") or "other",
+                "start_off": s_off,
+                "end_off": e_off,
+                "duration_s": float(dur),
+                "iteration_idx": idx,
+            })
+    return out
+
+
+
     """Internal helper: yield (name, start_epoch, end_epoch, duration) for
     every init-container row across iterations. Used by both duration and
     offset helpers.
@@ -1172,16 +1357,85 @@ def _plot_compare_phase_decomposition(csvs: list[Path], out_dir: Path) -> Path |
         ]
         rows_c.append((label, [v if np.isfinite(v) else 0.0 for v in vals]))
 
+    # ---- Panel D data: image-pull critical-path by family ----
+    from .image_family import FAMILY_COLORS, DEFAULT_FAMILY
+    # Per-family critical-path contribution per run: for each iteration of a
+    # run, sum durations within each family, then take the median across
+    # iterations. This is an approximation that ignores parallelism within
+    # a family (multiple cilium init images on one node may pull in
+    # parallel), but it's the right granularity for cross-provider
+    # comparison of "which family costs how much to pull cold."
+    def _family_breakdown(df: pd.DataFrame) -> tuple[dict[str, float], int, float]:
+        """Returns (family_p50_seconds, distinct_image_p50, critical_p50)."""
+        if "node_image_pulls_json" not in df.columns:
+            return {}, 0, float("nan")
+        import json as _json
+        per_iter_fam: list[dict[str, float]] = []
+        per_iter_distinct: list[int] = []
+        for raw in df["node_image_pulls_json"].dropna():
+            if not isinstance(raw, str) or not raw:
+                continue
+            try:
+                entries = _json.loads(raw)
+            except Exception:
+                continue
+            fam_sum: dict[str, float] = {}
+            distinct_imgs: set[str] = set()
+            for e in entries:
+                fam = e.get("family") or DEFAULT_FAMILY
+                d = e.get("duration_s")
+                if not isinstance(d, (int, float)):
+                    continue
+                fam_sum[fam] = fam_sum.get(fam, 0.0) + float(d)
+                if e.get("image"):
+                    distinct_imgs.add(e["image"])
+            per_iter_fam.append(fam_sum)
+            per_iter_distinct.append(len(distinct_imgs))
+        if not per_iter_fam:
+            return {}, 0, float("nan")
+        all_fams = sorted({f for d in per_iter_fam for f in d})
+        fam_p50: dict[str, float] = {}
+        for f in all_fams:
+            vals = [d.get(f, 0.0) for d in per_iter_fam]
+            fam_p50[f] = float(pd.Series(vals).median())
+        distinct_p50 = int(pd.Series(per_iter_distinct).median())
+        critical_p50 = _p(df, "image_pulls_critical_s", 0.5)
+        return fam_p50, distinct_p50, critical_p50
+
+    rows_d: list[tuple[str, dict[str, float], int, float]] = []
+    for label, df in runs:
+        fam_p50, distinct, crit = _family_breakdown(df)
+        if fam_p50:
+            rows_d.append((label, fam_p50, distinct, crit))
+    # Family ordering across the panel — by total contribution descending.
+    d_family_order: list[str] = []
+    if rows_d:
+        totals: dict[str, float] = {}
+        for _l, fam_p50, _d, _c in rows_d:
+            for f, v in fam_p50.items():
+                totals[f] = totals.get(f, 0.0) + v
+        d_family_order = sorted(totals.keys(), key=lambda f: -totals[f])
+    has_panel_d = bool(rows_d)
+
     # ---- Figure layout ----
     n = len(rows_a)
     h_a = max(2.2, 0.45 * n + 1.5)
     h_b = max(2.0, 0.40 * len(rows_b) + 1.2)
     h_c = max(2.0, 0.50 * len(rows_c) + 1.0)
-    fig, axes = plt.subplots(
-        3, 1, figsize=(16, h_a + h_b + h_c),
-        gridspec_kw={"height_ratios": [h_a, h_b, h_c]},
-    )
-    ax_a, ax_b, ax_c = axes
+    h_d = max(2.0, 0.50 * len(rows_d) + 1.0) if has_panel_d else 0.0
+    if has_panel_d:
+        fig, axes = plt.subplots(
+            4, 1, figsize=(16, h_a + h_b + h_c + h_d),
+            gridspec_kw={"height_ratios": [h_a, h_b, h_c, h_d]},
+        )
+        ax_a, ax_b, ax_c, ax_d = axes
+    else:
+        fig, axes = plt.subplots(
+            3, 1, figsize=(16, h_a + h_b + h_c),
+            gridspec_kw={"height_ratios": [h_a, h_b, h_c]},
+        )
+        ax_a, ax_b, ax_c = axes
+        ax_d = None
 
     # --- Panel A: stacked phase decomposition ---
     y = np.arange(n)
@@ -1275,8 +1529,47 @@ def _plot_compare_phase_decomposition(csvs: list[Path], out_dir: Path) -> Path |
     ax_c.legend(loc="center left", bbox_to_anchor=(1.02, 0.5),
                 fontsize=8, framealpha=0.95, title="suspect")
 
+    # --- Panel D: image-pull critical-path by family ---
+    if ax_d is not None and rows_d:
+        # Sort by image_pulls_critical_s p50 ascending (fastest at top).
+        rows_d_sorted = sorted(
+            rows_d,
+            key=lambda r: r[3] if np.isfinite(r[3]) else float("inf"),
+        )
+        yd = np.arange(len(rows_d_sorted))
+        cursor_d = np.zeros(len(rows_d_sorted))
+        for fam in d_family_order:
+            widths = np.array([r[1].get(fam, 0.0) for r in rows_d_sorted])
+            if widths.sum() <= 0:
+                continue
+            color = FAMILY_COLORS.get(fam, FAMILY_COLORS[DEFAULT_FAMILY])
+            ax_d.barh(yd, widths, left=cursor_d, color=color,
+                      edgecolor="white", linewidth=0.5, label=fam)
+            for j, w in enumerate(widths):
+                if w >= 0.8:
+                    ax_d.text(cursor_d[j] + w / 2, yd[j], f"{w:.1f}",
+                              ha="center", va="center", fontsize=7,
+                              color="black", fontweight="bold")
+            cursor_d += widths
+        # Annotations: distinct image count + critical-path span.
+        for j, (_lab, _fam, distinct, crit) in enumerate(rows_d_sorted):
+            crit_str = f"{crit:.1f}s" if np.isfinite(crit) else "n/a"
+            ax_d.text(cursor_d[j] + 0.4, yd[j],
+                      f"{distinct} imgs  ·  critical-path {crit_str}",
+                      va="center", fontsize=8, color="#333")
+        ax_d.set_yticks(yd)
+        ax_d.set_yticklabels([r[0] for r in rows_d_sorted], fontsize=9)
+        ax_d.invert_yaxis()
+        ax_d.set_xlabel("seconds (sum of per-family image-pull durations, p50)")
+        ax_d.set_title(
+            "Image-pull cost by family — distinct images pulled per node + critical-path window",
+            fontsize=10, fontweight="bold",
+        )
+        ax_d.grid(True, axis="x", alpha=0.3)
+        ax_d.legend(loc="center left", bbox_to_anchor=(1.02, 0.5),
+                    fontsize=7, framealpha=0.95, title="family")
+
     fig.suptitle(
-        "Networking-only comparison (T1-anchored, IaaS variance excluded)",
         fontsize=12, fontweight="bold", y=0.995,
     )
     fig.tight_layout(rect=(0, 0, 0.83, 0.985))

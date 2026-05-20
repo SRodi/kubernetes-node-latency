@@ -5,6 +5,7 @@ import logging
 import os
 import time
 import uuid
+from datetime import timedelta
 from pathlib import Path
 from typing import Iterable
 
@@ -218,6 +219,25 @@ def run_iterations(cfg: Config, handle: ClusterHandle, provider: ClusterProvider
                         rec.T5_pod_running = tp.get("T5_pod_running")
                     except Exception as e:  # noqa: BLE001
                         log.warning("trigger-pod status capture failed for iter %d: %s", i, e)
+                # Image-pull capture on the new node. Bounded by
+                # [T1, T5+5s] when both anchors are present, else fall back
+                # to [T0, now] so we still capture something on partial
+                # failures. Best-effort; never raises.
+                if rec.node_name and _coll is not None:
+                    try:
+                        win_start = rec.T1_node_registered or rec.T0_pod_created
+                        win_end = (
+                            (rec.T5_pod_running + timedelta(seconds=5))
+                            if rec.T5_pod_running is not None
+                            else utcnow()
+                        )
+                        if win_start is not None and win_end > win_start:
+                            rec.node_image_pulls = _coll.collect_node_image_pulls(
+                                rec.node_name, win_start, win_end,
+                                trigger_pattern=cfg.trigger_pod.image,
+                            ) or None
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("node image-pull capture failed for iter %d: %s", i, e)
                 if rec.pod_name:
                     delete_pod(core, rec.pod_name, cfg.trigger_pod.namespace)
                 # Best-effort uncordon so leftover nodes can be reused/reaped normally.
