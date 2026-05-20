@@ -251,7 +251,15 @@ class IterationRecord:
             ),
         }
         # Image-pull capture: serialize the per-pull list to JSON and emit
-        # 3 derived scalars for easy CSV-level analysis.
+        # 3 derived scalars for easy CSV-level analysis. Within a single
+        # iteration the same image can produce multiple kubelet `Pulled`
+        # events — one per pod referencing it — but containerd only
+        # actually pulls the image once and serves the rest from local
+        # cache. We dedupe by image (keeping the instance with the
+        # largest duration, i.e. the "real" pull) before computing the
+        # derived totals so they reflect wall-clock work, not event
+        # multiplicity. The raw per-pod events are still preserved in
+        # `node_image_pulls_json` for diagnostics.
         nip_serial: str | None = None
         nip_count: int | None = None
         nip_critical_s: float | None = None
@@ -260,8 +268,8 @@ class IterationRecord:
             slim_pulls = []
             starts: list[datetime] = []
             ends: list[datetime] = []
-            total = 0.0
-            have_dur = False
+            # Per-image best-duration tracking for the dedup sum + count.
+            best_dur_by_image: dict[str, float] = {}
             for p in self.node_image_pulls:
                 tpl = p.get("t_pulling")
                 tpd = p.get("t_pulled")
@@ -281,17 +289,20 @@ class IterationRecord:
                 if isinstance(tpd, datetime):
                     ends.append(tpd)
                 d = p.get("duration_s")
-                if isinstance(d, (int, float)):
-                    total += float(d)
-                    have_dur = True
+                img = p.get("image") or ""
+                if isinstance(d, (int, float)) and img:
+                    prev = best_dur_by_image.get(img, 0.0)
+                    if float(d) > prev:
+                        best_dur_by_image[img] = float(d)
             nip_serial = _json.dumps(slim_pulls, separators=(",", ":"))
-            nip_count = len(slim_pulls)
+            # Count: distinct images (not raw event count) — matches the
+            # "real pull" semantics used by the plots.
+            nip_count = len({(p.get("image") or "") for p in self.node_image_pulls
+                             if p.get("image")})
             if starts and ends:
-                # Critical path = wall-clock span from first Pulling to last
-                # Pulled. Clipped at zero for safety.
                 nip_critical_s = max((max(ends) - min(starts)).total_seconds(), 0.0)
-            if have_dur:
-                nip_total_s = total
+            if best_dur_by_image:
+                nip_total_s = sum(best_dur_by_image.values())
         row["node_image_pulls_json"] = nip_serial
         row["image_pulls_count"] = nip_count
         row["image_pulls_critical_s"] = nip_critical_s

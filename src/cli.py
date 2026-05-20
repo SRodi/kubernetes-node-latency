@@ -130,11 +130,16 @@ def _cmd_plot(args: argparse.Namespace) -> int:
         return 2
     all_paths: list[Path] = []
     for run_dir in run_dirs:
-        paths = plot_all(run_dir / "iterations.csv", run_dir / "plots")
+        paths = plot_all(run_dir / "iterations.csv", run_dir / "plots",
+                         iteration=args.iteration)
         print(f"wrote ({run_dir.name}):")
         for p in paths:
             print(f"  {p}")
         all_paths.extend(paths)
+    # When --iteration is set we skip cross-run comparisons (per-iteration
+    # profiling is a single-run drilldown).
+    if args.iteration is not None:
+        return 0
     # Comparison output:
     #   - explicit `--compare`: overlay the first run_dir against the listed extras
     #     (legacy behaviour; output lands in the primary run's plots/ dir)
@@ -234,6 +239,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="root of run directories when using --last (default: results/)")
     pp.add_argument("--compare", nargs="*", default=[],
                     help="additional run dirs to overlay on the comparison CDF")
+    pp.add_argument("--iteration", type=int, default=None,
+                    help="profile a single iteration (1-indexed) from the run; "
+                         "emits only phase_profile_iter-NNN.png and skips "
+                         "aggregate / compare plots")
     pp.set_defaults(func=_cmd_plot)
 
     pc = sub.add_parser("clean", help="remove all run dirs under results/")
