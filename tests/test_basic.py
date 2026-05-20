@@ -31,6 +31,33 @@ def synthetic_records(n: int = 5) -> list[IterationRecord]:
         r.T4b_schedulable = r.T4_node_ready
         # CNI conflist landed ~15s after kubelet registered, ~2s before Ready.
         r.T1c_cni_conflist = _ts(20 + i)
+        # Synthetic image pulls: cilium-agent at +6s, coredns at +10s on
+        # the new node — exercises the node_image_pulls -> JSON +
+        # derived-column path end-to-end.
+        r.node_image_pulls = [
+            {
+                "pod": f"cilium-{i}",
+                "namespace": "kube-system",
+                "container": "cilium-agent",
+                "image": "quay.io/cilium/cilium:v1.16.4",
+                "family": "cilium",
+                "t_pulling": _ts(6 + i),
+                "t_pulled": _ts(11 + i),
+                "duration_s": 5.0,
+                "failed": False,
+            },
+            {
+                "pod": f"coredns-{i}",
+                "namespace": "kube-system",
+                "container": "coredns",
+                "image": "registry.k8s.io/coredns/coredns:v1.11.3",
+                "family": "dns",
+                "t_pulling": _ts(10 + i),
+                "t_pulled": _ts(13 + i),
+                "duration_s": 3.0,
+                "failed": False,
+            },
+        ]
         r.status = "success"
         out.append(r)
     return out
@@ -87,6 +114,60 @@ def test_record_row_math():
     assert row["post_conflist_ready_s"] == 2.0
     # T4 − T1 = 17 — autoscaler-free counterpart to node_startup_latency_s.
     assert row["node_ready_after_register_s"] == 17.0
+    # Image-pull derived columns: 2 pulls per iteration in the fixture.
+    # cilium pull spans +6s..+11s (5s); dns pull +10s..+13s (3s).
+    # critical-path = last_pulled - first_pulling = 13 - 6 = 7s.
+    # total = 5 + 3 = 8s. distinct count = 2.
+    assert row["image_pulls_count"] == 2
+    assert row["image_pulls_critical_s"] == 7.0
+    assert row["image_pulls_total_s"] == 8.0
+    assert "node_image_pulls_json" in row
+    assert row["node_image_pulls_json"] is not None
+    assert '"family":"cilium"' in row["node_image_pulls_json"]
+
+
+def test_record_row_image_pulls_dedupe_cache_hits():
+    """When the same image is pulled by multiple pods on the same node,
+    kubelet emits one Pulled event per pod but containerd only does one
+    real pull and serves the rest from local cache. The derived scalars
+    must dedupe by image (keeping the max-duration instance) so cache
+    hits don't inflate totals."""
+    r = IterationRecord(iteration=1, run_id="t", provider="aks", region="x")
+    r.pod_name = "p1"; r.node_name = "n1"
+    r.T0_pod_created = _ts(0); r.T1_node_registered = _ts(5)
+    r.T4_node_ready = _ts(20); r.T4b_schedulable = _ts(20)
+    r.T1c_cni_conflist = _ts(15)
+    # Two pods reference the same csi-node-driver-registrar image.
+    # First Pulled carries the real 3.4s cold-pull cost; the second is a
+    # cache-hit instant (duration_s=None or 0).
+    r.node_image_pulls = [
+        {"pod": "csi-azuredisk", "namespace": "kube-system",
+         "container": "node-driver-registrar",
+         "image": "csi-node-driver-registrar:v1",
+         "family": "csi-azure",
+         "t_pulling": _ts(6), "t_pulled": _ts(9.4),
+         "duration_s": 3.4, "failed": False},
+        {"pod": "csi-azurefile", "namespace": "kube-system",
+         "container": "node-driver-registrar",
+         "image": "csi-node-driver-registrar:v1",
+         "family": "csi-azure",
+         "t_pulling": _ts(10), "t_pulled": _ts(10),
+         "duration_s": None, "failed": False},
+        # A genuinely distinct image pulled once.
+        {"pod": "cilium-1", "namespace": "kube-system",
+         "container": "cilium-agent",
+         "image": "cilium:v1.16.4",
+         "family": "cilium",
+         "t_pulling": _ts(7), "t_pulled": _ts(12),
+         "duration_s": 5.0, "failed": False},
+    ]
+    r.status = "success"
+    row = r.to_row()
+    # 2 distinct images, not 3 raw events.
+    assert row["image_pulls_count"] == 2
+    # Sum of best-per-image durations: 3.4 (csi) + 5.0 (cilium) = 8.4 —
+    # NOT 8.4 + 0 from the cache hit and NOT a doubled csi value.
+    assert row["image_pulls_total_s"] == 8.4
 
 
 def test_record_row_math_aks_taint_gating():

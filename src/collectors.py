@@ -488,6 +488,144 @@ class Collector:
         return out
 
 
+    def collect_node_image_pulls(
+        self,
+        node_name: str,
+        window_start: datetime,
+        window_end: datetime,
+        *,
+        trigger_pattern: str | None = None,
+    ) -> list[dict]:
+        """Capture every kubelet image pull observed on `node_name` within
+        the time window [window_start, window_end].
+
+        Strategy:
+          1. List pods on the node (one API call) to scope event lookup
+             and capture container -> image mappings.
+          2. List `reason=Pulling` and `reason=Pulled` events cluster-wide
+             (paginated); filter to pods on the target node and event
+             timestamps inside the window.
+          3. Pair Pulling/Pulled by (namespace, pod, image) using the
+             image string parsed from the event message.
+          4. Extract pull duration from the Pulled message; fall back to
+             the wall-clock delta (Pulled - Pulling) when absent.
+          5. Classify each image into a family via image_family.classify.
+
+        Returns a list of dicts (possibly empty). Never raises; failures
+        are logged to the sink.
+        """
+        from .image_family import classify, parse_pull_duration
+
+        out: list[dict] = []
+        # Pods on this node — used to (a) scope the event filter and
+        # (b) resolve the container name for each (pod, image) pair.
+        pod_index: dict[tuple[str, str], dict[str, str]] = {}
+        try:
+            pods = self.core.list_pod_for_all_namespaces(
+                field_selector=f"spec.nodeName={node_name}",
+                _request_timeout=(10, 30),
+            ).items
+        except Exception as e:  # noqa: BLE001
+            self.sink.write("node_image_pulls_pods_error",
+                            {"node": node_name, "error": str(e)[:200]})
+            return out
+        for p in pods:
+            ns = p.metadata.namespace
+            name = p.metadata.name
+            img_to_container: dict[str, str] = {}
+            for c in (p.spec.init_containers or []):
+                if c.image:
+                    img_to_container.setdefault(c.image, c.name)
+            for c in (p.spec.containers or []):
+                if c.image:
+                    img_to_container.setdefault(c.image, c.name)
+            pod_index[(ns, name)] = img_to_container
+
+        # Pull both reasons. Field-selector with reason= is cheap server-side.
+        events: list = []
+        for reason in ("Pulling", "Pulled", "Failed"):
+            try:
+                resp = self.core.list_event_for_all_namespaces(
+                    field_selector=f"reason={reason}",
+                    _request_timeout=(10, 30),
+                )
+                events.extend(resp.items or [])
+            except Exception as e:  # noqa: BLE001
+                self.sink.write("node_image_pulls_events_error",
+                                {"reason": reason, "error": str(e)[:200]})
+                continue
+
+        # Group by (ns, pod, image) so we can pair Pulling -> Pulled.
+        # message format: 'Pulling image "X"' / 'Successfully pulled image "X" in 5.234s ...'
+        img_re = re.compile(r'image\s+"([^"]+)"', re.I)
+        grouped: dict[tuple[str, str, str], dict] = {}
+        for ev in events:
+            io = getattr(ev, "involved_object", None)
+            if io is None or (io.kind and io.kind != "Pod"):
+                continue
+            key_pod = (io.namespace, io.name)
+            if key_pod not in pod_index:
+                continue
+            ts = _parse_k8s_time(
+                getattr(ev, "event_time", None)
+                or getattr(ev, "last_timestamp", None)
+                or getattr(ev, "first_timestamp", None)
+            )
+            if not ts or ts < window_start or ts > window_end:
+                continue
+            msg = getattr(ev, "message", "") or ""
+            m = img_re.search(msg)
+            if not m:
+                continue
+            image = m.group(1)
+            reason = getattr(ev, "reason", "") or ""
+            key = (io.namespace, io.name, image)
+            entry = grouped.setdefault(key, {
+                "namespace": io.namespace,
+                "pod": io.name,
+                "image": image,
+                "container": pod_index[key_pod].get(image),
+                "t_pulling": None,
+                "t_pulled": None,
+                "duration_s": None,
+                "failed": False,
+            })
+            if reason == "Pulling":
+                if entry["t_pulling"] is None or ts < entry["t_pulling"]:
+                    entry["t_pulling"] = ts
+            elif reason == "Pulled":
+                if entry["t_pulled"] is None or ts > entry["t_pulled"]:
+                    entry["t_pulled"] = ts
+                d = parse_pull_duration(msg)
+                if d is not None:
+                    entry["duration_s"] = d
+            elif reason == "Failed":
+                # Only flag failures whose message references image pull.
+                if "pull" in msg.lower() or "ErrImagePull" in msg or "ImagePullBackOff" in msg:
+                    entry["failed"] = True
+
+        # Backfill duration_s from wall-clock delta when message parsing missed.
+        for entry in grouped.values():
+            if (entry["duration_s"] is None
+                    and entry["t_pulling"] is not None
+                    and entry["t_pulled"] is not None):
+                entry["duration_s"] = max(
+                    (entry["t_pulled"] - entry["t_pulling"]).total_seconds(), 0.0)
+            entry["family"] = classify(entry["image"], extra_trigger_pattern=trigger_pattern)
+            out.append(entry)
+
+        out.sort(key=lambda e: (
+            e["t_pulling"] or e["t_pulled"] or window_start,
+            e["image"],
+        ))
+        self.sink.write("node_image_pulls_collected",
+                        {"node": node_name,
+                         "count": len(out),
+                         "with_duration": sum(1 for e in out if e["duration_s"] is not None),
+                         "failed": sum(1 for e in out if e["failed"])})
+        return out
+
+
     def t3_ready_from_logs(self, pod: client.V1Pod, tail_lines: int,
                            *, retries: int = 6) -> datetime | None:
         """Fallback T3: scan agent logs for ready_regex with exponential backoff."""
