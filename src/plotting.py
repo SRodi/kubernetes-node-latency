@@ -1292,6 +1292,21 @@ def plot_compare(csvs: list[Path], out_dir: Path) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(9, 5))
     cdf_metric = "time_to_runnable_s"
+    # Filter out missing/unreadable iterations.csv up-front so the rest of the
+    # pipeline doesn't have to defend against them. An incomplete run dir
+    # (cluster create succeeded but every iteration failed before flush) won't
+    # have iterations.csv on disk — skip with a warning, don't crash.
+    valid_csvs: list[Path] = []
+    for csv in csvs:
+        if not csv.exists():
+            print(f"  warn: skipping {csv.parent.name} (no iterations.csv)")
+            continue
+        valid_csvs.append(csv)
+    if not valid_csvs:
+        print("  warn: no valid run dirs to compare; nothing emitted")
+        plt.close(fig)
+        return []
+    csvs = valid_csvs
     # Fall back to legacy metric if no run carries the new T1-anchored column.
     any_runnable = False
     for csv in csvs:
@@ -1304,7 +1319,11 @@ def plot_compare(csvs: list[Path], out_dir: Path) -> list[Path]:
     if not any_runnable:
         cdf_metric = "node_startup_latency_s"
     for csv in csvs:
-        df = pd.read_csv(csv)
+        try:
+            df = pd.read_csv(csv)
+        except Exception as e:
+            print(f"  warn: skipping {csv.parent.name} (read error: {e})")
+            continue
         ok = _ok(df)
         s = pd.to_numeric(ok.get(cdf_metric), errors="coerce").dropna().sort_values()
         if s.empty:

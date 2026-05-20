@@ -135,12 +135,28 @@ def _cmd_plot(args: argparse.Namespace) -> int:
         for p in paths:
             print(f"  {p}")
         all_paths.extend(paths)
+    # Comparison output:
+    #   - explicit `--compare`: overlay the first run_dir against the listed extras
+    #     (legacy behaviour; output lands in the primary run's plots/ dir)
+    #   - implicit `--last N` with N>=2: compare all N selected runs and write
+    #     into a shared, primary-less directory under <base>/analysis/
     if args.compare:
-        # Compare overlays the first run_dir against the listed extras.
         base_run = run_dirs[0]
         csvs = [Path(d) / "iterations.csv" for d in args.compare]
         cmp_paths = plot_compare([base_run / "iterations.csv", *csvs], base_run / "plots")
         print("comparison:")
+        for p in cmp_paths:
+            print(f"  {p}")
+    elif args.last is not None and len(run_dirs) >= 2:
+        base = Path(args.base_dir or "results")
+        # Name the output by the *newest* run id so it's stable and discoverable
+        newest = max(run_dirs, key=lambda p: p.name).name
+        out_dir = base / "analysis" / f"compare-last-{len(run_dirs)}-{newest}" / "plots"
+        # newest first in the legend / cdf line order
+        ordered = sorted(run_dirs, key=lambda p: p.name, reverse=True)
+        csvs = [d / "iterations.csv" for d in ordered]
+        cmp_paths = plot_compare(csvs, out_dir)
+        print(f"comparison (--last {args.last}):")
         for p in cmp_paths:
             print(f"  {p}")
     return 0
@@ -211,7 +227,9 @@ def main(argv: list[str] | None = None) -> int:
     pp.add_argument("results_dir", nargs="?", default=None,
                     help="run dir under results/ (omit when using --last)")
     pp.add_argument("--last", type=int, default=None,
-                    help="(re)plot the last N runs by directory name")
+                    help="(re)plot the last N runs by directory name; "
+                         "when N>=2 also emit cross-provider compare plots "
+                         "into <base>/analysis/compare-last-N-<newest>/plots/")
     pp.add_argument("--base-dir", default=None,
                     help="root of run directories when using --last (default: results/)")
     pp.add_argument("--compare", nargs="*", default=[],
