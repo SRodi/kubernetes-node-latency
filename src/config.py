@@ -196,6 +196,10 @@ class Config:
     iterations: int = 10
     per_iteration_timeout_s: int = 900
     node_settle_seconds: int = 30
+    # Log capture: "none" (default) or "minimal" (cilium-agent + IPAM pods
+    # on the target node, time-bounded to the iteration window). Saved to
+    # iter-NNN/logs/. See Collector.collect_pod_logs.
+    capture_logs: str = "none"
     # Per-run isolation (set by CLI; enables parallel runs from different terminals).
     kubeconfig_path: Path | None = None
     cluster_name_suffix: str | None = None
