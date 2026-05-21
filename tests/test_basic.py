@@ -244,18 +244,59 @@ def test_container_started_at_uses_running_state():
     assert ts is not None and ts.second == 5
 
 
-def test_container_started_at_falls_back_to_init_finish():
+def test_container_started_at_returns_none_when_main_not_running():
+    """T2 must be strictly the cilium-agent main container's current-run
+    startedAt. When the main container isn't Running yet, return None
+    (the watch loop will re-read until it is). Falling back to init-end
+    or pod.startTime would produce a T2 that pre-dates init-end, which
+    is physically impossible (k8s won't start the main until inits are
+    done) and was the root cause of misordered phases on GKE plots.
+    """
     from src.collectors import _container_started_at
-    pod = _make_pod(init_finished="2025-01-01T00:00:09Z", start_time="2025-01-01T00:00:01Z")
-    ts = _container_started_at(pod, "cilium-agent")
-    assert ts is not None and ts.second == 9
-
-
-def test_container_started_at_falls_back_to_pod_starttime():
-    from src.collectors import _container_started_at
+    # init container finished, but main is not yet Running
+    pod = _make_pod(init_finished="2025-01-01T00:00:09Z",
+                    start_time="2025-01-01T00:00:01Z")
+    assert _container_started_at(pod, "cilium-agent") is None
+    # only pod.startTime present
     pod = _make_pod(start_time="2025-01-01T00:00:01Z")
-    ts = _container_started_at(pod, "cilium-agent")
-    assert ts is not None and ts.second == 1
+    assert _container_started_at(pod, "cilium-agent") is None
+
+
+def test_container_started_at_ignores_terminated_and_laststate():
+    """A previously-terminated (or restarted) container exposes
+    `lastState.running.startedAt` / `state.terminated.startedAt` that
+    are from the previous run and must NOT be used as T2.
+    """
+    from src.collectors import _container_started_at
+    cs = _Obj(name="cilium-agent",
+              state=_Obj(running=None,
+                         terminated=_Obj(started_at="2024-12-31T23:59:00Z",
+                                         finished_at="2025-01-01T00:00:00Z"),
+                         waiting=None),
+              last_state=_Obj(running=_Obj(started_at="2024-12-30T00:00:00Z"),
+                              terminated=None, waiting=None))
+    pod = _Obj(metadata=_Obj(name="anetd-x", namespace="kube-system"),
+               status=_Obj(container_statuses=[cs], init_container_statuses=[],
+                           start_time=None, conditions=[]))
+    assert _container_started_at(pod, "cilium-agent") is None
+
+
+def test_container_started_at_ignores_other_running_containers():
+    """A sidecar running before the agent main must not leak into T2."""
+    from src.collectors import _container_started_at
+    other = _Obj(name="clean-cilium-state",
+                 state=_Obj(running=_Obj(started_at="2025-01-01T00:00:03Z"),
+                            terminated=None, waiting=None),
+                 last_state=_Obj(running=None, terminated=None, waiting=None))
+    agent = _Obj(name="cilium-agent",
+                 state=_Obj(running=None, terminated=None,
+                            waiting=_Obj(reason="PodInitializing")),
+                 last_state=_Obj(running=None, terminated=None, waiting=None))
+    pod = _Obj(metadata=_Obj(name="anetd-x", namespace="kube-system"),
+               status=_Obj(container_statuses=[other, agent],
+                           init_container_statuses=[],
+                           start_time=None, conditions=[]))
+    assert _container_started_at(pod, "cilium-agent") is None
 
 
 def test_pod_ready_transition_picks_ready_true():

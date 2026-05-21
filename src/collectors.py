@@ -87,38 +87,29 @@ class EventSink:
 
 
 def _container_started_at(pod: client.V1Pod, container_name: str) -> datetime | None:
-    """Best-effort T2: the earliest time we can attribute to the agent container starting.
+    """Strict T2: the cilium-agent **main** container's current-run start.
 
-    Search order:
-      1. containerStatuses[name].state.running.startedAt
-      2. containerStatuses[name].lastState.running.startedAt
-      3. containerStatuses[name].state.terminated.startedAt
-      4. any other container in containerStatuses with state.running.startedAt
-      5. latest initContainerStatus terminated.finishedAt (init phase complete)
-      6. pod.status.startTime
+    By k8s semantics the main container cannot transition to Running until
+    every init container has terminated successfully, so T2 must always be
+    >= max(init.finishedAt). Earlier iterations of this helper had
+    fallbacks to (a) lastState.running.startedAt, (b) state.terminated,
+    (c) any other container's startedAt, (d) pod.startTime — all of which
+    can produce timestamps that pre-date init-end and yield an impossible
+    T2 < last-init-finished (most visible on GKE where the init chain is
+    short, so the misordering is obvious in plots).
+
+    We now only accept `containerStatuses[<name>].state.running.startedAt`.
+    When the main container isn't Running yet we return None and let the
+    caller (a watch loop) re-read pod state until it is.
     """
     css = pod.status.container_statuses or []
-    by_name = {cs.name: cs for cs in css}
-    cs = by_name.get(container_name)
-    if cs is not None:
+    for cs in css:
+        if cs.name != container_name:
+            continue
         if cs.state and cs.state.running and cs.state.running.started_at:
             return _parse_k8s_time(cs.state.running.started_at)
-        if cs.last_state and cs.last_state.running and cs.last_state.running.started_at:
-            return _parse_k8s_time(cs.last_state.running.started_at)
-        if cs.state and cs.state.terminated and cs.state.terminated.started_at:
-            return _parse_k8s_time(cs.state.terminated.started_at)
-    for other in css:
-        if other.state and other.state.running and other.state.running.started_at:
-            return _parse_k8s_time(other.state.running.started_at)
-    finished = []
-    for ic in (pod.status.init_container_statuses or []):
-        if ic.state and ic.state.terminated and ic.state.terminated.finished_at:
-            ts = _parse_k8s_time(ic.state.terminated.finished_at)
-            if ts:
-                finished.append(ts)
-    if finished:
-        return max(finished)
-    return _parse_k8s_time(pod.status.start_time)
+        return None
+    return None
 
 
 def _pod_ready_transition(pod: client.V1Pod, condition_type: str) -> datetime | None:
