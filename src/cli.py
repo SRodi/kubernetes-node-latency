@@ -40,6 +40,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
         cfg.eks.region = args.aws_region
     if args.deep_cilium:
         cfg.cni.deep = True
+    if args.capture_logs is not None:
+        cfg.capture_logs = args.capture_logs
     run_id = args.run_id or time.strftime("%Y%m%d-%H%M%S")
     run_dir = Path(cfg.output.base_dir) / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -222,6 +224,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="exec into cilium-agent after T3 to capture "
                          "`cilium status -o json --verbose` and Prometheus "
                          "metrics; adds bootstrap/regen columns to iterations.csv")
+    pr.add_argument("--capture-logs", choices=["none", "minimal"], default=None,
+                    help="capture pod logs into iter-NNN/logs/ for forensics. "
+                         "'minimal' = cilium-agent + CNS/IPAM pods on the target "
+                         "node, time-bounded to the iteration window. Default: none.")
     pr.set_defaults(func=_cmd_run)
 
     pa = sub.add_parser("analyze", help="re-aggregate stats from an existing run dir")

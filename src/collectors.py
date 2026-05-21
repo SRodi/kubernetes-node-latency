@@ -625,6 +625,89 @@ class Collector:
                          "failed": sum(1 for e in out if e["failed"])})
         return out
 
+    def collect_pod_logs(
+        self,
+        node_name: str,
+        dest_dir: Path,
+        *,
+        targets: list[tuple[str, str]],
+        since_time: datetime | None = None,
+        tail_lines: int = 5000,
+    ) -> dict:
+        """Capture logs from selected pods on `node_name` into `dest_dir`.
+
+        `targets` is a list of (namespace, label_selector) pairs — for each,
+        every pod on the node matching the selector has its logs written to
+        `dest_dir/<namespace>__<pod>__<container>.log`. All containers
+        (init + main) are captured. Best-effort; never raises.
+
+        Returns a small summary dict: {pods, containers, bytes, errors}.
+        """
+        from pathlib import Path as _Path
+        dest = _Path(dest_dir)
+        dest.mkdir(parents=True, exist_ok=True)
+        summary = {"pods": 0, "containers": 0, "bytes": 0, "errors": 0}
+        since_s: int | None = None
+        if since_time is not None:
+            delta = (utcnow() - since_time).total_seconds()
+            if delta > 0:
+                since_s = int(delta) + 5  # small cushion
+        seen_pods: set[tuple[str, str]] = set()
+        for ns, sel in targets:
+            try:
+                pods = self.core.list_namespaced_pod(
+                    namespace=ns,
+                    label_selector=sel,
+                    field_selector=f"spec.nodeName={node_name}",
+                    _request_timeout=(10, 30),
+                ).items or []
+            except Exception as e:  # noqa: BLE001
+                self.sink.write("pod_logs_list_error",
+                                {"ns": ns, "selector": sel, "error": str(e)[:200]})
+                summary["errors"] += 1
+                continue
+            for p in pods:
+                pname = p.metadata.name
+                key = (ns, pname)
+                if key in seen_pods:
+                    continue
+                seen_pods.add(key)
+                summary["pods"] += 1
+                containers: list[str] = []
+                containers += [c.name for c in (p.spec.init_containers or [])]
+                containers += [c.name for c in (p.spec.containers or [])]
+                for cname in containers:
+                    try:
+                        kw = dict(
+                            name=pname, namespace=ns, container=cname,
+                            timestamps=True, tail_lines=tail_lines,
+                            _request_timeout=(10, 60),
+                        )
+                        if since_s is not None:
+                            kw["since_seconds"] = since_s
+                        logs: str = self.core.read_namespaced_pod_log(**kw)
+                    except Exception as e:  # noqa: BLE001
+                        self.sink.write("pod_logs_fetch_error",
+                                        {"ns": ns, "pod": pname, "container": cname,
+                                         "error": str(e)[:200]})
+                        summary["errors"] += 1
+                        continue
+                    if not logs:
+                        continue
+                    fname = f"{ns}__{pname}__{cname}.log"
+                    out_path = dest / fname
+                    try:
+                        out_path.write_text(logs)
+                        summary["containers"] += 1
+                        summary["bytes"] += len(logs)
+                    except OSError as e:
+                        self.sink.write("pod_logs_write_error",
+                                        {"path": str(out_path), "error": str(e)[:200]})
+                        summary["errors"] += 1
+        self.sink.write("pod_logs_collected",
+                        {"node": node_name, "dest": str(dest), **summary})
+        return summary
+
 
     def t3_ready_from_logs(self, pod: client.V1Pod, tail_lines: int,
                            *, retries: int = 6) -> datetime | None:

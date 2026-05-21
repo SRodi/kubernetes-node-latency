@@ -87,6 +87,12 @@ class IterationRecord:
     #    duration_s: float|None, failed: bool}
     node_image_pulls: list[dict] | None = None
 
+    # Log capture summary from `Collector.collect_pod_logs` (None when
+    # capture_logs="none"). Shape:
+    #   {pods: int, containers: int, bytes: int, errors: int,
+    #    duration_s: float}
+    log_capture: dict | None = None
+
     status: str = "pending"  # pending|success|timeout|error
     error: str | None = None
 
@@ -307,6 +313,17 @@ class IterationRecord:
         row["image_pulls_count"] = nip_count
         row["image_pulls_critical_s"] = nip_critical_s
         row["image_pulls_total_s"] = nip_total_s
+        # Log capture summary scalars (None when capture disabled).
+        if self.log_capture:
+            row["log_capture_pods"] = self.log_capture.get("pods")
+            row["log_capture_containers"] = self.log_capture.get("containers")
+            row["log_capture_bytes"] = self.log_capture.get("bytes")
+            row["log_capture_s"] = self.log_capture.get("duration_s")
+        else:
+            row["log_capture_pods"] = None
+            row["log_capture_containers"] = None
+            row["log_capture_bytes"] = None
+            row["log_capture_s"] = None
         row.update(ic_durations)
         row.update(headline_to_columns(self.deep_cilium))
         return row

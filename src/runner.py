@@ -238,6 +238,29 @@ def run_iterations(cfg: Config, handle: ClusterHandle, provider: ClusterProvider
                             ) or None
                     except Exception as e:  # noqa: BLE001
                         log.warning("node image-pull capture failed for iter %d: %s", i, e)
+                # Pod-log capture (opt-in via --capture-logs). Bounded to the
+                # iteration window so we don't drag in unrelated history.
+                if (getattr(cfg, "capture_logs", "none") == "minimal"
+                        and rec.node_name and _coll is not None):
+                    try:
+                        iter_dir = run_dir / f"iter-{i:03d}"
+                        log_dest = iter_dir / "logs"
+                        # Cilium agents + CNS/IPAM (best-effort across providers).
+                        targets = [
+                            ("kube-system", "k8s-app=cilium"),
+                            ("kube-system", "k8s-app=azure-cns"),
+                            ("kube-system", "k8s-app=cilium-azure-ipam"),
+                        ]
+                        since = rec.T1_node_registered or rec.T0_pod_created
+                        t0_log = time.monotonic()
+                        summary = _coll.collect_pod_logs(
+                            rec.node_name, log_dest,
+                            targets=targets, since_time=since,
+                        )
+                        summary["duration_s"] = round(time.monotonic() - t0_log, 3)
+                        rec.log_capture = summary
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("pod log capture failed for iter %d: %s", i, e)
                 if rec.pod_name:
                     delete_pod(core, rec.pod_name, cfg.trigger_pod.namespace)
                 # Best-effort uncordon so leftover nodes can be reused/reaped normally.
