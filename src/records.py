@@ -65,6 +65,14 @@ class IterationRecord:
     #                       "finished_at": iso|None}, ...]
     init_containers: list[dict] | None = None
 
+    # Full kubelet event log for the cilium DS pod within the
+    # T_pod_scheduled..T2 window. Each entry:
+    #   {ts: datetime, reason: str, container: str|None, message: str}
+    # Used by plotting to derive fine-grained per-container phases
+    # (sandbox setup, pull:<image>, start:<container>, run:<container>)
+    # rather than the older coarse `T_image_pull_start..T_image_pulled` lane.
+    pod_events: list[dict] | None = None
+
     # Trigger-pod lifecycle (the workload pod the harness submits each
     # iteration to force a new node). Captured post-iteration so we can
     # measure the actual "K8s networking" cost a workload sees: from node
@@ -182,6 +190,16 @@ class IterationRecord:
             "T_image_pull_start": iso(self.T_image_pull_start),
             "T_image_pulled": iso(self.T_image_pulled),
             "init_containers_json": init_serial,
+            "pod_events_json": (
+                _json.dumps(
+                    [{"ts": iso(e.get("ts")) if isinstance(e.get("ts"), datetime) else e.get("ts"),
+                      "reason": e.get("reason"),
+                      "container": e.get("container"),
+                      "message": e.get("message")}
+                     for e in self.pod_events],
+                    separators=(",", ":"),
+                ) if self.pod_events else None
+            ),
             # Derived seconds relative to T1 (None when either anchor is missing).
             "csinode_block_s": (
                 max(delta(self.T_csinode_ready, self.T1_node_registered) or 0.0, 0.0)

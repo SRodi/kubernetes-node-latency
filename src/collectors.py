@@ -374,13 +374,18 @@ class Collector:
         Returns a dict with optional keys (any may be absent):
             T_pod_scheduled        datetime
             T_pod_initialized      datetime  (pod.status.conditions[Initialized])
-            T_image_pull_start     datetime  (event reason=Pulling)
-            T_image_pulled         datetime  (event reason=Pulled)
+            T_image_pull_start     datetime  (event reason=Pulling, first)
+            T_image_pulled         datetime  (event reason=Pulled,  last)
             init_containers        list[{name, started_at, finished_at}]
+            events                 list[{ts, reason, container, message}]
+                                   \u2014 full kubelet event log for the pod,
+                                     used by plotting to reconstruct
+                                     fine-grained per-container phases
+                                     (sandbox setup, pull, start, run).
 
         Best-effort: never raises; failures are logged to the sink.
         """
-        out: dict = {"init_containers": []}
+        out: dict = {"init_containers": [], "events": []}
         try:
             pod = self.core.read_namespaced_pod(name=pod_name, namespace=namespace)
         except Exception as e:  # noqa: BLE001
@@ -423,13 +428,36 @@ class Collector:
             if not ts:
                 continue
             reason = getattr(ev, "reason", "") or ""
+            msg = getattr(ev, "message", "") or ""
+            field_path = ""
+            inv = getattr(ev, "involved_object", None)
+            if inv is not None:
+                field_path = getattr(inv, "field_path", "") or ""
+            # field_path looks like `spec.containers{cilium-agent}` or
+            # `spec.initContainers{install-cni-binaries}`; extract the
+            # container name when present.
+            container = None
+            cm = re.search(r"\{([^}]+)\}", field_path)
+            if cm:
+                container = cm.group(1)
+            out["events"].append({
+                "ts": ts,
+                "reason": reason,
+                "container": container,
+                "message": msg[:200],
+            })
             if reason == "Pulling" and "T_image_pull_start" not in out:
                 out["T_image_pull_start"] = ts
-            elif reason == "Pulled" and "T_image_pulled" not in out:
+            elif reason == "Pulled":
+                # Keep the LAST Pulled timestamp so T_image_pulled spans
+                # the full image-pull window for the pod (previously this
+                # captured only the first image pulled, which on
+                # multi-init-container pods was misleadingly short).
                 out["T_image_pulled"] = ts
         self.sink.write("pod_lifecycle_collected",
                         {"pod": pod_name,
                          "init_count": len(out["init_containers"]),
+                         "event_count": len(out["events"]),
                          "have_pull_start": "T_image_pull_start" in out,
                          "have_pulled": "T_image_pulled" in out,
                          "have_scheduled": "T_pod_scheduled" in out})
