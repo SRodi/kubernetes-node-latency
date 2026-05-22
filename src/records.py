@@ -65,6 +65,14 @@ class IterationRecord:
     #                       "finished_at": iso|None}, ...]
     init_containers: list[dict] | None = None
 
+    # Full kubelet event log for the cilium DS pod within the
+    # T_pod_scheduled..T2 window. Each entry:
+    #   {ts: datetime, reason: str, container: str|None, message: str}
+    # Used by plotting to derive fine-grained per-container phases
+    # (sandbox setup, pull:<image>, start:<container>, run:<container>)
+    # rather than the older coarse `T_image_pull_start..T_image_pulled` lane.
+    pod_events: list[dict] | None = None
+
     # Trigger-pod lifecycle (the workload pod the harness submits each
     # iteration to force a new node). Captured post-iteration so we can
     # measure the actual "K8s networking" cost a workload sees: from node
@@ -86,6 +94,16 @@ class IterationRecord:
     #    t_pulling: datetime|None, t_pulled: datetime|None,
     #    duration_s: float|None, failed: bool}
     node_image_pulls: list[dict] | None = None
+
+    # Per-container `reason=Started` kubelet events observed on the new
+    # node within the iteration window. Populated by
+    # `Collector.collect_node_container_starts`; None when capture was
+    # disabled or the call failed. Each dict:
+    #   {namespace, pod, container, init: bool, t_started: datetime}
+    # Used by plotting to derive `run:<container>` lanes for every pod
+    # on the new node (not just the cilium agent), so CNS/CSI/etc. show
+    # their full init-container chain in the main chart.
+    node_container_starts: list[dict] | None = None
 
     # Log capture summary from `Collector.collect_pod_logs` (None when
     # capture_logs="none"). Shape:
@@ -182,6 +200,16 @@ class IterationRecord:
             "T_image_pull_start": iso(self.T_image_pull_start),
             "T_image_pulled": iso(self.T_image_pulled),
             "init_containers_json": init_serial,
+            "pod_events_json": (
+                _json.dumps(
+                    [{"ts": iso(e.get("ts")) if isinstance(e.get("ts"), datetime) else e.get("ts"),
+                      "reason": e.get("reason"),
+                      "container": e.get("container"),
+                      "message": e.get("message")}
+                     for e in self.pod_events],
+                    separators=(",", ":"),
+                ) if self.pod_events else None
+            ),
             # Derived seconds relative to T1 (None when either anchor is missing).
             "csinode_block_s": (
                 max(delta(self.T_csinode_ready, self.T1_node_registered) or 0.0, 0.0)
@@ -313,6 +341,22 @@ class IterationRecord:
         row["image_pulls_count"] = nip_count
         row["image_pulls_critical_s"] = nip_critical_s
         row["image_pulls_total_s"] = nip_total_s
+        # Per-container Started events on the new node — used by plotting
+        # to derive `run:<container>` lanes for every pod (not just cilium).
+        ncs_serial: str | None = None
+        if self.node_container_starts:
+            slim_starts = []
+            for s in self.node_container_starts:
+                ts = s.get("t_started")
+                slim_starts.append({
+                    "namespace": s.get("namespace"),
+                    "pod": s.get("pod"),
+                    "container": s.get("container"),
+                    "init": bool(s.get("init", False)),
+                    "t_started": iso(ts) if isinstance(ts, datetime) else ts,
+                })
+            ncs_serial = _json.dumps(slim_starts, separators=(",", ":"))
+        row["node_container_starts_json"] = ncs_serial
         # Log capture summary scalars (None when capture disabled).
         if self.log_capture:
             row["log_capture_pods"] = self.log_capture.get("pods")

@@ -53,6 +53,7 @@ ACTOR_COLORS = {
     "scheduler_wait":  "#c7d2fe",  # lavender (T1->Ts pre-bind)
     "sandbox":         "#fde68a",  # pale amber (kubelet pre-pull setup)
     "kubelet_main":    "#93c5fd",  # light blue (kubelet starting agent main container)
+    "init_run":        "#f97316",  # dark orange (init container execution window)
     "trigger_pod":     "#a855f7",  # purple (trigger pod CNI ADD / sandbox setup)
 }
 
@@ -305,9 +306,20 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
         return float(s.median())
 
     lanes: list[tuple[str, float, float, str]] = []
+    # Suppressed PROFILE_LANES: replaced by fine-grained per-container
+    # phases (sandbox setup is already covered by "Kubelet sandbox +
+    # image-pull init"; per-image pulls are rendered as their own rows;
+    # per-init runs are appended below as run:<container> lanes).
+    _SUPPRESS_MAIN_LANES = {
+        "Cilium agent image pull",
+        "Cilium init-container chain",
+        "Cilium agent bootstrap",
+    }
     for label, start_col, end_col, actor in PROFILE_LANES:
         if actor == "cloud":
             continue  # rendered as a numeric annotation, not a bar
+        if label in _SUPPRESS_MAIN_LANES:
+            continue
         s_off = _mean_offset(start_col)
         e_off = _mean_offset(end_col)
         if s_off is None or e_off is None:
@@ -466,6 +478,97 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
                 main_start, main_end, "kubelet_main",
             ))
 
+    # ---- Per-init-container "run:<name>" lanes ----
+    # Replace the coarse "Cilium init-container chain" lane (suppressed
+    # above) with one lane per init container so the reader can see the
+    # exact execution window of each. Kubelet reports init-container
+    # `terminated.started_at` / `finished_at` at 1s resolution, so the
+    # naive `finished_at - started_at` rounds to 0-1s for nearly every
+    # init and hides the real chain cost. We instead use the time until
+    # the NEXT init container starts as the effective duration (the
+    # kubelet only transitions to the next init after the current one
+    # exits, so successive starts bracket each init's true wall-clock
+    # cost). The last init's end is snapped to `last_init_end_t1`
+    # (max of last finished_at and T1c) to close the visual gap to the
+    # conflist appearing on disk.
+    if ic_offsets:
+        chain_end = last_init_end_t1 if last_init_end_t1 is not None \
+            else max((e for _n, _s, e in ic_offsets), default=None)
+        if chain_end is not None:
+            ordered = sorted(ic_offsets, key=lambda r: r[1])
+            for i, (name, s_rel, e_rel) in enumerate(ordered):
+                if i + 1 < len(ordered):
+                    end_rel = ordered[i + 1][1]
+                else:
+                    end_rel = max(e_rel, chain_end)
+                end_rel = min(end_rel, chain_end)
+                if end_rel <= s_rel:
+                    continue
+                all_lanes.append((
+                    f"run: {name}", s_rel, end_rel, "init_run",
+                ))
+
+    # ---- Per-container `run:<container>` lanes for non-cilium pods ----
+    # `node_container_starts_json` lists every `reason=Started` kubelet
+    # event on the new node within the iteration window, tagged with pod
+    # + container + init/main. We group by pod basename and emit one
+    # `run:<container>` lane per container, using the next container's
+    # start (in the same pod) as this lane's end so each step's wall-clock
+    # cost is visible (kubelet only transitions to the next container
+    # after the current one exits, so successive starts bracket each
+    # step at second resolution). The last container in each pod (which
+    # is typically the long-running main container) is rendered with a
+    # short fixed window so it stays visible without dominating the chart.
+    # The cilium pod is skipped — it already has dedicated per-init lanes
+    # derived from `init_containers_json` (1s-resolution, but anchored to
+    # the full chain end via T1c) plus bootstrap phases.
+    if "node_container_starts_json" in ok.columns:
+        starts_by_pod = _aggregate_node_container_starts(ok, ok["T1_node_registered"])
+        for (ns, base), container_starts in starts_by_pod.items():
+            if base == "cilium" or base.startswith("cilium-"):
+                continue
+            pod_key = f"{ns}/{base}" if ns else base
+            n = len(container_starts)
+            for i, (cname, is_init, s_off) in enumerate(container_starts):
+                if i + 1 < n:
+                    e_off = container_starts[i + 1][2]
+                else:
+                    # Last container in the pod: give it a short visible
+                    # window. Init containers without a successor usually
+                    # mean the main container's Started event wasn't
+                    # captured — use 1s as a conservative end. Main
+                    # containers stay running for the rest of the iteration
+                    # so 2s is enough to draw a recognizable bar without
+                    # implying a specific exit time.
+                    e_off = s_off + (1.0 if is_init else 2.0)
+                if e_off <= s_off + 5e-3:
+                    continue
+                base_label = f"run: {cname}"
+                label = base_label
+                # Disambiguate against any cilium init container with the
+                # same name (rare but possible across DSes).
+                dedup_n = 2
+                while label in run_label_to_pod and run_label_to_pod[label] != pod_key:
+                    label = f"{base_label} ({base})"
+                    dedup_n += 1
+                    if dedup_n > 10:
+                        break
+                run_label_to_pod[label] = pod_key
+                all_lanes.append((label, s_off, e_off, "init_run"))
+
+    # ---- Inline Cilium agent bootstrap phases as main-chart lanes ----
+    # `cilium_breakdown` already chains the bootstrap phases at their
+    # T1-relative positions (anchored so they end exactly at T3). Surface
+    # each phase as its own lane so the reader sees every sub-phase on
+    # the same time axis as everything else.
+    if cilium_breakdown:
+        for label, s_rel, e_rel in cilium_breakdown:
+            if e_rel - s_rel < 5e-3:
+                continue
+            all_lanes.append((
+                f"bootstrap: {label}", s_rel, e_rel, "cilium",
+            ))
+
     # ---- "Cilium init-container chain" zoom: Tip -> end of last init ----
     # The pre-image-pull portion (scheduler latency, sandbox prep, image pull)
     # is explicit on the main chart, so the zoom focuses on the per-init-
@@ -578,43 +681,121 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
     # ---- Merge image-pull rows into the main chart ----
     # Each distinct image pulled on the node becomes its own lane so the
     # reader can see exactly when each pull happens on the same time axis
-    # as the lifecycle phases. Lanes are inserted in chronological order
-    # (by median start_off) and use the actor sentinel "pull:<family>" so
-    # the render loop colours them by family palette instead of ACTOR_COLORS.
-    pull_lane_keys: dict[str, str] = {}  # short ytick label -> full image ref
-
-    def _short_pull_label(ref: str, maxlen: int = 38) -> str:
-        if len(ref) <= maxlen:
-            return ref
-        if "/" in ref:
-            tail = ref.rsplit("/", 1)[-1]
-            if len(tail) <= maxlen - 4:
-                return ".../" + tail
-        return ref[: maxlen - 1] + "\u2026"
+    # as the lifecycle phases. To keep the chart legible on providers
+    # that pull many ancillary images (notably GKE), we:
+    #   * drop pulls shorter than MAIN_CHART_PULL_MIN_S (sub-panel still
+    #     shows them);
+    #   * keep critical-path families per-image (cilium, cns, azure-cni,
+    #     trigger) so the reader can see which specific image dominates;
+    #   * collapse every other family into ONE aggregated lane covering
+    #     `min(start)..max(end)` with a `(xN)` count badge.
+    # Labels use just the image basename (last path segment + tag) — the
+    # registry/repo prefix is not load-bearing once family colour is set.
+    pull_lane_keys: dict[str, str] = {}  # short ytick label -> full image ref(s)
+    pull_label_to_pod: dict[str, str | None] = {}  # short ytick label -> pod_key
+    # For non-cilium `run:<container>` lanes derived from
+    # node_container_starts_json — map lane label -> pod_key so the
+    # outer container-grouping box wraps them correctly.
+    run_label_to_pod: dict[str, str | None] = {}
 
     if pull_image_order:
-        from .image_family import DEFAULT_FAMILY as _DF
+        from .image_family import (
+            DEFAULT_FAMILY as _DF,
+            MAIN_CHART_PER_IMAGE_FAMILIES as _PER_IMG,
+            MAIN_CHART_PULL_MIN_S as _MIN_S,
+            image_basename as _basename,
+        )
+
+        def _pod_basename(pod: str) -> str:
+            # Strip the trailing -xxxxx random suffix(es) produced by
+            # ReplicaSet/DaemonSet controllers so the box label stays
+            # stable across iterations and runs.
+            if not pod:
+                return ""
+            import re as _re
+            return _re.sub(r"(-[a-z0-9]{5,10}){1,2}$", "", pod)
+
+        def _pod_key(ns: str, pod: str) -> str | None:
+            if not pod:
+                return None
+            base = _pod_basename(pod)
+            return f"{ns}/{base}" if ns else base
+
+        # Detect the cilium-agent pod identifier from the pull entries so
+        # that lifecycle lanes (image-pull, init chain, agent bootstrap,
+        # main-container startup, endpoint regen) can be grouped together
+        # with the cilium pod's pull rows under one outer container/pod box.
+        cilium_pod_key: str | None = None
+        for image, insts in image_pulls_by_image.items():
+            for r in insts:
+                if r.get("container") == "cilium-agent":
+                    cilium_pod_key = _pod_key(r.get("namespace") or "", r.get("pod") or "")
+                    break
+            if cilium_pod_key:
+                break
+
+        per_image_rows: list[tuple[str, float, float, str, str, str | None]] = []  # (label, s, e, family, full_ref, pod_key)
+        # Aggregate non-critical families per (family, pod_key) rather
+        # than globally — otherwise an "other"-family image that belongs
+        # to a specific pod (e.g. azure-iptables-monitor on the cilium
+        # pod) gets merged into a pod-less lane and disappears from
+        # its container-grouping box.
+        agg_by_family_pod: dict[tuple[str, str | None], list[dict]] = {}
         for image in pull_image_order:
             insts = image_pulls_by_image[image]
             fam = insts[0].get("family") or _DF
             s = float(np.median([r["start_off"] for r in insts]))
             e = float(np.median([r["end_off"] for r in insts]))
-            label = _short_pull_label(image)
-            # Disambiguate colliding shortened labels (rare) so the
-            # full-name lookup below stays unique. If the short label
-            # already maps to a different image, append a counter.
+            dur = e - s
+            pod_keys = {
+                _pod_key(r.get("namespace") or "", r.get("pod") or "")
+                for r in insts
+                if r.get("pod")
+            }
+            pod_keys.discard(None)
+            row_pod_key = next(iter(pod_keys)) if len(pod_keys) == 1 else None
+            if fam in _PER_IMG:
+                label = _basename(image) or image
+                per_image_rows.append((label, s, e, fam, image, row_pod_key))
+            else:
+                if dur < _MIN_S:
+                    continue
+                agg_by_family_pod.setdefault((fam, row_pod_key), []).append(
+                    {"image": image, "s": s, "e": e, "pod_key": row_pod_key})
+
+        agg_rows: list[tuple[str, float, float, str, str, str | None]] = []
+        for (fam, row_pod_key), items in agg_by_family_pod.items():
+            s = min(it["s"] for it in items)
+            e = max(it["e"] for it in items)
+            n = len(items)
+            if n == 1:
+                # Single image in this (family, pod) bucket: show the
+                # image basename so the reader can identify what was
+                # actually pulled (rather than the generic family name).
+                label = _basename(items[0]["image"]) or items[0]["image"]
+            else:
+                label = f"{fam} (\u00d7{n})"
+            full = ", ".join(_basename(it["image"]) or it["image"] for it in items)
+            agg_rows.append((label, s, e, fam, full, row_pod_key))
+
+        # Emit lanes in chronological order by start.
+        merged_rows = sorted(per_image_rows + agg_rows, key=lambda r: r[1])
+        for label, s, e, fam, full, pk in merged_rows:
             base = label
             n = 2
-            while label in pull_lane_keys and pull_lane_keys[label] != image:
+            while label in pull_lane_keys and pull_lane_keys[label] != full:
                 label = f"{base} ({n})"
                 n += 1
-            pull_lane_keys[label] = image
+            pull_lane_keys[label] = full
+            pull_label_to_pod[label] = pk
             all_lanes.append((label, s, e, f"pull:{fam}"))
+    else:
+        cilium_pod_key = None
 
     # Layout: main wall-clock Gantt on top, plus optional zoomed subplots
     # (CNI add\u2192Ready decomposition, Cilium-internal bootstrap).
-    has_cilium_bd = bool(cilium_breakdown)
-    has_cni_bd = bool(cni_breakdown)
+    has_cilium_bd = False  # bootstrap phases inlined into main chart
+    has_cni_bd = False     # init-container chain inlined as run:<name> lanes
     has_regen_bd = bool(regen_breakdown)
     n_main = len(all_lanes)
     n_pull_rows = len(pull_image_order)
@@ -660,6 +841,53 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
     ax_pulls = sub_axes.pop(0) if has_pulls_bd else None
     ax_pulls_tl = sub_axes.pop(0) if has_pulls_tl else None
 
+    # ---- Reorder lanes so same-pod lanes are contiguous ----
+    # Chronological ordering scatters a pod's lanes (e.g. cilium lifecycle
+    # lanes near the top + cilium image-pull rows at the bottom) which
+    # forces the container-grouping box to either engulf unrelated lanes
+    # or split into multiple boxes. Clumping a pod's lanes together at
+    # the position of its FIRST lane lets each pod render as a single
+    # tight outer box while keeping the relative chronology within the
+    # pod intact and leaving non-pod lifecycle lanes in their original
+    # positions.
+    _CILIUM_LIFECYCLE_ACTORS = {"image_pull", "cni", "cilium",
+                                 "kubelet_main", "cilium_regen",
+                                 "init_run"}
+
+    def _lane_pod_key(lbl: str, actor: str) -> str | None:
+        if isinstance(actor, str) and actor.startswith("pull:"):
+            return pull_label_to_pod.get(lbl)
+        if actor == "init_run" and lbl in run_label_to_pod:
+            # Non-cilium pod's run:<container> lane — use the explicit
+            # pod_key we recorded when the lane was emitted.
+            return run_label_to_pod[lbl]
+        if actor in _CILIUM_LIFECYCLE_ACTORS:
+            return cilium_pod_key or "cilium-agent"
+        if actor == "trigger_pod":
+            return "trigger-pod"
+        return None
+
+    _orig_keys = [_lane_pod_key(lbl, actor) for lbl, _s, _e, actor in all_lanes]
+    _emitted = [False] * len(all_lanes)
+    _reordered: list[tuple[str, float, float, str]] = []
+    _reordered_keys: list[str | None] = []
+    for i, lane in enumerate(all_lanes):
+        if _emitted[i]:
+            continue
+        key = _orig_keys[i]
+        if key is None:
+            _reordered.append(lane)
+            _reordered_keys.append(None)
+            _emitted[i] = True
+        else:
+            for j in range(i, len(all_lanes)):
+                if not _emitted[j] and _orig_keys[j] == key:
+                    _reordered.append(all_lanes[j])
+                    _reordered_keys.append(key)
+                    _emitted[j] = True
+    all_lanes = _reordered
+    lane_pod_keys = _reordered_keys
+
     y_positions = np.arange(n_main, 0, -1)  # top-down listing
     used_actors: list[str] = []
     used_pull_fams: list[str] = []
@@ -686,16 +914,47 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
                 va="center", ha="center" if dur > 1.5 else "left",
                 fontsize=7 if is_pull else 8,
                 color="white" if (dur > 1.5 and not is_pull) else "black")
-        if is_pull:
-            # Render the full image reference as small italic text just
-            # above the bar so the truncated y-tick remains compact while
-            # the reader can still identify the image precisely.
-            full = pull_lane_keys.get(label, label)
-            if full and full != label:
-                ax.text(s_off, y + bar_h / 2 + 0.02, full,
-                        ha="left", va="bottom", fontsize=6,
-                        style="italic", color="#374151", alpha=0.85,
-                        clip_on=False)
+
+    # ---- Container/pod grouping boxes ----
+    # Lanes have already been reordered so each pod's lanes are
+    # contiguous. Draw a single thin dashed outer border around the
+    # block belonging to each pod.
+    pod_groups: dict[str, list[int]] = {}
+    for i, key in enumerate(lane_pod_keys):
+        if key:
+            pod_groups.setdefault(key, []).append(i)
+
+    from matplotlib.patches import Rectangle as _Rect
+    _box_palette = ["#1f77b4", "#ff7f0e", "#2ca02c", "#9467bd",
+                    "#8c564b", "#e377c2", "#17becf", "#bcbd22"]
+    sorted_groups = sorted(
+        pod_groups.items(),
+        key=lambda kv: -max(y_positions[i] for i in kv[1]),
+    )
+    for gi, (key, idxs) in enumerate(sorted_groups):
+        if len(idxs) < 2:
+            continue
+        ys = [y_positions[i] for i in idxs]
+        bars = [all_lanes[i] for i in idxs]
+        y_top = max(ys) + 0.45
+        y_bot = min(ys) - 0.45
+        x_left = min(b[1] for b in bars)
+        x_right = max(b[2] for b in bars)
+        span = max(x_right - x_left, 0.5)
+        x_pad = span * 0.015 + 0.15
+        color = _box_palette[gi % len(_box_palette)]
+        short_key = key.split("/", 1)[-1] if "/" in key else key
+        rect = _Rect(
+            (x_left - x_pad, y_bot),
+            (x_right - x_left) + 2 * x_pad,
+            y_top - y_bot,
+            fill=False, edgecolor=color, linewidth=1.3, linestyle="--",
+            zorder=0.5, alpha=0.9,
+        )
+        ax.add_patch(rect)
+        ax.text(x_right + x_pad, y_top, f"\u2192 {short_key}",
+                ha="left", va="bottom", fontsize=7,
+                color=color, fontweight="bold")
 
     for glyph, off in markers:
         # Render T4b prominently: it marks when the node becomes schedulable
@@ -966,16 +1225,7 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
         y_pulls = np.arange(n_pull_rows, 0, -1)
         used_fams: list[str] = []
 
-        # Truncate very long image refs for tick labels (keep tag).
-        def _short(ref: str, maxlen: int = 60) -> str:
-            if len(ref) <= maxlen:
-                return ref
-            if "/" in ref:
-                tail = ref.rsplit("/", 1)[-1]
-                if len(tail) <= maxlen - 4:
-                    return ".../" + tail
-            return ref[: maxlen - 1] + "\u2026"
-
+        from .image_family import image_basename as _basename
         max_dur = max((d["max"] for d in per_image), default=1.0)
         for y, d in zip(y_pulls, per_image):
             fam = d["family"]
@@ -1000,7 +1250,7 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
                           color="#111", fontweight="bold")
 
         ax_pulls.set_yticks(y_pulls)
-        ax_pulls.set_yticklabels([_short(d["image"]) for d in per_image],
+        ax_pulls.set_yticklabels([_basename(d["image"]) or d["image"] for d in per_image],
                                  fontsize=7)
         ax_pulls.set_xlim(0, max_dur * 1.22)
         ax_pulls.set_ylim(0.3, n_pull_rows + 0.7)
@@ -1176,6 +1426,66 @@ def _mean_init_container_durations(ok: pd.DataFrame) -> list[tuple[str, float]]:
     return out
 
 
+def _aggregate_node_container_starts(
+    ok: pd.DataFrame, t1_off_per_row: pd.Series,
+) -> dict[tuple[str, str], list[tuple[str, bool, float]]]:
+    """Aggregate per-container ``Started`` events across iterations.
+
+    Returns a dict keyed by ``(namespace, pod_basename)`` whose value is a
+    list of ``(container_name, init: bool, median_start_offset_s)`` ordered
+    by median start offset. The pod basename is the pod name with its
+    trailing ``-xxxxx`` ReplicaSet/DaemonSet hash suffix(es) stripped, so
+    rows aggregate cleanly across iterations even when each iteration sees
+    a freshly-named pod.
+    """
+    if "node_container_starts_json" not in ok.columns:
+        return {}
+    import json as _json
+    import re as _re
+    from datetime import datetime as _dt
+    t1_series = pd.to_datetime(t1_off_per_row, utc=True, errors="coerce")
+    # key = (ns, pod_basename, container, init) -> list[start_offset_s]
+    starts: dict[tuple[str, str, str, bool], list[float]] = {}
+    def _basename(pod: str) -> str:
+        if not pod:
+            return ""
+        return _re.sub(r"(-[a-z0-9]{5,10}){1,2}$", "", pod)
+    for raw, t1 in zip(ok["node_container_starts_json"], t1_series):
+        if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+            continue
+        if pd.isna(t1):
+            continue
+        try:
+            entries = _json.loads(raw)
+        except Exception:
+            continue
+        for e in entries:
+            ts = e.get("t_started")
+            if not ts:
+                continue
+            try:
+                ts_t = _dt.fromisoformat(ts.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            ns = e.get("namespace") or ""
+            pod = e.get("pod") or ""
+            container = e.get("container") or ""
+            if not (ns and pod and container):
+                continue
+            is_init = bool(e.get("init", False))
+            base = _basename(pod)
+            s_off = (ts_t - t1.to_pydatetime()).total_seconds()
+            starts.setdefault((ns, base, container, is_init), []).append(s_off)
+    by_pod: dict[tuple[str, str], list[tuple[str, bool, float]]] = {}
+    for (ns, base, container, is_init), offs in starts.items():
+        med = float(pd.Series(offs).median())
+        by_pod.setdefault((ns, base), []).append((container, is_init, med))
+    for k in by_pod:
+        by_pod[k].sort(key=lambda r: r[2])
+    return by_pod
+
+
+
 def _mean_init_container_offsets(ok: pd.DataFrame, t1_off_per_row: pd.Series) -> list[tuple[str, float, float]]:
     """Return per-init-container (name, median_start_offset_s, median_end_offset_s)
     relative to T1, using absolute timestamps in init_containers_json.
@@ -1256,6 +1566,7 @@ def _node_image_pulls_aggregated(ok: pd.DataFrame, t1_off_per_row: pd.Series) ->
         return []
     import json as _json
     from datetime import datetime as _dt
+    from .image_family import classify
     out: list[dict] = []
     t1_series = pd.to_datetime(ok.get("T1_node_registered"), errors="coerce", utc=True)
     for (idx, raw), t1_ts in zip(ok["node_image_pulls_json"].items(), t1_series):
@@ -1273,24 +1584,42 @@ def _node_image_pulls_aggregated(ok: pd.DataFrame, t1_off_per_row: pd.Series) ->
         for e in entries:
             tpl = e.get("t_pulling")
             tpd = e.get("t_pulled")
-            if not (tpl and tpd):
+            if not tpd:
+                # No "Pulled" event at all: nothing to anchor a window
+                # to. Skip — these are typically failed/no-op entries.
                 continue
             try:
-                s_t = _dt.fromisoformat(tpl.replace("Z", "+00:00"))
                 e_t = _dt.fromisoformat(tpd.replace("Z", "+00:00"))
             except Exception:
                 continue
+            # Cache hits emit "Pulled" with no preceding "Pulling" event
+            # (kubelet message: "Container image ... already present on
+            # machine"). Surface them as zero-duration markers at the
+            # Pulled timestamp so the reader can still see which images
+            # were referenced even when no network pull happened.
+            cache_hit = not tpl
+            if tpl:
+                try:
+                    s_t = _dt.fromisoformat(tpl.replace("Z", "+00:00"))
+                except Exception:
+                    s_t = e_t
+            else:
+                s_t = e_t
             s_off = s_t.timestamp() - t1_epoch
             e_off = e_t.timestamp() - t1_epoch
             dur = e.get("duration_s")
             if not isinstance(dur, (int, float)):
-                dur = None
+                dur = 0.0 if cache_hit else None
             by_image.setdefault(e.get("image") or "", []).append({
                 "image": e.get("image") or "",
-                "family": e.get("family") or "other",
+                "pod": e.get("pod") or "",
+                "namespace": e.get("namespace") or "",
+                "container": e.get("container") or "",
+                "family": classify(e.get("image") or "") if (e.get("image")) else (e.get("family") or "other"),
                 "start_off": s_off,
                 "end_off": e_off,
                 "duration_s": dur,
+                "cache_hit": cache_hit,
                 "iteration_idx": idx,
             })
         # Pick the "real" pull per image: the entry with the largest
@@ -1606,6 +1935,7 @@ def _plot_compare_phase_decomposition(csvs: list[Path], out_dir: Path) -> Path |
         if "node_image_pulls_json" not in df.columns:
             return {}, 0, float("nan")
         import json as _json
+        from .image_family import classify as _classify
         per_iter_fam: list[dict[str, float]] = []
         per_iter_distinct: list[int] = []
         for raw in df["node_image_pulls_json"].dropna():
@@ -1619,7 +1949,8 @@ def _plot_compare_phase_decomposition(csvs: list[Path], out_dir: Path) -> Path |
             best: dict[str, tuple[str, float]] = {}  # image -> (family, dur)
             for e in entries:
                 img = e.get("image") or ""
-                fam = e.get("family") or DEFAULT_FAMILY
+                # Re-classify on read so stale CSV families don't survive.
+                fam = _classify(img) if img else (e.get("family") or DEFAULT_FAMILY)
                 d = e.get("duration_s")
                 if not isinstance(d, (int, float)) or not img:
                     continue

@@ -374,13 +374,18 @@ class Collector:
         Returns a dict with optional keys (any may be absent):
             T_pod_scheduled        datetime
             T_pod_initialized      datetime  (pod.status.conditions[Initialized])
-            T_image_pull_start     datetime  (event reason=Pulling)
-            T_image_pulled         datetime  (event reason=Pulled)
+            T_image_pull_start     datetime  (event reason=Pulling, first)
+            T_image_pulled         datetime  (event reason=Pulled,  last)
             init_containers        list[{name, started_at, finished_at}]
+            events                 list[{ts, reason, container, message}]
+                                   \u2014 full kubelet event log for the pod,
+                                     used by plotting to reconstruct
+                                     fine-grained per-container phases
+                                     (sandbox setup, pull, start, run).
 
         Best-effort: never raises; failures are logged to the sink.
         """
-        out: dict = {"init_containers": []}
+        out: dict = {"init_containers": [], "events": []}
         try:
             pod = self.core.read_namespaced_pod(name=pod_name, namespace=namespace)
         except Exception as e:  # noqa: BLE001
@@ -423,13 +428,36 @@ class Collector:
             if not ts:
                 continue
             reason = getattr(ev, "reason", "") or ""
+            msg = getattr(ev, "message", "") or ""
+            field_path = ""
+            inv = getattr(ev, "involved_object", None)
+            if inv is not None:
+                field_path = getattr(inv, "field_path", "") or ""
+            # field_path looks like `spec.containers{cilium-agent}` or
+            # `spec.initContainers{install-cni-binaries}`; extract the
+            # container name when present.
+            container = None
+            cm = re.search(r"\{([^}]+)\}", field_path)
+            if cm:
+                container = cm.group(1)
+            out["events"].append({
+                "ts": ts,
+                "reason": reason,
+                "container": container,
+                "message": msg[:200],
+            })
             if reason == "Pulling" and "T_image_pull_start" not in out:
                 out["T_image_pull_start"] = ts
-            elif reason == "Pulled" and "T_image_pulled" not in out:
+            elif reason == "Pulled":
+                # Keep the LAST Pulled timestamp so T_image_pulled spans
+                # the full image-pull window for the pod (previously this
+                # captured only the first image pulled, which on
+                # multi-init-container pods was misleadingly short).
                 out["T_image_pulled"] = ts
         self.sink.write("pod_lifecycle_collected",
                         {"pod": pod_name,
                          "init_count": len(out["init_containers"]),
+                         "event_count": len(out["events"]),
                          "have_pull_start": "T_image_pull_start" in out,
                          "have_pulled": "T_image_pulled" in out,
                          "have_scheduled": "T_pod_scheduled" in out})
@@ -615,6 +643,89 @@ class Collector:
                          "with_duration": sum(1 for e in out if e["duration_s"] is not None),
                          "failed": sum(1 for e in out if e["failed"])})
         return out
+
+    def collect_node_container_starts(
+        self,
+        node_name: str,
+        window_start: datetime,
+        window_end: datetime,
+    ) -> list[dict]:
+        """List every kubelet ``reason=Started`` event for containers on
+        ``node_name`` within [window_start, window_end].
+
+        Used by plotting to render per-container ``run:<container>`` lanes
+        for any pod on the new node (not just the cilium agent). Each pod's
+        chain of init-container starts brackets the kubelet's transitions
+        between init containers, so successive ``t_started`` values give the
+        effective wall-clock cost of each step at second resolution.
+
+        Returns a list of dicts; never raises. Each entry:
+            {namespace, pod, container, init, t_started}
+        ``init`` is True when the event's field_path references
+        ``spec.initContainers{...}``, False for main containers.
+        """
+        out: list[dict] = []
+        try:
+            pods = self.core.list_pod_for_all_namespaces(
+                field_selector=f"spec.nodeName={node_name}",
+                _request_timeout=(10, 30),
+            ).items
+        except Exception as e:  # noqa: BLE001
+            self.sink.write("node_container_starts_pods_error",
+                            {"node": node_name, "error": str(e)[:200]})
+            return out
+        on_node: set[tuple[str, str]] = {
+            (p.metadata.namespace, p.metadata.name) for p in pods
+        }
+        try:
+            resp = self.core.list_event_for_all_namespaces(
+                field_selector="reason=Started",
+                _request_timeout=(10, 30),
+            )
+            events = resp.items or []
+        except Exception as e:  # noqa: BLE001
+            self.sink.write("node_container_starts_events_error",
+                            {"error": str(e)[:200]})
+            return out
+        seen: set[tuple[str, str, str]] = set()
+        for ev in events:
+            io = getattr(ev, "involved_object", None)
+            if io is None or (io.kind and io.kind != "Pod"):
+                continue
+            key_pod = (io.namespace, io.name)
+            if key_pod not in on_node:
+                continue
+            ts = _parse_k8s_time(
+                getattr(ev, "event_time", None)
+                or getattr(ev, "last_timestamp", None)
+                or getattr(ev, "first_timestamp", None)
+            )
+            if not ts or ts < window_start or ts > window_end:
+                continue
+            field_path = ""
+            if getattr(ev, "involved_object", None) is not None:
+                field_path = getattr(ev.involved_object, "field_path", "") or ""
+            cm = re.search(r"\{([^}]+)\}", field_path)
+            if not cm:
+                continue
+            container = cm.group(1)
+            is_init = "initContainers" in field_path
+            key = (io.namespace, io.name, container)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({
+                "namespace": io.namespace,
+                "pod": io.name,
+                "container": container,
+                "init": is_init,
+                "t_started": ts,
+            })
+        out.sort(key=lambda e: e["t_started"])
+        self.sink.write("node_container_starts_collected",
+                        {"node": node_name, "count": len(out)})
+        return out
+
 
     def collect_pod_logs(
         self,

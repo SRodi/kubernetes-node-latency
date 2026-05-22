@@ -1,4 +1,24 @@
-from src.image_family import classify, parse_pull_duration, DEFAULT_FAMILY
+from src.image_family import classify, parse_pull_duration, DEFAULT_FAMILY, image_basename
+
+
+def test_image_basename_strips_registry_and_repo():
+    assert image_basename(
+        "mcr.microsoft.com/oss/v2/containernetworking/azure-cns:v1.7.16-0"
+    ) == "azure-cns:v1.7.16-0"
+    assert image_basename(
+        "quay.io/cilium/cilium-distroless:v1.18.9-260508"
+    ) == "cilium-distroless:v1.18.9-260508"
+    assert image_basename("registry.k8s.io/pause:3.9") == "pause:3.9"
+    # Digest-only ref -> drop digest entirely (no tag to preserve).
+    assert image_basename("gke.gcr.io/anetd@sha256:abcdef0123") == "anetd"
+    # Tag + digest -> keep the tag, drop the digest.
+    assert image_basename("foo/bar:v1.2.3@sha256:abc") == "bar:v1.2.3"
+    # No slash -> unchanged (minus any digest).
+    assert image_basename("nginx:latest") == "nginx:latest"
+    assert image_basename("nginx@sha256:deadbeef") == "nginx"
+    # Empty / None tolerant.
+    assert image_basename("") == ""
+    assert image_basename(None) == ""
 
 
 def test_classify_cilium_variants():
@@ -15,11 +35,29 @@ def test_classify_aks_components():
     assert classify("mcr.microsoft.com/oss/kubernetes/azure-ip-masq-agent:v2.10") == "azure-cni"
 
 
-def test_classify_csi_azure():
-    assert classify("mcr.microsoft.com/oss/kubernetes-csi/azuredisk-csi:v1.30.3") == "csi-azure"
-    assert classify("mcr.microsoft.com/oss/kubernetes-csi/azurefile-csi:v1.30.3") == "csi-azure"
-    assert classify("mcr.microsoft.com/oss/kubernetes-csi/csi-node-driver-registrar:v2.12.0") == "csi-azure"
-    assert classify("mcr.microsoft.com/oss/kubernetes-csi/livenessprobe:v2.13.0") == "csi-azure"
+def test_classify_csi():
+    # Azure CSI variants
+    assert classify("mcr.microsoft.com/oss/kubernetes-csi/azuredisk-csi:v1.30.3") == "csi"
+    assert classify("mcr.microsoft.com/oss/kubernetes-csi/azurefile-csi:v1.30.3") == "csi"
+    # Upstream cloud-agnostic sidecars (used by every cloud's CSI drivers)
+    assert classify("mcr.microsoft.com/oss/kubernetes-csi/csi-node-driver-registrar:v2.12.0") == "csi"
+    assert classify("mcr.microsoft.com/oss/kubernetes-csi/livenessprobe:v2.13.0") == "csi"
+    # GKE CSI drivers — previously misclassified as `csi-azure`/`other`
+    assert classify(
+        "europe-west1-artifactregistry.gcr.io/gke-release/gke-release/csi-node-driver-registrar:v2.15.0-gke.20"
+    ) == "csi"
+    assert classify(
+        "europe-west1-artifactregistry.gcr.io/gke-release/gke-release/gcp-compute-persistent-disk-csi-driver:v1.23.1-gke.8"
+    ) == "csi"
+    assert classify(
+        "europe-west1-artifactregistry.gcr.io/gke-release/gke-release/gcs-fuse-csi-driver:v1.22.9-gke.3"
+    ) == "csi"
+    assert classify(
+        "europe-west1-artifactregistry.gcr.io/gke-release/gke-release/gcp-filestore-csi-driver:v1.12.2-gke.0"
+    ) == "csi"
+    assert classify(
+        "europe-west1-artifactregistry.gcr.io/gke-release/gke-release/parallelstore-csi-driver:v0.2.10-gke.8"
+    ) == "csi"
 
 
 def test_classify_misc():

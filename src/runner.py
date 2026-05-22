@@ -173,6 +173,7 @@ def run_iterations(cfg: Config, handle: ClusterHandle, provider: ClusterProvider
                         rec.T_image_pull_start = lc.get("T_image_pull_start")
                         rec.T_image_pulled = lc.get("T_image_pulled")
                         rec.init_containers = lc.get("init_containers") or None
+                        rec.pod_events = lc.get("events") or None
                     except Exception as e:  # noqa: BLE001
                         log.warning("pod-lifecycle enrichment failed for iter %d: %s", i, e)
                 else:
@@ -235,6 +236,9 @@ def run_iterations(cfg: Config, handle: ClusterHandle, provider: ClusterProvider
                             rec.node_image_pulls = _coll.collect_node_image_pulls(
                                 rec.node_name, win_start, win_end,
                                 trigger_pattern=cfg.trigger_pod.image,
+                            ) or None
+                            rec.node_container_starts = _coll.collect_node_container_starts(
+                                rec.node_name, win_start, win_end,
                             ) or None
                     except Exception as e:  # noqa: BLE001
                         log.warning("node image-pull capture failed for iter %d: %s", i, e)
