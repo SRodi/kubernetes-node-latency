@@ -130,10 +130,19 @@ def _cmd_plot(args: argparse.Namespace) -> int:
     else:
         print("must provide results_dir or --last N", file=sys.stderr)
         return 2
+    containers_filter: set[str] | None = None
+    if args.containers:
+        containers_filter = {c.strip() for c in args.containers.split(",") if c.strip()}
+    pods_filter: set[str] | None = None
+    if args.pods:
+        pods_filter = {p.strip() for p in args.pods.split(",") if p.strip()}
     all_paths: list[Path] = []
     for run_dir in run_dirs:
         paths = plot_all(run_dir / "iterations.csv", run_dir / "plots",
-                         iteration=args.iteration)
+                         iteration=args.iteration,
+                         containers_filter=containers_filter,
+                         pods_filter=pods_filter,
+                         filter_out_suffix=args.out_suffix)
         print(f"wrote ({run_dir.name}):")
         for p in paths:
             print(f"  {p}")
@@ -249,6 +258,18 @@ def main(argv: list[str] | None = None) -> int:
                     help="profile a single iteration (1-indexed) from the run; "
                          "emits only phase_profile_iter-NNN.png and skips "
                          "aggregate / compare plots")
+    pp.add_argument("--containers", default=None,
+                    help="comma-separated container names to keep "
+                         "(e.g. 'cilium-agent,azure-cns'); other lanes are dropped. "
+                         "Filtered output is written to phase_profile_filtered.png "
+                         "(or phase_profile_<suffix>.png with --out-suffix).")
+    pp.add_argument("--pods", default=None,
+                    help="comma-separated pod basenames to keep "
+                         "(e.g. 'cilium,azure-cns'); other lanes are dropped. "
+                         "Composes with --containers (intersection).")
+    pp.add_argument("--out-suffix", default=None,
+                    help="custom suffix for filtered phase_profile output "
+                         "(default: 'filtered' when --containers/--pods is set)")
     pp.set_defaults(func=_cmd_plot)
 
     pc = sub.add_parser("clean", help="remove all run dirs under results/")

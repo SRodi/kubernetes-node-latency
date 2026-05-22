@@ -96,7 +96,10 @@ def _ok(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def plot_all(iterations_csv: Path, out_dir: Path, *, title: str = "",
-             iteration: int | None = None) -> list[Path]:
+             iteration: int | None = None,
+             containers_filter: set[str] | None = None,
+             pods_filter: set[str] | None = None,
+             filter_out_suffix: str | None = None) -> list[Path]:
     """Generate plots for a run.
 
     When `iteration` is given (1-indexed), only the phase-profile chart is
@@ -137,8 +140,18 @@ def plot_all(iterations_csv: Path, out_dir: Path, *, title: str = "",
                 title = f"({prov}) iter {iteration}"
             else:
                 title = f"iter {iteration}"
+        # When a filter is active and no explicit suffix was given,
+        # write to `phase_profile_iter-NNN_filtered.png` to avoid
+        # overwriting the canonical full chart.
+        if containers_filter or pods_filter:
+            sfx = filter_out_suffix or "filtered"
+            fn = f"phase_profile_iter-{iteration:03d}_{sfx}.png"
+        else:
+            fn = f"phase_profile_iter-{iteration:03d}.png"
         p = _plot_phase_profile(ok_iter, out_dir, title=title,
-                                filename=f"phase_profile_iter-{iteration:03d}.png")
+                                filename=fn,
+                                containers_filter=containers_filter,
+                                pods_filter=pods_filter)
         if p is not None:
             paths.append(p)
         return paths
@@ -278,7 +291,14 @@ def plot_all(iterations_csv: Path, out_dir: Path, *, title: str = "",
     # 6. profile / Gantt: each phase as a swimlane on a shared time axis so the
     #    reader can see at a glance which lifecycle steps overlap in time
     #    (vertically stacked = parallel) and which are sequential.
-    p = _plot_phase_profile(ok, out_dir, title=title)
+    if containers_filter or pods_filter:
+        sfx = filter_out_suffix or "filtered"
+        fn = f"phase_profile_{sfx}.png"
+    else:
+        fn = "phase_profile.png"
+    p = _plot_phase_profile(ok, out_dir, title=title, filename=fn,
+                            containers_filter=containers_filter,
+                            pods_filter=pods_filter)
     if p is not None:
         paths.append(p)
 
@@ -286,8 +306,24 @@ def plot_all(iterations_csv: Path, out_dir: Path, *, title: str = "",
 
 
 def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
-                        filename: str = "phase_profile.png") -> Path | None:
-    """Per-run mean-aligned Gantt of every captured phase."""
+                        filename: str = "phase_profile.png",
+                        containers_filter: set[str] | None = None,
+                        pods_filter: set[str] | None = None) -> Path | None:
+    """Per-run mean-aligned Gantt of every captured phase.
+
+    Optional filters narrow the chart to specific containers / pods:
+
+    * ``containers_filter`` — set of container names. Lanes survive iff
+      their associated container is in this set (looked up via the
+      pull/create/run side-maps). Gap-fill ``runtime wait`` lanes
+      survive iff their pod has at least one other surviving lane.
+    * ``pods_filter`` — set of pod basenames (e.g. ``"azure-cns"``,
+      ``"cilium"``). Lanes survive iff their pod basename is in this
+      set.
+
+    Both filters compose (intersection). When neither is set, all
+    lanes are kept (default behavior).
+    """
     if ok.empty:
         return None
 
@@ -947,6 +983,79 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
                 create_label_to_pod[label] = pk
                 all_lanes.append((label, cursor, s, "kubelet_wait"))
             cursor = max(cursor, e)
+
+    # ---- Apply --containers / --pods filter ----
+    # When the caller passed a container or pod whitelist, prune
+    # all_lanes to lanes that match. Gap-fill `runtime wait` lanes
+    # survive iff their pod has at least one other surviving lane
+    # (otherwise they'd float alone, attributing time to a pod that
+    # was entirely removed from the chart). T-marker vertical lines
+    # are drawn later from `_mean_offset()` directly and are NOT
+    # affected by this filter — they remain global timeline anchors.
+    if containers_filter or pods_filter:
+        _CILIUM_LIFECYCLE_ACTORS_FILTER = {
+            "image_pull", "cni", "cilium", "kubelet_main",
+            "cilium_regen", "init_run",
+        }
+
+        def _lane_container_f(lbl: str, actor: str) -> str | None:
+            if isinstance(actor, str) and actor.startswith("pull:"):
+                return pull_label_to_container.get(lbl)
+            if actor == "init_run":
+                return (create_label_to_container.get(lbl)
+                        or run_label_to_container.get(lbl))
+            return None
+
+        def _lane_pod_base_f(lbl: str, actor: str) -> str | None:
+            pk = None
+            if isinstance(actor, str) and actor.startswith("pull:"):
+                pk = pull_label_to_pod.get(lbl)
+            elif actor in ("init_run", "kubelet_wait"):
+                pk = (create_label_to_pod.get(lbl)
+                      or run_label_to_pod.get(lbl))
+            if pk is None and actor in _CILIUM_LIFECYCLE_ACTORS_FILTER:
+                pk = cilium_pod_key
+            if not pk:
+                return None
+            return pk.split("/")[-1]
+
+        _filter_pass1: list[tuple[str, float, float, str]] = []
+        for lane in all_lanes:
+            lbl, _s, _e, actor = lane
+            if actor == "kubelet_wait":
+                _filter_pass1.append(lane)
+                continue
+            c = _lane_container_f(lbl, actor)
+            p = _lane_pod_base_f(lbl, actor)
+            keep = True
+            if containers_filter:
+                keep = keep and (c in containers_filter)
+            if pods_filter:
+                keep = keep and (p in pods_filter)
+            if keep:
+                _filter_pass1.append(lane)
+
+        _surviving_pods: set[str] = set()
+        for lbl, _s, _e, actor in _filter_pass1:
+            if actor == "kubelet_wait":
+                continue
+            p = _lane_pod_base_f(lbl, actor)
+            if p:
+                _surviving_pods.add(p)
+
+        all_lanes = [
+            lane for lane in _filter_pass1
+            if lane[3] != "kubelet_wait"
+            or _lane_pod_base_f(lane[0], lane[3]) in _surviving_pods
+        ]
+
+        if not all_lanes:
+            print(
+                f"phase_profile filter matched no lanes: "
+                f"containers={sorted(containers_filter or [])} "
+                f"pods={sorted(pods_filter or [])}"
+            )
+            return None
 
     # Layout: main wall-clock Gantt on top, plus optional zoomed subplots
     # (CNI add\u2192Ready decomposition, Cilium-internal bootstrap).
