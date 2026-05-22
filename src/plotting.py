@@ -620,7 +620,20 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
             ordered = sorted(ic_offsets, key=lambda r: r[1])
             for i, (name, s_rel, e_rel) in enumerate(ordered):
                 if i + 1 < len(ordered):
-                    end_rel = ordered[i + 1][1]
+                    next_name = ordered[i + 1][0]
+                    next_started = ordered[i + 1][1]
+                    # Prefer next container's Created event as the end
+                    # of this run lane (kubelet emits Created(N+1) only
+                    # after N has exited), so the `create:<next>` lane
+                    # — which spans [Created, Started] — doesn't visually
+                    # overlap with this run bar.
+                    nc_matches = [v for k, v in creates_lookup.items()
+                                  if k[2] == next_name]
+                    next_created = nc_matches[0] if len(nc_matches) == 1 else None
+                    end_rel = next_created if (next_created is not None
+                                                and next_created <= next_started
+                                                and next_created > s_rel) \
+                              else next_started
                 else:
                     end_rel = max(e_rel, chain_end)
                 end_rel = min(end_rel, chain_end)
@@ -654,7 +667,19 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
             n = len(container_starts)
             for i, (cname, is_init, s_off) in enumerate(container_starts):
                 if i + 1 < n:
-                    e_off = container_starts[i + 1][2]
+                    next_cname = container_starts[i + 1][0]
+                    next_started = container_starts[i + 1][2]
+                    # Prefer the next container's Created event as our
+                    # end: kubelet only emits Created(N+1) after N has
+                    # exited, so using next_started here would visually
+                    # overlap this run lane with the `create:<next>`
+                    # lane (which spans [Created, Started] of N+1).
+                    next_created = creates_lookup.get(
+                        (ns or "", base or "", next_cname))
+                    e_off = next_created if (next_created is not None
+                                              and next_created <= next_started
+                                              and next_created > s_off) \
+                            else next_started
                 else:
                     # Last container in the pod: give it a short visible
                     # window. Init containers without a successor usually
