@@ -105,6 +105,28 @@ class IterationRecord:
     # their full init-container chain in the main chart.
     node_container_starts: list[dict] | None = None
 
+    # Per-container `reason=Created` kubelet events on the new node.
+    # Populated by `Collector.collect_node_container_creates`. Each dict:
+    #   {namespace, pod, container, init: bool, t_created: datetime}
+    # Renders as `create:<container>` sliver lanes between pull and run,
+    # closing the CRI `CreateContainer` gap (typically 0.5-3 s).
+    node_container_creates: list[dict] | None = None
+
+    # All other kubelet events (any reason) for pods on the new node
+    # within the iteration window. Populated by
+    # `Collector.collect_node_pod_events`. Each dict:
+    #   {namespace, pod, container, init: bool, reason, ts, message}
+    # Captures SuccessfulMountVolume / SandboxChanged / NetworkNotReady
+    # / FailedMount / BackOff / etc. — surfaces what kubelet is doing
+    # during otherwise-blank gaps between Pulled and Created.
+    node_pod_events: list[dict] | None = None
+
+    # Pod-level lifecycle scalars (creationTimestamp + status.startTime
+    # + status.conditions[].lastTransitionTime) for every pod on the
+    # new node. Populated by `Collector.collect_node_pod_status`. Each
+    # dict: {namespace, pod, creation_ts, start_ts, conditions: {type: ts}}
+    node_pod_status: list[dict] | None = None
+
     # Log capture summary from `Collector.collect_pod_logs` (None when
     # capture_logs="none"). Shape:
     #   {pods: int, containers: int, bytes: int, errors: int,
@@ -357,6 +379,62 @@ class IterationRecord:
                 })
             ncs_serial = _json.dumps(slim_starts, separators=(",", ":"))
         row["node_container_starts_json"] = ncs_serial
+        # Per-container Created events on the new node — used to render
+        # `create:<container>` slivers between pull and run, closing the
+        # CRI CreateContainer gap (Pulled → Created → Started).
+        ncc_serial: str | None = None
+        if self.node_container_creates:
+            slim_creates = []
+            for s in self.node_container_creates:
+                ts = s.get("t_created")
+                slim_creates.append({
+                    "namespace": s.get("namespace"),
+                    "pod": s.get("pod"),
+                    "container": s.get("container"),
+                    "init": bool(s.get("init", False)),
+                    "t_created": iso(ts) if isinstance(ts, datetime) else ts,
+                })
+            ncc_serial = _json.dumps(slim_creates, separators=(",", ":"))
+        row["node_container_creates_json"] = ncc_serial
+        # All-reason kubelet events for pods on the new node — explains
+        # what kubelet was doing during otherwise-blank gaps.
+        npe_serial: str | None = None
+        if self.node_pod_events:
+            slim_events = []
+            for e in self.node_pod_events:
+                ts = e.get("ts")
+                slim_events.append({
+                    "namespace": e.get("namespace"),
+                    "pod": e.get("pod"),
+                    "container": e.get("container") or None,
+                    "init": bool(e.get("init", False)),
+                    "reason": e.get("reason"),
+                    "ts": iso(ts) if isinstance(ts, datetime) else ts,
+                    "message": (e.get("message") or "")[:300] or None,
+                })
+            npe_serial = _json.dumps(slim_events, separators=(",", ":"))
+        row["node_pod_events_json"] = npe_serial
+        # Pod-level lifecycle scalars (creationTimestamp + startTime +
+        # conditions) for every pod on the new node.
+        nps_serial: str | None = None
+        if self.node_pod_status:
+            slim_status = []
+            for s in self.node_pod_status:
+                conds_raw = s.get("conditions") or {}
+                conds = {
+                    k: (iso(v) if isinstance(v, datetime) else v)
+                    for k, v in conds_raw.items()
+                }
+                ct = s.get("creation_ts"); stt = s.get("start_ts")
+                slim_status.append({
+                    "namespace": s.get("namespace"),
+                    "pod": s.get("pod"),
+                    "creation_ts": iso(ct) if isinstance(ct, datetime) else ct,
+                    "start_ts": iso(stt) if isinstance(stt, datetime) else stt,
+                    "conditions": conds,
+                })
+            nps_serial = _json.dumps(slim_status, separators=(",", ":"))
+        row["node_pod_status_json"] = nps_serial
         # Log capture summary scalars (None when capture disabled).
         if self.log_capture:
             row["log_capture_pods"] = self.log_capture.get("pods")

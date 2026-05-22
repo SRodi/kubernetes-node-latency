@@ -240,8 +240,35 @@ def run_iterations(cfg: Config, handle: ClusterHandle, provider: ClusterProvider
                             rec.node_container_starts = _coll.collect_node_container_starts(
                                 rec.node_name, win_start, win_end,
                             ) or None
+                            rec.node_container_creates = _coll.collect_node_container_creates(
+                                rec.node_name, win_start, win_end,
+                            ) or None
+                            rec.node_pod_events = _coll.collect_node_pod_events(
+                                rec.node_name, win_start, win_end,
+                            ) or None
+                            rec.node_pod_status = _coll.collect_node_pod_status(
+                                rec.node_name,
+                            ) or None
                     except Exception as e:  # noqa: BLE001
                         log.warning("node image-pull capture failed for iter %d: %s", i, e)
+                # Cluster-manifest snapshot — one-shot per run, fired
+                # on the FIRST iteration once we have a fresh node so the
+                # kubelet configz endpoint is reachable. Captures kubelet
+                # effective config (the authoritative source of
+                # serializeImagePulls / maxParallelImagePulls), all
+                # DaemonSets in kube-system, and key ConfigMaps. Best
+                # effort; never breaks the run.
+                if (i == 1 and rec.node_name
+                        and not getattr(run_iterations, "_snapshot_done", False)):
+                    try:
+                        from . import cluster_snapshot as _cs
+                        apps_api = client.AppsV1Api(core.api_client)
+                        _cs.snapshot(core, apps_api,
+                                     node=rec.node_name,
+                                     out_dir=run_dir / "cluster_manifests")
+                        setattr(run_iterations, "_snapshot_done", True)
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("cluster manifest snapshot failed: %s", e)
                 # Pod-log capture (opt-in via --capture-logs). Bounded to the
                 # iteration window so we don't drag in unrelated history.
                 if (getattr(cfg, "capture_logs", "none") == "minimal"
