@@ -623,13 +623,36 @@ class Collector:
                 if "pull" in msg.lower() or "ErrImagePull" in msg or "ImagePullBackOff" in msg:
                     entry["failed"] = True
 
-        # Backfill duration_s from wall-clock delta when message parsing missed.
+        # Post-process each grouped (pod, image) entry:
+        #   * Backfill duration_s from wall-clock delta when message
+        #     parsing missed (no "Successfully pulled ... in Xs" suffix,
+        #     e.g. cache-hit "already present on machine" events).
+        #   * When we have a real Pulling event AND a parsed duration_s
+        #     from the kubelet's Pulled message, prefer the derived
+        #     `t_pulling + duration_s` as the end of the pull window.
+        #     Kubelet emits one Pulled event per (container, image)
+        #     reference: when N init containers in the same pod share an
+        #     image, the first emits a "Successfully pulled ... in Xs"
+        #     event (the real download) and the rest emit cache-hit
+        #     "already present on machine" Pulled events as each init
+        #     starts. Grouping by (pod, image) and taking max(Pulled)
+        #     inflates t_pulled to the LAST init's start, making the
+        #     image-pull lane visually overlap subsequent run:<init>
+        #     lanes even though the image was actually ready long
+        #     before. Reconstructing t_pulled from duration_s closes
+        #     this gap (precision: 1s, limited by event resolution).
+        from datetime import timedelta as _td
         for entry in grouped.values():
             if (entry["duration_s"] is None
                     and entry["t_pulling"] is not None
                     and entry["t_pulled"] is not None):
                 entry["duration_s"] = max(
                     (entry["t_pulled"] - entry["t_pulling"]).total_seconds(), 0.0)
+            if (entry["t_pulling"] is not None
+                    and isinstance(entry["duration_s"], (int, float))):
+                derived = entry["t_pulling"] + _td(seconds=float(entry["duration_s"]))
+                if entry["t_pulled"] is None or derived < entry["t_pulled"]:
+                    entry["t_pulled"] = derived
             entry["family"] = classify(entry["image"], extra_trigger_pattern=trigger_pattern)
             out.append(entry)
 
@@ -723,6 +746,233 @@ class Collector:
             })
         out.sort(key=lambda e: e["t_started"])
         self.sink.write("node_container_starts_collected",
+                        {"node": node_name, "count": len(out)})
+        return out
+
+    def collect_node_container_creates(
+        self,
+        node_name: str,
+        window_start: datetime,
+        window_end: datetime,
+    ) -> list[dict]:
+        """List every kubelet ``reason=Created`` event for containers on
+        ``node_name`` within ``[window_start, window_end]``.
+
+        Kubelet emits three events per container in order:
+
+            1. ``Pulled``   image available locally
+            2. ``Created``  CRI runtime ``CreateContainer`` returned
+            3. ``Started``  CRI runtime ``StartContainer`` returned
+
+        Without (2) the phase profile shows an unexplained gap between
+        the pull lane and the run lane equal to the CRI ``CreateContainer``
+        duration (typically 0.5-3 s on AKS, longer on a fresh-extracted
+        layer). Capturing ``Created`` lets the plotter render a
+        ``create:<container>`` sliver that closes that gap and attributes
+        it to the runtime.
+
+        Returns a list of dicts; never raises. Each entry::
+
+            {namespace, pod, container, init, t_created}
+        """
+        out: list[dict] = []
+        try:
+            pods = self.core.list_pod_for_all_namespaces(
+                field_selector=f"spec.nodeName={node_name}",
+                _request_timeout=(10, 30),
+            ).items
+        except Exception as e:  # noqa: BLE001
+            self.sink.write("node_container_creates_pods_error",
+                            {"node": node_name, "error": str(e)[:200]})
+            return out
+        on_node: set[tuple[str, str]] = {
+            (p.metadata.namespace, p.metadata.name) for p in pods
+        }
+        try:
+            resp = self.core.list_event_for_all_namespaces(
+                field_selector="reason=Created",
+                _request_timeout=(10, 30),
+            )
+            events = resp.items or []
+        except Exception as e:  # noqa: BLE001
+            self.sink.write("node_container_creates_events_error",
+                            {"error": str(e)[:200]})
+            return out
+        seen: set[tuple[str, str, str]] = set()
+        for ev in events:
+            io = getattr(ev, "involved_object", None)
+            if io is None or (io.kind and io.kind != "Pod"):
+                continue
+            key_pod = (io.namespace, io.name)
+            if key_pod not in on_node:
+                continue
+            ts = _parse_k8s_time(
+                getattr(ev, "event_time", None)
+                or getattr(ev, "last_timestamp", None)
+                or getattr(ev, "first_timestamp", None)
+            )
+            if not ts or ts < window_start or ts > window_end:
+                continue
+            field_path = ""
+            if getattr(ev, "involved_object", None) is not None:
+                field_path = getattr(ev.involved_object, "field_path", "") or ""
+            cm = re.search(r"\{([^}]+)\}", field_path)
+            if not cm:
+                continue
+            container = cm.group(1)
+            is_init = "initContainers" in field_path
+            key = (io.namespace, io.name, container)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({
+                "namespace": io.namespace,
+                "pod": io.name,
+                "container": container,
+                "init": is_init,
+                "t_created": ts,
+            })
+        out.sort(key=lambda e: e["t_created"])
+        self.sink.write("node_container_creates_collected",
+                        {"node": node_name, "count": len(out)})
+        return out
+
+    def collect_node_pod_events(
+        self,
+        node_name: str,
+        window_start: datetime,
+        window_end: datetime,
+    ) -> list[dict]:
+        """List **all** kubelet events for pods on ``node_name`` within
+        ``[window_start, window_end]`` — not just Pulling/Pulled/Created/
+        Started.
+
+        This is the catch-all that surfaces every other ``reason`` value
+        kubelet emits during pod startup, e.g. ``SuccessfulMountVolume``,
+        ``SandboxChanged``, ``FailedMount``, ``NetworkNotReady``,
+        ``FailedCreatePodSandBox``, ``BackOff``, ``Killing``,
+        ``Unhealthy``, etc. The phase-profile renderer uses these to
+        explain otherwise-blank gaps between ``Pulled`` and ``Created``.
+
+        Returns a list of dicts (never raises). Each entry::
+
+            {namespace, pod, container, init, reason, ts, message}
+
+        ``container`` and ``init`` are populated when the event's
+        ``field_path`` references a container; otherwise both are
+        empty/False (pod-level event such as ``Scheduled``,
+        ``SuccessfulMountVolume``).
+        """
+        out: list[dict] = []
+        try:
+            pods = self.core.list_pod_for_all_namespaces(
+                field_selector=f"spec.nodeName={node_name}",
+                _request_timeout=(10, 30),
+            ).items
+        except Exception as e:  # noqa: BLE001
+            self.sink.write("node_pod_events_pods_error",
+                            {"node": node_name, "error": str(e)[:200]})
+            return out
+        on_node: set[tuple[str, str]] = {
+            (p.metadata.namespace, p.metadata.name) for p in pods
+        }
+        # No field-selector filter on reason — we want every kubelet-
+        # emitted event for these pods. Fetch all events and filter
+        # client-side by involvedObject.kind=Pod + namespace/name match.
+        try:
+            resp = self.core.list_event_for_all_namespaces(
+                _request_timeout=(10, 60),
+            )
+            events = resp.items or []
+        except Exception as e:  # noqa: BLE001
+            self.sink.write("node_pod_events_error", {"error": str(e)[:200]})
+            return out
+        for ev in events:
+            io = getattr(ev, "involved_object", None)
+            if io is None or (io.kind and io.kind != "Pod"):
+                continue
+            key_pod = (io.namespace, io.name)
+            if key_pod not in on_node:
+                continue
+            ts = _parse_k8s_time(
+                getattr(ev, "event_time", None)
+                or getattr(ev, "last_timestamp", None)
+                or getattr(ev, "first_timestamp", None)
+            )
+            if not ts or ts < window_start or ts > window_end:
+                continue
+            reason = getattr(ev, "reason", "") or ""
+            field_path = getattr(io, "field_path", "") or ""
+            container = ""
+            is_init = False
+            cm = re.search(r"\{([^}]+)\}", field_path)
+            if cm:
+                container = cm.group(1)
+                is_init = "initContainers" in field_path
+            msg = (getattr(ev, "message", "") or "")[:400]
+            out.append({
+                "namespace": io.namespace,
+                "pod": io.name,
+                "container": container,
+                "init": is_init,
+                "reason": reason,
+                "ts": ts,
+                "message": msg,
+            })
+        out.sort(key=lambda e: e["ts"])
+        # Tag distinct reasons for quick triage.
+        by_reason: dict[str, int] = {}
+        for e in out:
+            by_reason[e["reason"]] = by_reason.get(e["reason"], 0) + 1
+        self.sink.write("node_pod_events_collected",
+                        {"node": node_name, "count": len(out),
+                         "by_reason": by_reason})
+        return out
+
+    def collect_node_pod_status(
+        self,
+        node_name: str,
+    ) -> list[dict]:
+        """Snapshot pod-level lifecycle scalars for every pod on
+        ``node_name``: creationTimestamp, status.startTime, and the
+        lastTransitionTime of each status.condition (PodScheduled,
+        Initialized, ContainersReady, Ready).
+
+        Together with ``collect_node_pod_events`` these scalars let the
+        phase-profile renderer reconstruct the kubelet's view of each
+        pod's lifecycle and identify which kubelet-internal phase
+        owns an otherwise-blank gap.
+
+        Returns a list of dicts (never raises). Each entry::
+
+            {namespace, pod, creation_ts, start_ts,
+             conditions: {<type>: <last_transition_ts>}}
+        """
+        out: list[dict] = []
+        try:
+            pods = self.core.list_pod_for_all_namespaces(
+                field_selector=f"spec.nodeName={node_name}",
+                _request_timeout=(10, 30),
+            ).items
+        except Exception as e:  # noqa: BLE001
+            self.sink.write("node_pod_status_pods_error",
+                            {"node": node_name, "error": str(e)[:200]})
+            return out
+        for p in pods:
+            md = p.metadata
+            st = p.status
+            conds: dict[str, datetime | None] = {}
+            for c in (getattr(st, "conditions", None) or []):
+                t = _parse_k8s_time(getattr(c, "last_transition_time", None))
+                conds[c.type] = t
+            out.append({
+                "namespace": md.namespace,
+                "pod": md.name,
+                "creation_ts": _parse_k8s_time(md.creation_timestamp),
+                "start_ts": _parse_k8s_time(getattr(st, "start_time", None)),
+                "conditions": conds,
+            })
+        self.sink.write("node_pod_status_collected",
                         {"node": node_name, "count": len(out)})
         return out
 
