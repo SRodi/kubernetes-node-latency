@@ -95,6 +95,16 @@ class IterationRecord:
     #    duration_s: float|None, failed: bool}
     node_image_pulls: list[dict] | None = None
 
+    # Per-container `reason=Started` kubelet events observed on the new
+    # node within the iteration window. Populated by
+    # `Collector.collect_node_container_starts`; None when capture was
+    # disabled or the call failed. Each dict:
+    #   {namespace, pod, container, init: bool, t_started: datetime}
+    # Used by plotting to derive `run:<container>` lanes for every pod
+    # on the new node (not just the cilium agent), so CNS/CSI/etc. show
+    # their full init-container chain in the main chart.
+    node_container_starts: list[dict] | None = None
+
     # Log capture summary from `Collector.collect_pod_logs` (None when
     # capture_logs="none"). Shape:
     #   {pods: int, containers: int, bytes: int, errors: int,
@@ -331,6 +341,22 @@ class IterationRecord:
         row["image_pulls_count"] = nip_count
         row["image_pulls_critical_s"] = nip_critical_s
         row["image_pulls_total_s"] = nip_total_s
+        # Per-container Started events on the new node — used by plotting
+        # to derive `run:<container>` lanes for every pod (not just cilium).
+        ncs_serial: str | None = None
+        if self.node_container_starts:
+            slim_starts = []
+            for s in self.node_container_starts:
+                ts = s.get("t_started")
+                slim_starts.append({
+                    "namespace": s.get("namespace"),
+                    "pod": s.get("pod"),
+                    "container": s.get("container"),
+                    "init": bool(s.get("init", False)),
+                    "t_started": iso(ts) if isinstance(ts, datetime) else ts,
+                })
+            ncs_serial = _json.dumps(slim_starts, separators=(",", ":"))
+        row["node_container_starts_json"] = ncs_serial
         # Log capture summary scalars (None when capture disabled).
         if self.log_capture:
             row["log_capture_pods"] = self.log_capture.get("pods")

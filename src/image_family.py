@@ -26,7 +26,11 @@ FAMILY_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         r"(?:^|/)operator-generic(?:[:@]|$)",
         re.I)),
     # Azure CNS (Container Networking Service — pod IPAM daemon).
-    ("cns", re.compile(r"azure-cns|aks/cns", re.I)),
+    # azure-ipam ships in the same DaemonSet pod (cni-installer container)
+    # and is part of the same critical CNS wiring path, so we route it to
+    # the `cns` family rather than `other` to keep both visible in the
+    # main chart and grouped under the azure-cns pod box.
+    ("cns", re.compile(r"azure-cns|azure-ipam|aks/cns", re.I)),
     # Azure CNI plugin (different from CNS) and ip-masq-agent / npm.
     ("azure-cni", re.compile(r"azure-(?:cni|ip-masq|npm)", re.I)),
     # CSI drivers + upstream sidecars. Covers Azure (azuredisk/azurefile/
