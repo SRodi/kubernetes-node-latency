@@ -3,7 +3,7 @@ image-pull analysis.
 
 The harness captures every `Pulling`/`Pulled` Event on a fresh node and
 classifies each image into a small fixed taxonomy (cilium / cns /
-azure-cni / csi-azure / dns / konnectivity / kube-proxy / metrics /
+azure-cni / csi / dns / konnectivity / kube-proxy / metrics /
 trigger / other). Families are matched in declaration order so the
 first match wins; the catch-all `other` ensures every image gets a
 family.
@@ -29,12 +29,18 @@ FAMILY_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("cns", re.compile(r"azure-cns|aks/cns", re.I)),
     # Azure CNI plugin (different from CNS) and ip-masq-agent / npm.
     ("azure-cni", re.compile(r"azure-(?:cni|ip-masq|npm)", re.I)),
-    # CSI drivers + sidecars on Azure (disk/file/blob). Kept as one family
-    # because they tend to all land on a fresh node together. Patterns
-    # cover both orderings (`csi-azuredisk-...` and `azuredisk-csi-...`).
-    ("csi-azure", re.compile(
+    # CSI drivers + upstream sidecars. Covers Azure (azuredisk/azurefile/
+    # blob), GCP (gcp-compute-persistent-disk-csi-driver, gcs-fuse,
+    # filestore, parallelstore), AWS (ebs-csi), and the cloud-agnostic
+    # upstream sidecars (csi-node-driver-registrar, csi-attacher, etc.)
+    # that all CSI drivers ship together. They tend to land on a fresh
+    # node together so a single family keeps the chart legible.
+    ("csi", re.compile(
         r"(?:csi-[a-z-]*(?:azuredisk|azurefile|blob)|"
         r"(?:azuredisk|azurefile|blob)-csi)|"
+        r"gcp-compute-persistent-disk-csi-driver|"
+        r"gcs-fuse-csi-driver|gcp-filestore-csi-driver|parallelstore-csi-driver|"
+        r"(?:^|/)ebs-csi(?:[-/:]|$)|aws-ebs-csi-driver|"
         r"csi-(?:attacher|provisioner|resizer|snapshotter|node-driver-registrar)|"
         r"livenessprobe", re.I)),
     # Cluster DNS (CoreDNS + node-local-dns).
@@ -66,7 +72,7 @@ FAMILY_COLORS: dict[str, str] = {
     "cilium":       "#34a853",
     "cns":          "#4285f4",
     "azure-cni":    "#fb8c00",
-    "csi-azure":    "#a855f7",
+    "csi":          "#a855f7",
     "dns":          "#ea4335",
     "konnectivity": "#06b6d4",
     "kube-proxy":   "#fbbf24",
@@ -96,6 +102,47 @@ def classify(image_ref: str, *, extra_trigger_pattern: str | None = None) -> str
         if pat.search(image_ref):
             return family
     return DEFAULT_FAMILY
+
+
+def image_basename(ref: str) -> str:
+    """Strip the registry / repo path AND any digest so only the image name
+    (+ tag, when present) remains.
+
+    Examples:
+      mcr.microsoft.com/oss/v2/containernetworking/azure-cns:v1.7.16-0
+        -> azure-cns:v1.7.16-0
+      quay.io/cilium/cilium-distroless:v1.18.9
+        -> cilium-distroless:v1.18.9
+      registry.k8s.io/pause:3.9
+        -> pause:3.9
+      gke.gcr.io/anetd@sha256:abc...
+        -> anetd
+      foo/bar:v1@sha256:abc...
+        -> bar:v1
+    Empty / None input returns "".
+    """
+    if not ref:
+        return ""
+    tail = ref.rsplit("/", 1)[-1]
+    # Drop any digest (`@sha256:...`); keep the preceding tag if there is one.
+    if "@" in tail:
+        tail = tail.split("@", 1)[0]
+    return tail
+
+
+# Families kept as individual lanes on the merged main chart (critical
+# path / per-image signal matters). Everything else is collapsed into
+# one aggregated lane per family to keep the chart legible on providers
+# that pull many ancillary images (notably GKE).
+MAIN_CHART_PER_IMAGE_FAMILIES: frozenset[str] = frozenset({
+    "cilium", "cns", "azure-cni", "trigger",
+})
+
+# Pulls shorter than this are excluded from the main chart (sub-panel and
+# JSON still show them). Sub-second pulls are typically cache hits or
+# tiny sidecar images that add visual noise without changing the story.
+MAIN_CHART_PULL_MIN_S: float = 1.0
+
 
 
 _DURATION_RE = re.compile(

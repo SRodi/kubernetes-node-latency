@@ -578,37 +578,68 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
     # ---- Merge image-pull rows into the main chart ----
     # Each distinct image pulled on the node becomes its own lane so the
     # reader can see exactly when each pull happens on the same time axis
-    # as the lifecycle phases. Lanes are inserted in chronological order
-    # (by median start_off) and use the actor sentinel "pull:<family>" so
-    # the render loop colours them by family palette instead of ACTOR_COLORS.
-    pull_lane_keys: dict[str, str] = {}  # short ytick label -> full image ref
-
-    def _short_pull_label(ref: str, maxlen: int = 38) -> str:
-        if len(ref) <= maxlen:
-            return ref
-        if "/" in ref:
-            tail = ref.rsplit("/", 1)[-1]
-            if len(tail) <= maxlen - 4:
-                return ".../" + tail
-        return ref[: maxlen - 1] + "\u2026"
+    # as the lifecycle phases. To keep the chart legible on providers
+    # that pull many ancillary images (notably GKE), we:
+    #   * drop pulls shorter than MAIN_CHART_PULL_MIN_S (sub-panel still
+    #     shows them);
+    #   * keep critical-path families per-image (cilium, cns, azure-cni,
+    #     trigger) so the reader can see which specific image dominates;
+    #   * collapse every other family into ONE aggregated lane covering
+    #     `min(start)..max(end)` with a `(xN)` count badge.
+    # Labels use just the image basename (last path segment + tag) — the
+    # registry/repo prefix is not load-bearing once family colour is set.
+    pull_lane_keys: dict[str, str] = {}  # short ytick label -> full image ref(s)
 
     if pull_image_order:
-        from .image_family import DEFAULT_FAMILY as _DF
+        from .image_family import (
+            DEFAULT_FAMILY as _DF,
+            MAIN_CHART_PER_IMAGE_FAMILIES as _PER_IMG,
+            MAIN_CHART_PULL_MIN_S as _MIN_S,
+            image_basename as _basename,
+        )
+        per_image_rows: list[tuple[str, float, float, str, str]] = []  # (label, s, e, family, full_ref)
+        agg_by_family: dict[str, list[dict]] = {}
         for image in pull_image_order:
             insts = image_pulls_by_image[image]
             fam = insts[0].get("family") or _DF
             s = float(np.median([r["start_off"] for r in insts]))
             e = float(np.median([r["end_off"] for r in insts]))
-            label = _short_pull_label(image)
-            # Disambiguate colliding shortened labels (rare) so the
-            # full-name lookup below stays unique. If the short label
-            # already maps to a different image, append a counter.
+            dur = e - s
+            if fam in _PER_IMG:
+                # Critical-path families: always show individually so the
+                # specific image (e.g. cilium-distroless vs cilium-init)
+                # is identifiable on the main chart.
+                label = _basename(image) or image
+                per_image_rows.append((label, s, e, fam, image))
+            else:
+                # Non-critical families: filter sub-second pulls and
+                # collect for aggregation below.
+                if dur < _MIN_S:
+                    continue
+                agg_by_family.setdefault(fam, []).append(
+                    {"image": image, "s": s, "e": e})
+
+        # Build aggregated lanes per family.
+        agg_rows: list[tuple[str, float, float, str, str]] = []
+        for fam, items in agg_by_family.items():
+            s = min(it["s"] for it in items)
+            e = max(it["e"] for it in items)
+            n = len(items)
+            label = f"{fam} (\u00d7{n})" if n > 1 else (_basename(items[0]["image"]) or items[0]["image"])
+            # Tooltip-ish full description: comma-joined basenames so the
+            # legend / hover (when rendered) carries something useful.
+            full = ", ".join(_basename(it["image"]) or it["image"] for it in items)
+            agg_rows.append((label, s, e, fam, full))
+
+        # Emit lanes in chronological order by start.
+        merged_rows = sorted(per_image_rows + agg_rows, key=lambda r: r[1])
+        for label, s, e, fam, full in merged_rows:
             base = label
             n = 2
-            while label in pull_lane_keys and pull_lane_keys[label] != image:
+            while label in pull_lane_keys and pull_lane_keys[label] != full:
                 label = f"{base} ({n})"
                 n += 1
-            pull_lane_keys[label] = image
+            pull_lane_keys[label] = full
             all_lanes.append((label, s, e, f"pull:{fam}"))
 
     # Layout: main wall-clock Gantt on top, plus optional zoomed subplots
@@ -686,16 +717,6 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
                 va="center", ha="center" if dur > 1.5 else "left",
                 fontsize=7 if is_pull else 8,
                 color="white" if (dur > 1.5 and not is_pull) else "black")
-        if is_pull:
-            # Render the full image reference as small italic text just
-            # above the bar so the truncated y-tick remains compact while
-            # the reader can still identify the image precisely.
-            full = pull_lane_keys.get(label, label)
-            if full and full != label:
-                ax.text(s_off, y + bar_h / 2 + 0.02, full,
-                        ha="left", va="bottom", fontsize=6,
-                        style="italic", color="#374151", alpha=0.85,
-                        clip_on=False)
 
     for glyph, off in markers:
         # Render T4b prominently: it marks when the node becomes schedulable
@@ -966,16 +987,7 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
         y_pulls = np.arange(n_pull_rows, 0, -1)
         used_fams: list[str] = []
 
-        # Truncate very long image refs for tick labels (keep tag).
-        def _short(ref: str, maxlen: int = 60) -> str:
-            if len(ref) <= maxlen:
-                return ref
-            if "/" in ref:
-                tail = ref.rsplit("/", 1)[-1]
-                if len(tail) <= maxlen - 4:
-                    return ".../" + tail
-            return ref[: maxlen - 1] + "\u2026"
-
+        from .image_family import image_basename as _basename
         max_dur = max((d["max"] for d in per_image), default=1.0)
         for y, d in zip(y_pulls, per_image):
             fam = d["family"]
@@ -1000,7 +1012,7 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
                           color="#111", fontweight="bold")
 
         ax_pulls.set_yticks(y_pulls)
-        ax_pulls.set_yticklabels([_short(d["image"]) for d in per_image],
+        ax_pulls.set_yticklabels([_basename(d["image"]) or d["image"] for d in per_image],
                                  fontsize=7)
         ax_pulls.set_xlim(0, max_dur * 1.22)
         ax_pulls.set_ylim(0.3, n_pull_rows + 0.7)
@@ -1256,6 +1268,7 @@ def _node_image_pulls_aggregated(ok: pd.DataFrame, t1_off_per_row: pd.Series) ->
         return []
     import json as _json
     from datetime import datetime as _dt
+    from .image_family import classify
     out: list[dict] = []
     t1_series = pd.to_datetime(ok.get("T1_node_registered"), errors="coerce", utc=True)
     for (idx, raw), t1_ts in zip(ok["node_image_pulls_json"].items(), t1_series):
@@ -1287,7 +1300,11 @@ def _node_image_pulls_aggregated(ok: pd.DataFrame, t1_off_per_row: pd.Series) ->
                 dur = None
             by_image.setdefault(e.get("image") or "", []).append({
                 "image": e.get("image") or "",
-                "family": e.get("family") or "other",
+                # Re-classify on read so that CSVs captured with an older
+                # version of `image_family.classify` (e.g. when csi-azure
+                # also matched generic upstream sidecars) benefit from
+                # current taxonomy without needing a re-run.
+                "family": classify(e.get("image") or "") if (e.get("image")) else (e.get("family") or "other"),
                 "start_off": s_off,
                 "end_off": e_off,
                 "duration_s": dur,
@@ -1606,6 +1623,7 @@ def _plot_compare_phase_decomposition(csvs: list[Path], out_dir: Path) -> Path |
         if "node_image_pulls_json" not in df.columns:
             return {}, 0, float("nan")
         import json as _json
+        from .image_family import classify as _classify
         per_iter_fam: list[dict[str, float]] = []
         per_iter_distinct: list[int] = []
         for raw in df["node_image_pulls_json"].dropna():
@@ -1619,7 +1637,8 @@ def _plot_compare_phase_decomposition(csvs: list[Path], out_dir: Path) -> Path |
             best: dict[str, tuple[str, float]] = {}  # image -> (family, dur)
             for e in entries:
                 img = e.get("image") or ""
-                fam = e.get("family") or DEFAULT_FAMILY
+                # Re-classify on read so stale CSV families don't survive.
+                fam = _classify(img) if img else (e.get("family") or DEFAULT_FAMILY)
                 d = e.get("duration_s")
                 if not isinstance(d, (int, float)) or not img:
                     continue
