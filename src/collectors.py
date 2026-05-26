@@ -700,6 +700,28 @@ class Collector:
         on_node: set[tuple[str, str]] = {
             (p.metadata.namespace, p.metadata.name) for p in pods
         }
+        # Build (ns, pod, container) -> image map from each Pod's container
+        # statuses, so every emitted entry can be tagged with the image
+        # actually used. This makes downstream rendering able to display
+        # `pull: <image>` even for cached images (no kubelet Pulling event).
+        image_by_key: dict[tuple[str, str, str], str] = {}
+        for p in pods:
+            ns = p.metadata.namespace
+            name = p.metadata.name
+            for ic in (p.status.init_container_statuses or []):
+                if ic.name and ic.image:
+                    image_by_key[(ns, name, ic.name)] = ic.image
+            for c in (p.status.container_statuses or []):
+                if c.name and c.image:
+                    image_by_key[(ns, name, c.name)] = c.image
+            spec = getattr(p, "spec", None)
+            if spec is not None:
+                for c in (getattr(spec, "init_containers", None) or []):
+                    if c.name and c.image:
+                        image_by_key.setdefault((ns, name, c.name), c.image)
+                for c in (getattr(spec, "containers", None) or []):
+                    if c.name and c.image:
+                        image_by_key.setdefault((ns, name, c.name), c.image)
         try:
             resp = self.core.list_event_for_all_namespaces(
                 field_selector="reason=Started",
@@ -743,6 +765,7 @@ class Collector:
                 "container": container,
                 "init": is_init,
                 "t_started": ts,
+                "image": image_by_key.get(key),
             })
         out.sort(key=lambda e: e["t_started"])
         self.sink.write("node_container_starts_collected",
