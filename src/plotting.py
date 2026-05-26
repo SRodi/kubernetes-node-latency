@@ -12,6 +12,41 @@ import pandas as pd  # noqa: E402
 
 from .analysis import METRICS
 
+
+def _pod_basename(pod: str) -> str:
+    """Strip ReplicaSet/DaemonSet hash suffix(es) from a pod name so the
+    same workload renders as a single group across iterations.
+
+    Iteratively peels trailing ``-<token>`` segments (with optional
+    single-letter discriminator like GKE's ``anetd-m-qhlth``). A token is
+    treated as a hash only if it has 5–10 ``[a-z0-9]`` chars AND looks
+    random — i.e. it contains a digit OR has no vowels. English-like
+    suffixes such as ``-agent`` or ``-autoscaler`` are preserved.
+
+    Examples:
+      ``anetd-m-qhlth``                                  -> ``anetd``
+      ``ip-masq-agent-4ct8j``                            -> ``ip-masq-agent``
+      ``event-exporter-gke-7bf86dd5ff-6sfqm``            -> ``event-exporter-gke``
+      ``konnectivity-agent-autoscaler-679b575cc9-zndq4`` -> ``konnectivity-agent-autoscaler``
+      ``token-broker-adc-init``                          -> ``token-broker-adc-init``
+    """
+    if not pod:
+        return ""
+    import re as _re
+    _RE = _re.compile(r"(?:-[a-z])?-([a-z0-9]{5,10})$")
+    while True:
+        m = _RE.search(pod)
+        if not m:
+            return pod
+        tok = m.group(1)
+        looks_like_hash = any(c.isdigit() for c in tok) or not any(
+            c in "aeiou" for c in tok)
+        if not looks_like_hash:
+            return pod
+        pod = pod[: m.start()]
+        if not pod:
+            return ""
+
 PHASE_COLS = [
     ("T0_pod_created", "T1_node_registered", "VM provision + node registered"),
     ("T1_node_registered", "T4_node_ready", "node init to Ready"),
@@ -429,13 +464,17 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
             short = label.replace("regen.", "")
             regen_breakdown.append((short, cursor, cursor + dur))
             cursor += dur
-        # Add a synthetic lane to the main Gantt summarising the whole
-        # post-T3 regen budget. `lanes` has already been rebased to T1, so
-        # we use T1-relative offsets here too.
-        lanes.append((
-            "Cilium endpoint regeneration (per-endpoint avg, post-T3)",
-            t3_off - t1_off, t3_off - t1_off + regen_total, "cilium_regen",
-        ))
+        # Emit each regeneration sub-phase as its own lane in the main
+        # Gantt so the reader sees the breakdown directly (mirrors the
+        # cilium bootstrap inlining). `lanes` has already been rebased to
+        # T1, so we use T1-relative offsets here too. All lanes share the
+        # ``cilium_regen`` actor so they group under the cilium pod box.
+        for label, s_rel, e_rel in regen_breakdown:
+            if e_rel - s_rel < 5e-3:
+                continue
+            lanes.append((
+                f"regen: {label}", s_rel, e_rel, "cilium_regen",
+            ))
 
     # ---- Image pulls on this node (per-image rows, T1-relative) ----
     # Aggregate across iterations: one row per distinct image, with one bar
@@ -477,8 +516,7 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
         creates_lookup = _aggregate_node_container_creates(ok, ok["T1_node_registered"])
 
     def _pod_basename_str(pod: str) -> str:
-        import re as _re
-        return _re.sub(r"(-[a-z0-9]{5,10}){1,2}$", "", pod or "")
+        return _pod_basename(pod or "")
 
     def _emit_create_lane_for_run(
         ns: str | None, pod_base: str | None, container: str, run_start_off: float,
@@ -660,7 +698,18 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
     # the full chain end via T1c) plus bootstrap phases.
     if "node_container_starts_json" in ok.columns:
         starts_by_pod = _aggregate_node_container_starts(ok, ok["T1_node_registered"])
+        # Identify the cilium DS pod's (ns, base) so the generic loop
+        # below skips it — on GKE the DS is named ``anetd``, so the
+        # legacy name-only check missed it and emitted duplicate
+        # ``run: cilium-agent`` lanes under a second pod group.
+        _cilium_ns_base: tuple[str, str] | None = None
+        for (_ns, _base), _cs in starts_by_pod.items():
+            if any(_c[0] == "cilium-agent" for _c in _cs):
+                _cilium_ns_base = (_ns, _base)
+                break
         for (ns, base), container_starts in starts_by_pod.items():
+            if (ns, base) == _cilium_ns_base:
+                continue
             if base == "cilium" or base.startswith("cilium-"):
                 continue
             pod_key = f"{ns}/{base}" if ns else base
@@ -825,22 +874,39 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
         ("T_taint_observed", "Tt"),
     ]
     markers: list[tuple[str, float]] = []
-    t4_off = _mean_offset("T4_node_ready")
-    t4b_off = _mean_offset("T4b_schedulable")
-    t4_t4b_coincide = (
-        t4_off is not None and t4b_off is not None
-        and abs(t4_off - t4b_off) <= 1e-3
-    )
     for col, glyph in MAIN_MARKERS:
         off = _mean_offset(col)
         if off is None:
             continue
-        # When T4 and T4b are the same instant (e.g. GKE without a cilium
-        # taint), drop the plain T4 marker so the prominent T4b line below
-        # is the only one drawn at that x.
-        if glyph == "T4" and t4_t4b_coincide:
-            continue
         markers.append((glyph, off - t1_off))
+
+    # ---- Collapse coincident T-markers into combined labels ----
+    # When two or more glyphs land at the same offset (within 1ms), drawing
+    # both vertical lines and labels just overlaps illegibly. Instead, keep
+    # one "primary" marker (selected by visual prominence) and merge the
+    # other glyph names into its label, e.g. ``T1=Ts`` or ``T4=T4b``. The
+    # primary is chosen so the more prominent rendering style wins (T4b's
+    # bold scheduler line beats T4's dotted line, etc.).
+    _GLYPH_PRIORITY = ["T4b", "T5", "T1c", "Tts",
+                       "T0", "T1", "T2", "T3", "T4", "Ts", "Tt", "Tcsi",
+                       "Tip", "Tips"]
+
+    def _prio(g: str) -> int:
+        return _GLYPH_PRIORITY.index(g) if g in _GLYPH_PRIORITY else 99
+
+    _by_off: dict[float, list[str]] = {}
+    for _g, _o in markers:
+        _by_off.setdefault(round(_o, 3), []).append(_g)
+    glyphs_to_skip: set[str] = set()
+    combined_label: dict[str, str] = {}
+    for _gs in _by_off.values():
+        if len(_gs) < 2:
+            continue
+        _gs_sorted = sorted(_gs, key=_prio)
+        _primary = _gs_sorted[0]
+        combined_label[_primary] = "=".join(_gs_sorted)
+        for _g in _gs_sorted[1:]:
+            glyphs_to_skip.add(_g)
 
     # ---- Merge image-pull rows into the main chart ----
     # Each distinct image pulled on the node becomes its own lane so the
@@ -867,25 +933,19 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
             image_basename as _basename,
         )
 
-        def _pod_basename(pod: str) -> str:
-            # Strip the trailing -xxxxx random suffix(es) produced by
-            # ReplicaSet/DaemonSet controllers so the box label stays
-            # stable across iterations and runs.
-            if not pod:
-                return ""
-            import re as _re
-            return _re.sub(r"(-[a-z0-9]{5,10}){1,2}$", "", pod)
-
         def _pod_key(ns: str, pod: str) -> str | None:
             if not pod:
                 return None
             base = _pod_basename(pod)
             return f"{ns}/{base}" if ns else base
 
-        # Detect the cilium-agent pod identifier from the pull entries so
-        # that lifecycle lanes (image-pull, init chain, agent bootstrap,
-        # main-container startup, endpoint regen) can be grouped together
-        # with the cilium pod's pull rows under one outer container/pod box.
+        # Detect the cilium-agent pod identifier. Primary path: scan
+        # image-pull entries for container=cilium-agent. Fallback: scan
+        # container-start entries — on GKE the cilium-agent image is
+        # pre-baked into the COS node VHD so no Pulling/Pulled event
+        # ever fires; without the fallback ``cilium_pod_key`` would
+        # stay None and lifecycle lanes would group under the literal
+        # string ``"cilium-agent"`` instead of the real pod (``anetd``).
         cilium_pod_key: str | None = None
         for image, insts in image_pulls_by_image.items():
             for r in insts:
@@ -894,6 +954,21 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
                     break
             if cilium_pod_key:
                 break
+        if cilium_pod_key is None and "node_container_starts_json" in ok.columns:
+            import json as _json
+            for v in ok["node_container_starts_json"].dropna():
+                try:
+                    rows = _json.loads(v) if isinstance(v, str) else []
+                except Exception:
+                    rows = []
+                for r in rows:
+                    if r.get("container") == "cilium-agent":
+                        cilium_pod_key = _pod_key(r.get("namespace") or "",
+                                                  r.get("pod") or "")
+                        if cilium_pod_key:
+                            break
+                if cilium_pod_key:
+                    break
 
         per_image_rows: list[tuple[str, float, float, str, str, str | None, str | None]] = []  # (label, s, e, family, full_ref, pod_key, container)
         agg_by_family_pod: dict[tuple[str, str | None], list[dict]] = {}
@@ -940,6 +1015,7 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
         # Emit lanes in chronological order by start.
         merged_rows = sorted(per_image_rows + agg_rows, key=lambda r: r[1])
         for label, s, e, fam, full, pk, container in merged_rows:
+            label = f"pull: {label}"
             base = label
             n = 2
             while label in pull_lane_keys and pull_lane_keys[label] != full:
@@ -1086,7 +1162,7 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
     # (CNI add\u2192Ready decomposition, Cilium-internal bootstrap).
     has_cilium_bd = False  # bootstrap phases inlined into main chart
     has_cni_bd = False     # init-container chain inlined as run:<name> lanes
-    has_regen_bd = bool(regen_breakdown)
+    has_regen_bd = False   # endpoint regen lane inlined into main chart
     n_main = len(all_lanes)
     n_pull_rows = len(pull_image_order)
     sub_count = (
@@ -1307,13 +1383,16 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
                 color=color, fontweight="bold")
 
     for glyph, off in markers:
+        if glyph in glyphs_to_skip:
+            continue
         # Render T4b prominently: it marks when the node becomes schedulable
         # (cilium taint removed) and is the primary user-facing readiness
         # outcome of the run.
         if glyph == "T4b":
             ax.axvline(off, color=ACTOR_COLORS["scheduler"], linestyle="-",
                        alpha=0.85, linewidth=1.6)
-            label = "T4 = T4b\n(pod schedulable)" if t4_t4b_coincide else "T4b\n(pod schedulable)"
+            _g_label = combined_label.get("T4b", "T4b")
+            label = f"{_g_label}\n(pod schedulable)"
             # Place outside the chart, just above the top spine.
             ax.annotate(
                 label,
@@ -1330,8 +1409,9 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
             # workload-running) are visually distinct.
             ax.axvline(off, color=ACTOR_COLORS["trigger_pod"], linestyle="-",
                        alpha=0.85, linewidth=1.6)
+            _g_label = combined_label.get("T5", "T5")
             ax.annotate(
-                "T5\n(pod running)",
+                f"{_g_label}\n(pod running)",
                 xy=(off, 1.0), xycoords=("data", "axes fraction"),
                 xytext=(0, 4), textcoords="offset points",
                 ha="center", va="bottom", fontsize=8,
@@ -1343,6 +1423,10 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
             # so the reader can see where the T4b -> T5 sandbox window opens.
             ax.axvline(off, color=ACTOR_COLORS["trigger_pod"], linestyle=":",
                        alpha=0.6, linewidth=1.0)
+            if "Tts" in combined_label:
+                ax.text(off, n_main + 0.6, combined_label["Tts"],
+                        ha="center", va="bottom", fontsize=8,
+                        color=ACTOR_COLORS["trigger_pod"], fontweight="bold")
         elif glyph == "T1c":
             # T1c (conflist written / discovered on disk) is a key transition
             # marker: kubelet stops reporting "no CNI" after this point.
@@ -1352,11 +1436,13 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
             # mid-chain because the conflist is pre-baked into the image).
             ax.axvline(off, color="#b91c1c", linestyle="--", alpha=0.85,
                        linewidth=1.2)
-            ax.text(off, n_main + 0.6, glyph, ha="center", va="bottom",
+            ax.text(off, n_main + 0.6, combined_label.get(glyph, glyph),
+                    ha="center", va="bottom",
                     fontsize=8, color="#b91c1c", fontweight="bold")
         else:
             ax.axvline(off, color="black", linestyle=":", alpha=0.35, linewidth=0.8)
-            ax.text(off, n_main + 0.6, glyph, ha="center", va="bottom",
+            ax.text(off, n_main + 0.6, combined_label.get(glyph, glyph),
+                    ha="center", va="bottom",
                     fontsize=8, color="black")
 
     ax.set_yticks(y_positions)
@@ -1506,47 +1592,6 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
             fontsize=9, loc="left",
         )
         ax_bd.grid(True, axis="x", alpha=0.3)
-
-    # ---- Cilium endpoint regeneration (zoomed, per-endpoint avg) ----
-    if has_regen_bd and ax_regen is not None:
-        palette = ["#bfdbfe", "#93c5fd", "#60a5fa", "#3b82f6", "#2563eb",
-                   "#1d4ed8", "#1e40af", "#1e3a8a"]
-        bd_start = regen_breakdown[0][1]
-        bd_end = regen_breakdown[-1][2]
-        bd_total = bd_end - bd_start
-        for i, (label, s, e) in enumerate(regen_breakdown):
-            dur = e - s
-            color = palette[i % len(palette)]
-            ax_regen.barh(0.5, dur, left=s, height=0.7, color=color,
-                          edgecolor="black", linewidth=0.4)
-            rel = dur / bd_total if bd_total > 0 else 0
-            inline = rel > 0.20
-            txt = f"{label}\n{dur*1000:.0f}ms" if dur < 0.5 else f"{label}\n{dur:.2f}s"
-            if inline:
-                ax_regen.text(s + dur / 2, 0.5, txt, ha="center", va="center",
-                              fontsize=7,
-                              color="white" if i >= 4 else "black")
-            else:
-                y_label = 1.05 + 0.30 * (i % 2)
-                ax_regen.annotate(
-                    txt,
-                    xy=(s + dur / 2, 0.85),
-                    xytext=(s + dur / 2, y_label),
-                    ha="center", va="bottom", fontsize=7, color="black",
-                    arrowprops=dict(arrowstyle="-", color="grey",
-                                    linewidth=0.4, shrinkA=0, shrinkB=0),
-                )
-        ax_regen.set_xlim(bd_start - bd_total * 0.05, bd_end + bd_total * 0.05)
-        ax_regen.set_ylim(0, 2.0)
-        ax_regen.set_yticks([0.5])
-        ax_regen.set_yticklabels(["Cilium endpoint\nregeneration"], fontsize=8)
-        ax_regen.set_xlabel("seconds since T1 (node registered) \u2014 per-endpoint avg, anchored at T3")
-        ax_regen.set_title(
-            f"{title + '  ' if title else ''}"
-            f"Cilium endpoint regeneration (per-endpoint avg, post-T3) \u2014 total {bd_total:.2f}s",
-            fontsize=9, loc="left",
-        )
-        ax_regen.grid(True, axis="x", alpha=0.3)
 
     # ---- Image pulls on this node (per-image median duration) ----
     if has_pulls_bd and ax_pulls is not None:
@@ -1791,15 +1836,11 @@ def _aggregate_node_container_starts(
     if "node_container_starts_json" not in ok.columns:
         return {}
     import json as _json
-    import re as _re
     from datetime import datetime as _dt
     t1_series = pd.to_datetime(t1_off_per_row, utc=True, errors="coerce")
     # key = (ns, pod_basename, container, init) -> list[start_offset_s]
     starts: dict[tuple[str, str, str, bool], list[float]] = {}
-    def _basename(pod: str) -> str:
-        if not pod:
-            return ""
-        return _re.sub(r"(-[a-z0-9]{5,10}){1,2}$", "", pod)
+    _basename = _pod_basename
     for raw, t1 in zip(ok["node_container_starts_json"], t1_series):
         if raw is None or (isinstance(raw, float) and pd.isna(raw)):
             continue
@@ -1846,14 +1887,10 @@ def _aggregate_node_container_creates(
     if "node_container_creates_json" not in ok.columns:
         return {}
     import json as _json
-    import re as _re
     from datetime import datetime as _dt
     t1_series = pd.to_datetime(t1_off_per_row, utc=True, errors="coerce")
     bucket: dict[tuple[str, str, str], list[float]] = {}
-    def _basename(pod: str) -> str:
-        if not pod:
-            return ""
-        return _re.sub(r"(-[a-z0-9]{5,10}){1,2}$", "", pod)
+    _basename = _pod_basename
     for raw, t1 in zip(ok["node_container_creates_json"], t1_series):
         if raw is None or (isinstance(raw, float) and pd.isna(raw)):
             continue

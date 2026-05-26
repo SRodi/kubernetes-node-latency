@@ -1,42 +1,33 @@
 # node-startup-latency
 
-Measures **K8s networking wiring latency** on managed Kubernetes —
-the time from a fresh node registering with the apiserver to a workload
-pod actually transitioning to `Running` — across GKE Autopilot, GKE
-Standard with Dataplane V2, AKS with Azure CNI Powered by Cilium, AKS
-BYOCNI + upstream Cilium, AKS kubenet, and EKS with Cilium in ENI mode.
+Measures **K8s networking wiring latency** on managed Kubernetes — the
+time from a fresh node registering with the apiserver to a workload pod
+transitioning to `Running` — across GKE Autopilot, GKE Standard with
+Dataplane V2, AKS with Azure CNI Powered by Cilium, AKS BYOCNI + upstream
+Cilium, AKS kubenet, and EKS with Cilium in ENI mode.
 
-The harness also records the end-to-end `Pod created → Node Ready=True`
-latency for completeness, but the **headline metric is
-`time_to_runnable_s = T5_pod_running − T1_node_registered`** — the
-T1-anchored, IaaS-noise-free measure of CNI + kubelet + cilium-agent +
-IPAM wiring on a brand-new node. Cloud-side autoscaler + VM bringup
-(T0 → T1) varies by 5×–10× depending on warm-pool state, region
-capacity, and trigger mechanism and is intentionally **excluded** from
-the headline.
+**Headline KPI:** `time_to_runnable_s = T5_pod_running − T1_node_registered`
+— the T1-anchored, IaaS-noise-free measure of CNI + kubelet + cilium-agent
++ IPAM wiring on a brand-new node. Cloud-side autoscaler + VM bringup
+(T0 → T1) varies 5×–10× by warm-pool state / region / trigger mechanism
+and is reported separately as `node_register_latency_s`, never folded
+into the headline. Quote results as **median (p50)** over ≥10 iterations
+— the IaaS cold-pool tail makes mean+stddev misleading.
 
 ## Methodology
 
-Each iteration submits a single resource-heavy trigger Pod with `podAntiAffinity`
-against earlier iterations, forcing the platform to provision a brand-new node
-VM, while the harness watches the Kubernetes API to capture a rich set of
-**lifecycle markers** from a common cluster clock — at minimum T0 Pod created,
-T1 Node registered, T1c CNI conflist placed, T2 CNI agent container started,
-T3 CNI agent Ready, T4 Node `Ready=True`, T4b Node schedulable (taints
-cleared), **T5 trigger pod first container Running** (the workload-side
-"node became useful" moment), plus per-iteration enrichment that
-decomposes the T1→T1c window (scheduler latency, image-pull window,
-CSINode registration, blocking-taint observation, per-init-container
-durations). The **headline KPI is `time_to_runnable_s = T5 − T1`**;
-`node_startup_latency_s = T4 − T0` is still emitted alongside as a
-legacy end-to-end view but its variance is dominated by cloud-side
-provisioning and is **not directly comparable across providers**. For
-robust cross-cloud reporting use **medians** (p50) over a 10+
-iteration sample, not means — the IaaS-side cold-pool tail makes
-mean+stddev actively misleading. The same code path runs across all
-six providers — only the cluster-creation primitive and the
-new-node trigger mechanism (Autopilot / NAP / cluster-autoscaler /
-manual scale) differ per platform.
+Each iteration submits a single resource-heavy trigger Pod with
+`podAntiAffinity` against earlier iterations, forcing the platform to
+provision a brand-new node VM. The harness watches the Kubernetes API
+and captures **lifecycle markers** from a common cluster clock: T0 Pod
+created, T1 Node registered, T1c CNI conflist placed, T2 CNI agent
+container started, T3 CNI agent Ready, T4 Node `Ready=True`, T4b Node
+schedulable (taints cleared), T5 trigger pod first container Running —
+plus per-iteration enrichment of the T1→T1c window (scheduler latency,
+image-pull window, CSINode registration, blocking-taint observation,
+per-init-container durations). The same code path runs across all six
+providers; only the cluster-creation primitive and the new-node trigger
+mechanism (Autopilot / NAP / cluster-autoscaler / manual scale) differ.
 
 ### Timestamps and derived metrics
 
@@ -50,14 +41,15 @@ contributes to the time from the previous marker to this one).
 | **T0** Pod created            | `Pod.metadata.creationTimestamp` | — (start) |
 | **T1** Node registered        | new `Node` object's `metadata.creationTimestamp`, first observed via watch | **Cloud-side autoscaler decision + VM allocation + VM boot + kubelet process startup**, ending when kubelet POSTs the Node to the apiserver. *Not* a measure of CNI or kubelet bootstrap. |
 | **Tt** Blocking taint first observed | first watch event where the new Node carries a `NoSchedule` taint such as `node.cilium.io/agent-not-ready` (`T_taint_observed`) | Operator-stamping latency for the scheduling-block taint (AKS managed Cilium / BYOCNI only; absent on GKE DPv2 and AKS kubenet). |
-| **Ts** Cilium agent Pod scheduled | `Pod.status.conditions[PodScheduled].lastTransitionTime` for the new node's cilium-agent DS pod (`T_pod_scheduled`) | Scheduler queue time after the node registered. |
+| **Ts** Cilium agent Pod scheduled | `Pod.status.conditions[PodScheduled].lastTransitionTime` for the new node's **cilium-agent DS** pod — `cilium-agent` / `anetd` / `azure-cns` depending on the provider (`T_pod_scheduled`) | Scheduler queue time for the **infrastructure / networking** pod after the node registered. Drives the `T1 → Ts` "Scheduler latency" lane. Typically lands within a few ms of T1 (the scheduler picks the already-pending pod the moment the new node passes predicates), so the plot collapses both markers into a combined `T1=Ts` label when they coincide. |
 | **Tips / Tip** Cilium agent image pull window | pod-scoped `Pulling` / `Pulled` Events for the cilium-agent container (`T_image_pull_start`, `T_image_pulled`) | Image pull duration for the agent container, measured on the new node. |
 | **Tcsi** CSINode registered   | first watch event where the Node's `Ready=False` message no longer carries `CSINode is not yet initialized` (`T_csinode_ready`) | kubelet's CSINode CRD registration after node creation — frequently the dominant gating signal in the T1→T1c window on AKS. |
 | **T1c** CNI conflist placed   | first watch event at which `Node.status.conditions[Ready].message` no longer reports `NetworkPluginNotReady` / `cni config uninitialized`. Captured at observation time (`utcnow()`) since the condition message carries no per-message timestamp. | **CNI plugin work to place a conflist in `/etc/cni/net.d/`** — Cilium's `install-cni` init container (managed/BYOCNI/DPv2) or the kubelet itself (kubenet). This is the *only* CNI-side signal that actually blocks `Node Ready=True` on a vanilla kubelet. |
 | **T2** CNI agent container started | `pod.status.containerStatuses[*].state.running.startedAt` for the Cilium agent container on the new node | Image pull + container creation for the Cilium agent Pod (does **not** gate Node Ready — kubelet only needs T1c, not a running agent). |
 | **T3** CNI agent Ready        | agent Pod's `Ready` condition `lastTransitionTime` | Cilium agent internal bootstrap (BPF compile, k8s init, IPAM, endpoint restore) + readiness-probe lag. With `--deep-cilium`, decomposed further into `bpfCompilation`, `bpfWaitForELF`, `bpfLoadProg`, `waitingForLock`, `mapSync` per-phase means. |
 | **T4** Node `Ready=True`      | `Node.status.conditions[Ready].lastTransitionTime` | Residual kubelet status sync after the conflist landed. Typically the next 10 s heartbeat tick, often coincident with T1c. |
-| **T4b** Node schedulable      | first watch event after T4 with no CNI-applied `NoSchedule` taint (e.g. `node.cilium.io/agent-not-ready`) on `Node.spec.taints` | Time the operator-applied scheduling-block taint remains after Node Ready (AKS managed Cilium / BYOCNI only — zero on GKE DPv2 and AKS kubenet). |
+| **T4b** Node schedulable      | first watch event after T4 with no CNI-applied `NoSchedule` taint (e.g. `node.cilium.io/agent-not-ready`) on `Node.spec.taints` | Time the operator-applied scheduling-block taint remains after Node Ready (AKS managed Cilium / BYOCNI only — zero on GKE DPv2 and AKS kubenet, so the plot collapses `T4=T4b` there). |
+| **Tts** Trigger pod scheduled | `Pod.status.conditions[PodScheduled].lastTransitionTime` for the **latency-trigger workload** pod (`T_trigger_scheduled`) | Scheduler queue time for the **user workload** pod once the node is admissible (i.e. after T4b). Same definition as Ts but on a *workload* pod instead of the cilium DS pod, so it answers "how fast did the user's pod get bound once scheduling unblocked?" Opens the `Tts → T5` "Trigger pod sandbox / CNI ADD" lane. |
 | **T5** Trigger pod Running    | trigger pod's first `containerStatuses[0].state.running.startedAt` — the moment kubelet successfully completed CNI ADD (sandbox wired with an IP) and started the pause container | **CNI ADD on a workload pod** (sandbox creation + IP allocation by cilium-agent IPAM). Together with T1 this is the K8s-networking-only window the harness was built to compare. On GKE Autopilot, T5 typically lands ~10-15 s *after* T4b because T4b only requires Node Ready, while T5 also requires cilium-agent IPAM to be up. |
 
 Per-iteration init-container timings (`initc_<name>_s`) are also captured for
@@ -65,85 +57,52 @@ every init container on the Cilium agent pod (e.g. `install-cni-binaries`,
 `mount-cgroup`, `clean-cilium-state`) so the T1→T1c window can be attributed
 to specific install-cni steps.
 
+> **`Ts` vs `Tts` — same condition, different pods.** Both come from a Kubernetes
+> `PodScheduled=True` condition, but on two *different* pods:
+> - **`Ts`** = the **cilium / system DS pod** (cilium-agent / anetd / azure-cns)
+>   — answers "how fast did the scheduler bind the *infrastructure* pod once the
+>   node registered?". Drives `T1 → Ts` ("Scheduler latency").
+> - **`Tts`** = the **latency-trigger workload pod** — answers "how fast did the
+>   scheduler bind the *user workload* pod once the node became admissible
+>   (post-T4b)?". Drives `Tts → T5` ("Trigger pod sandbox / CNI ADD").
+>
+> Ordering on the timeline is `T1 → Ts → ... → T4b → Tts → T5`. The phase profile
+> plot collapses any group of T-markers that land within 1 ms of each other into
+> a combined label (e.g. `T1=Ts`, `T4=T4b`) so coincident markers don't overlap
+> illegibly.
+
 **Decomposition (T1-anchored, the recommended cross-provider view):**
 
 ```
 time_to_runnable_s  =  T5 − T1
-                    =  (T1c − T1)        +  (T2 − T1c)             +  (T3 − T2)            +  (T5 − T3)
-                       = cni_conflist...    = kubelet-starts-agent    = cilium_init_duration  = trigger pod
-                                                                                                CNI ADD +
-                                                                                                cilium IPAM
+                    =  (T1c − T1)   +  (T2 − T1c)        +  (T3 − T2)            +  (T5 − T3)
+                       CNI conflist    kubelet → agent     cilium init             trigger pod CNI ADD
+                                                                                   + cilium IPAM
 ```
 
-The first two terms are kubelet / CNI installer work, the third is the cilium
-agent's own bootstrap, the fourth is the workload's CNI ADD wait — the only
-phase that varies materially with IPAM mode (ENI on EKS, overlay on AKS, GCE
-alias-IP on GKE). Cloud-side autoscaler + VM bringup (T0 → T1) is reported
-separately as `node_register_latency_s` and explicitly **not** rolled into
-`time_to_runnable_s`.
-
-**Legacy decomposition (T0-anchored, kept for backwards compat):**
-
-```
-node_startup_latency_s  =  T4 − T0
-                        =  (T1 − T0)              +  (T1c − T1)              +  (T4 − T1c)
-                           = node_register_latency_s   = cni_conflist_install_s   = post_conflist_ready_s
-                           [autoscaler + VM bringup]  [CNI conflist install]    [residual kubelet sync]
-```
-
-Only the middle and right terms describe what the *node software stack* does
-once a VM exists. The left term is cloud control-plane work and varies
-5×–10× by autoscaler / region / capacity. **Do not compare
-`node_startup_latency_s` directly across providers** — it conflates IaaS
-provisioning with K8s networking and the IaaS term dominates.
+The first two terms are kubelet / CNI installer work, the third is the
+cilium agent's own bootstrap, the fourth is the workload's CNI ADD wait —
+the only phase that varies materially with IPAM mode (ENI on EKS, overlay
+on AKS, GCE alias-IP on GKE). The T0-anchored view
+(`node_startup_latency_s = T4 − T0`) is emitted for backwards compat but
+its variance is dominated by autoscaler + VM bringup (`T1 − T0`,
+reported as `node_register_latency_s`) and is **not directly comparable
+across providers**.
 
 Derived metrics (seconds):
 
-- **`time_to_runnable_s          = T5  − T1`** — **HEADLINE.** Workload-pod's view of "K8s networking is wired up": from kubelet registering the node to the trigger pod's first container Running. IaaS-noise-free. Use this for cross-provider comparison, with **median (p50)** not mean.
-- `sandbox_setup_s             = T5  − T_trigger_scheduled` — CNI ADD + sandbox setup as observed on the trigger pod (workload-side analogue of `cilium_bootstrap_ipam_s`).
-- `T1c_s_from_T1`, `T2_s_from_T1`, `T3_s_from_T1`, `T4_s_from_T1`, `T4b_s_from_T1`, `T5_s_from_T1` — T1-anchored versions of the canonical markers, for clean post-T1 decomposition without re-subtracting `T0`.
-- `node_startup_latency_s        = T4  − T0` *(legacy end-to-end view; **includes** autoscaler + VM provisioning — varies 5×-10× by cloud / region / warm-pool state, not directly comparable across providers)*
-- `time_to_schedulable_s         = T4b − T0` *(legacy end-to-end-to-schedulable; same IaaS-dependence as above. Note: T4b can fire **before** T5_pod_running on providers where Node Ready flips before cilium-agent IPAM is up — see the "T4b is not 'runnable'" note below.)*
-- `node_register_latency_s       = T1  − T0` *(autoscaler + VM bringup + kubelet startup; cloud-side only, not a node-software metric — quote this alongside `time_to_runnable_s` so the IaaS contribution is visible but separated)*
-- `node_ready_after_register_s   = max(T4  − T1, 0)` *(IaaS-free counterpart to `node_startup_latency_s`: kubelet-registered → Node Ready=True. Equals `cni_conflist_install_s + post_conflist_ready_s`. Use this when comparing CNI / kubelet bootstrap alone.)*
-- `cni_conflist_install_s        = max(T1c − T1, 0)` *(time kubelet sat with `NetworkPluginNotReady` — the only CNI-side signal that actually blocks Node Ready on a vanilla kubelet)*
-- `post_conflist_ready_s         = max(T4  − T1c, 0)` *(residual kubelet readiness work after the conflist landed — typically the next status sync)*
-- `cilium_init_duration_s        = T3  − T2` *(Cilium agent container start → Ready; does **not** gate Node Ready)*
-- `cni_induced_delay_s           = max(T4  − T3, 0)` *(Cilium **agent Pod** gating Node Ready; ≈ 0 on every supported provider in practice — kubelet flips Ready before agent Pod Ready, because kubelet only needs the conflist (T1c), not the running agent)*
-- `cilium_scheduling_block_s     = max(T4b − T4, 0)` *(Cilium gating pod scheduling via the `node.cilium.io/agent-not-ready:NoSchedule` taint — non-zero on AKS managed Cilium / BYOCNI, zero on GKE DPv2 and AKS kubenet because their CNI doesn't apply this taint)*
-
-> **T4b is not "runnable".** `T4b` only means "scheduler is willing to bind a pod
-> to this node" — it requires `Node.status.Ready=True` and no NoSchedule taints,
-> but does **not** require CNI ADD to succeed. On GKE Autopilot in particular,
-> T4b regularly fires before `T1c` (CNI conflist write) because Node Ready
-> flips on first kubelet heartbeat; pods scheduled there sit in
-> `ContainerCreating` until CNI ADD returns an IP. Use `T5_pod_running` (and
-> derived `time_to_runnable_s`) as the honest end-to-end "node became useful"
-> signal.
-
-> **Why `cni_conflist_install_s` is the "real" CNI-induced Node-Ready delay.**
-> A vanilla kubelet refuses to transition `Ready=True` until it sees at least
-> one usable CNI conflist in `/etc/cni/net.d/`. While that file is missing it
-> publishes `Ready=False` with `reason=KubeletNotReady` and
-> `message="container runtime network not ready: NetworkReady=false
-> reason=NetworkPluginNotReady message=Network plugin returns error: cni config
-> uninitialized"`. The first watch event where that marker disappears is T1c;
-> the kubelet's next status sync flips Node Ready=True (T4) very shortly
-> after. By contrast `cni_induced_delay_s` (T4 − T3) compares Node Ready to
-> the *agent Pod's* Ready condition — and in practice the agent Pod doesn't
-> need to be Ready for kubelet to be Ready, only its `install-cni` init
-> container needs to have run, so that metric reads ≈ 0 on every provider.
-
-> **Why both `cni_induced_delay_s` and `cilium_scheduling_block_s`?** They
-> measure two distinct gating mechanisms. AKS managed Cilium and Helm-installed
-> Cilium run with `set-cilium-node-taints=true`, so the operator stamps
-> `node.cilium.io/agent-not-ready:NoSchedule` on every new node and only the
-> local agent removes it once Ready — pod scheduling is blocked from T4 until
-> ~T3. `cni_induced_delay_s` only fires when Cilium delays Node Ready itself,
-> so it reads 0 on AKS even though there is a real ~15-20 s delay before pods
-> can run. `cilium_scheduling_block_s` measures that delay directly.
-> GKE Dataplane V2 / anetd and AKS kubenet have no equivalent taint, so this
-> metric is 0 on those providers and `T4b == T4`.
+- **`time_to_runnable_s          = T5  − T1`** — **HEADLINE.** Cross-provider K8s-networking wiring time. Quote as **median (p50)**.
+- `sandbox_setup_s             = T5  − Tts` — CNI ADD + sandbox setup on the trigger pod (workload-side analogue of `cilium_bootstrap_ipam_s`).
+- `T1c_s_from_T1` … `T5_s_from_T1` — T1-anchored versions of each marker, for clean post-T1 decomposition.
+- `node_register_latency_s       = T1  − T0` — autoscaler + VM bringup + kubelet startup. Cloud-side only; quote alongside the headline so IaaS contribution is visible but separated.
+- `node_ready_after_register_s   = max(T4  − T1, 0)` — IaaS-free `node_startup_latency_s`. Equals `cni_conflist_install_s + post_conflist_ready_s`.
+- `cni_conflist_install_s        = max(T1c − T1, 0)` — the **real** CNI-induced Node-Ready delay: kubelet refuses `Ready=True` until at least one usable conflist appears in `/etc/cni/net.d/`. The first watch event where the `NetworkPluginNotReady` Ready-message clears is T1c; the next kubelet status sync (≈ T4) follows shortly after.
+- `post_conflist_ready_s         = max(T4  − T1c, 0)` — residual kubelet readiness work after the conflist landed.
+- `cilium_init_duration_s        = T3  − T2` — Cilium agent container start → Ready; does **not** gate Node Ready.
+- `cni_induced_delay_s           = max(T4  − T3, 0)` — Cilium **agent Pod** gating Node Ready. ≈ 0 on every supported provider in practice, because kubelet only needs the conflist (T1c) not the running agent — see `cilium_scheduling_block_s` for the *real* pod-scheduling delay on AKS Cilium.
+- `cilium_scheduling_block_s     = max(T4b − T4, 0)` — Cilium gating pod *scheduling* via the `node.cilium.io/agent-not-ready:NoSchedule` taint (operator stamps it; agent removes it once Ready). Non-zero on AKS managed Cilium / BYOCNI (run with `set-cilium-node-taints=true`); zero on GKE DPv2 and AKS kubenet (no equivalent taint), so `T4b == T4` there.
+- `node_startup_latency_s        = T4  − T0` *(legacy end-to-end; **includes** autoscaler + VM provisioning)*
+- `time_to_schedulable_s         = T4b − T0` *(legacy; same IaaS-dependence. **T4b is not "runnable"** — it only means the scheduler is willing to bind a pod; CNI ADD may still be pending. On GKE Autopilot T4b can fire before T1c. Use `T5` / `time_to_runnable_s` for the honest "node became useful" signal.)*
 
 ## Install
 
@@ -292,10 +251,10 @@ results/20260512-085541/
     │                            #            bottom = T1→T5 K8s networking
     │                            #            (T1c, T4, T4b, T5 breakdown — comparable across clouds)
     ├── phase_profile.png        # Gantt-style swimlane (kubelet / CNI / image-pull / cilium /
-    │                            # cilium-regen / scheduler) re-baselined to T1; T-markers
-    │                            # for T1, Tt, Ts, Tips, Tip, Tcsi, T1c, T2, T3, T4, T4b, T5; plus
-    │                            # up to three zoomed sub-panels: T1→T1c CNI decomposition,
-    │                            # Cilium agent bootstrap, Cilium endpoint regeneration
+    │                            # scheduler) re-baselined to T1, with per-container pull / create / run
+    │                            # lanes and per-phase `bootstrap:` and `regen:` lanes inlined.
+    │                            # T-markers: T1, Tt, Ts, Tips, Tip, Tcsi, T1c, T2, T3, T4, T4b, Tts, T5;
+    │                            # coincident markers (within 1 ms) collapse to combined labels (e.g. T1=Ts, T4=T4b).
     ├── latency_vs_iteration.png # both T0→T1 (IaaS) and T1→T5 (K8s networking) per iteration
     └── cdf.png                  # CDF of time_to_runnable_s (falls back to node_startup_latency_s
                                  # for older runs that pre-date T5 capture) with p50/p90/p99 markers
@@ -384,7 +343,7 @@ src/
 ├── collectors.py      K8s watchers, T0..T4b capture, T1→T1c enrichment (pod lifecycle, init containers, CSINode, taint)
 ├── records.py         IterationRecord + derived metrics
 ├── analysis.py        pandas aggregation -> CSV/MD/JSON
-├── plotting.py        matplotlib charts + --compare overlay (with T1→T1c, bootstrap, regen zoom subplots)
+├── plotting.py        matplotlib charts + --compare overlay (phase_profile Gantt with inlined per-container, bootstrap, and regen lanes)
 ├── report.py          deterministic md + docx comparison report
 ├── cilium_deep.py     per-iteration Cilium /metrics scraper (bootstrap + regen phases)
 ├── cilium_config.py   one-shot Cilium DS / operator / configmap snapshot
@@ -434,29 +393,24 @@ harness at it via the `existing` provider:
 
 ## Notes & caveats
 
-- **Cross-platform comparability.** The measurement code path is identical
-  across providers, but the *node provisioning trigger* is platform-specific:
+- **New-node trigger mechanism (varies per provider).** The measurement
+  code path is identical across providers, but what causes the new VM
+  differs — so `T1 − T0` is not strictly apples-to-apples:
 
   | Provider | What causes the new VM |
   |---|---|
   | `gke_autopilot` | Autopilot node auto-provisioning (no pre-existing pool) |
   | `gke_standard_dpv2` | GKE cluster-autoscaler scales pool from `min=0` |
-  | `aks_overlay_cilium` / `aks_byocni` / `aks_kubenet` (`cluster_autoscaler`, default) | AKS cluster-autoscaler scales VMSS from `min=0` |
-  | `aks_overlay_cilium` / `aks_byocni` / `aks_kubenet` (`nap`) | AKS Node Auto-Provisioning |
-  | `aks_overlay_cilium` / `aks_byocni` / `aks_kubenet` (`manual`) | Harness scales nodepool +1 directly |
+  | `aks_*` (`cluster_autoscaler`, default) | AKS cluster-autoscaler scales VMSS from `min=0` |
+  | `aks_*` (`nap`) | AKS Node Auto-Provisioning |
+  | `aks_*` (`manual`) | Harness scales nodepool +1 directly |
   | `eks_eni_cilium` | EKS Cluster Autoscaler scales the `latencypool` ASG from `min=0` |
 
-  As a result, `T1 − T0` is not strictly apples-to-apples: CA-driven runs
-  include the autoscaler scan/decision time on top of cloud VM provisioning,
-  and even within a single provider the T1 distribution can swing 5×–10×
+  Even within a single provider the T1 distribution can swing 5×–10×
   between warm-pool hits and cold node-pool creation (observed on GKE
-  Autopilot: 7 s on a warm pool vs 170 s on a cold one in the same run). For
-  cross-cloud comparison **lead with `time_to_runnable_s = T5 − T1`** and
-  quote it as **median (p50) + IQR**, not mean. T0-anchored metrics
-  (`node_startup_latency_s`, `time_to_schedulable_s`) are retained for
-  end-user-experience reporting but their tail is IaaS noise, not node-stack
-  behaviour. `T4 − T1` (Ready after registration) and `T3 − T2` (Cilium init)
-  are also trigger-independent and directly comparable.
+  Autopilot: 7 s warm vs 170 s cold in the same run). `T4 − T1` (Ready
+  after registration) and `T3 − T2` (Cilium init) are
+  trigger-independent and directly comparable.
 
 - **Phase chart semantics.** `phase_stacked.png` is a **two-panel** figure
   sharing the X axis: the top panel shows `T0 → T1` (IaaS — autoscaler + VM
