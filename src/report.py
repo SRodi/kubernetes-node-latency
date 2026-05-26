@@ -21,6 +21,39 @@ from typing import Any
 import pandas as pd
 
 # Cilium configmap keys to diff across runs (subset of analysis-prompt.md).
+# Provider-specific CNI/dataplane pods to keep when generating the report's
+# focused phase_profile. Keeps the report visually consistent across
+# providers by collapsing each plot to just the dataplane-owning pods.
+REPORT_PODS_BY_PROVIDER: dict[str, set[str]] = {
+    "gke_autopilot": {"anetd", "netd"},
+    "gke_standard_dpv2": {"anetd", "netd"},
+    "eks_eni_cilium": {"cilium"},
+    "aks_overlay_cilium": {"cilium", "azure-cns"},
+    "aks_byocni": {"cilium", "azure-cns"},
+    "aks_kubenet": {"azure-cns"},
+}
+
+# Human-readable shorthand for each provider id. Used everywhere the
+# report identifies a run (headline, KPI columns, cilium diff table) so
+# readers see "AKS Overlay+Cilium" rather than `aks_overlay_cilium`.
+PROVIDER_DISPLAY_NAMES: dict[str, str] = {
+    "gke_autopilot":      "GKE Autopilot",
+    "gke_standard_dpv2":  "GKE Standard (DPv2)",
+    "aks_overlay_cilium": "AKS Overlay+Cilium",
+    "aks_byocni":         "AKS BYO-CNI",
+    "aks_kubenet":        "AKS Kubenet",
+    "eks_eni_cilium":     "EKS ENI+Cilium",
+}
+
+
+def _provider_display(provider: str) -> str:
+    return PROVIDER_DISPLAY_NAMES.get(provider, provider)
+
+
+def _report_pods_filter(provider: str) -> set[str] | None:
+    return REPORT_PODS_BY_PROVIDER.get(provider)
+
+
 CILIUM_DIFF_KEYS = [
     "ipam", "routing-mode", "tunnel", "tunnel-protocol",
     "kube-proxy-replacement", "cni-chaining-mode",
@@ -106,20 +139,54 @@ class RunData:
         return "—"
 
     @property
+    def display_name(self) -> str:
+        """Env shorthand (e.g. ``AKS Overlay+Cilium``) — used in tables."""
+        return _provider_display(self.provider)
+
+    @property
     def label(self) -> str:
-        bits = [self.provider, self.region]
+        bits = [self.region]
         argv = self.metadata.get("cli_argv") or []
         if "--aks-node-provisioning" in argv:
             try:
                 bits.append(argv[argv.index("--aks-node-provisioning") + 1])
             except IndexError:
                 pass
-        return f"{self.run_id} ({', '.join(bits)})"
+        # Env-name-first label: "AKS Overlay+Cilium — 20260522-155452 (uksouth, nap)".
+        return f"{self.display_name} — {self.run_id} ({', '.join(bits)})"
 
     @property
     def phase_profile_png(self) -> Path | None:
-        p = self.run_dir / "plots" / "phase_profile.png"
-        return p if p.exists() else None
+        """Provider-focused phase profile for the report.
+
+        Generates a filtered variant (only the dataplane pods relevant to
+        the provider — see ``REPORT_PODS_BY_PROVIDER``) on demand and
+        falls back to the unfiltered ``phase_profile.png`` when filtering
+        produces no plot or the provider has no mapping.
+        """
+        pods = _report_pods_filter(self.provider)
+        unfiltered = self.run_dir / "plots" / "phase_profile.png"
+        if not pods:
+            return unfiltered if unfiltered.exists() else None
+        suffix = "report"
+        filtered = self.run_dir / "plots" / f"phase_profile_{suffix}.png"
+        if not filtered.exists():
+            try:
+                from .plotting import _plot_phase_profile, _ok
+                ok = _ok(self.iterations)
+                if not ok.empty:
+                    _plot_phase_profile(
+                        ok,
+                        self.run_dir / "plots",
+                        title=f"({self.provider} @ {self.region})",
+                        filename=f"phase_profile_{suffix}.png",
+                        pods_filter=pods,
+                    )
+            except Exception:
+                return unfiltered if unfiltered.exists() else None
+        if filtered.exists():
+            return filtered
+        return unfiltered if unfiltered.exists() else None
 
     @property
     def ok(self) -> pd.DataFrame:
@@ -274,7 +341,8 @@ def build_kpi_table(runs: list[RunData]) -> list[list[str]]:
     rows: list[list[str]] = [header]
 
     # static cluster-info rows
-    rows.append(["provider / region"] + [f"{r.provider} / {r.region}" for r in runs])
+    rows.append(["environment"] + [r.display_name for r in runs])
+    rows.append(["region"] + [r.region for r in runs])
     rows.append(["node SKU"] + [r.node_sku for r in runs])
     rows.append(["k8s version"] + [r.k8s_version for r in runs])
     rows.append(["iterations (ok / total)"] +
@@ -291,56 +359,124 @@ def build_kpi_table(runs: list[RunData]) -> list[list[str]]:
 
 # ---------- Cilium config diff ----------
 
-def cilium_config_diff(runs: list[RunData]) -> list[str]:
-    if not any(r.cilium_cm for r in runs):
-        return ["_No `cilium_config/cilium-config.json` available for any run._"]
-    lines: list[str] = []
-    only_in: dict[int, list[str]] = {i: [] for i in range(len(runs))}
-    diffs: list[str] = []
+def _cilium_diff_data(runs: list[RunData]) -> tuple[list[list[str]], list[str], list[list[str]]]:
+    """Structured form of the cilium config diff for docx rendering.
+
+    Returns ``(diff_table_rows, identical_keys_lines, image_table_rows)``.
+    Either table may be empty when no data is available.
+    """
+    diff_rows: list[list[str]] = []
     identical: list[str] = []
+    image_rows: list[list[str]] = []
+    if not any(r.cilium_cm for r in runs):
+        return diff_rows, identical, image_rows
+
+    diff_rows.append(["Key"] + [r.display_name for r in runs] + ["Status"])
     for key in CILIUM_DIFF_KEYS:
         vals = [r.cilium_cm.get(key) for r in runs]
         present = [(i, v) for i, v in enumerate(vals) if v is not None]
         if not present:
             continue
+        cells = [v if v is not None else "—" for v in vals]
         if len(present) == 1:
-            i, v = present[0]
-            only_in[i].append(f"`{key}` = `{v}`")
-            continue
-        # check equality among present values
-        unique = {v for _, v in present}
-        if len(unique) == 1 and len(present) == len(runs):
-            identical.append(f"`{key}={present[0][1]}`")
+            status = f"only in {runs[present[0][0]].display_name}"
         else:
-            parts = " vs ".join(f"{runs[i].run_id}=`{v}`" for i, v in present)
-            diffs.append(f"`{key}`: {parts}")
+            unique = {v for _, v in present}
+            if len(unique) == 1 and len(present) == len(runs):
+                identical.append(f"{key}={present[0][1]}")
+                continue
+            elif len(unique) == 1:
+                status = "identical where present (missing elsewhere)"
+            else:
+                status = "differs"
+        diff_rows.append([key] + cells + [status])
+    if len(diff_rows) == 1:  # only header
+        diff_rows = []
 
-    for i, items in only_in.items():
-        if items:
-            lines.append(f"- **{runs[i].run_id} only:** " + "; ".join(items))
-    for d in diffs:
-        lines.append(f"- **different value:** {d}")
-    if identical:
-        lines.append("- **Identical across runs:** " + ", ".join(identical))
-
-    # image tags
-    img_lines: list[str] = []
+    image_runs: list[RunData] = []
+    agent_imgs: list[str] = []
+    operator_imgs: list[str] = []
     for r in runs:
         at = (r.cilium_summary.get("agent_template") or {}).get("containers") or []
         ot = (r.cilium_summary.get("operator_template") or {}).get("containers") or []
         if not at and not ot:
             continue
-        agent = next((f"{c['name']}: `{c.get('image','—')}`" for c in at if c.get("name") == "cilium-agent"), None)
-        operator = next((f"{c['name']}: `{c.get('image','—')}`" for c in ot if c.get("name") == "cilium-operator"), None)
-        bits = [b for b in (agent, operator) if b]
-        if bits:
-            img_lines.append(f"- **{r.run_id}:** " + "; ".join(bits))
-    if img_lines:
+        agent = next((c.get("image", "—") for c in at if c.get("name") == "cilium-agent"), "—")
+        operator = next((c.get("image", "—") for c in ot if c.get("name") == "cilium-operator"), "—")
+        image_runs.append(r)
+        agent_imgs.append(agent)
+        operator_imgs.append(operator)
+    if image_runs:
+        image_rows.append(["Container"] + [r.display_name for r in image_runs])
+        image_rows.append(["cilium-agent"] + agent_imgs)
+        image_rows.append(["cilium-operator"] + operator_imgs)
+    return diff_rows, identical, image_rows
+
+
+def cilium_config_diff(runs: list[RunData]) -> list[str]:
+    if not any(r.cilium_cm for r in runs):
+        return ["_No `cilium_config/cilium-config.json` available for any run._"]
+
+    # Build a table: rows = each diffable key; cols = each env.
+    table_rows: list[list[str]] = []
+    header = ["Key"] + [r.display_name for r in runs] + ["Status"]
+    table_rows.append(header)
+
+    identical_keys: list[str] = []
+    for key in CILIUM_DIFF_KEYS:
+        vals = [r.cilium_cm.get(key) for r in runs]
+        present = [(i, v) for i, v in enumerate(vals) if v is not None]
+        if not present:
+            continue
+        cells = [f"`{v}`" if v is not None else "—" for v in vals]
+        if len(present) == 1:
+            status = f"only in **{runs[present[0][0]].display_name}**"
+        else:
+            unique = {v for _, v in present}
+            if len(unique) == 1 and len(present) == len(runs):
+                identical_keys.append(f"`{key}`=`{present[0][1]}`")
+                continue  # collapse identical rows into a single footer line
+            elif len(unique) == 1:
+                status = "identical where present (missing elsewhere)"
+            else:
+                status = "**differs**"
+        table_rows.append([f"`{key}`"] + cells + [status])
+
+    lines: list[str] = []
+    if len(table_rows) > 1:
+        lines.append(_table_md(table_rows))
+    else:
+        lines.append("_No differing keys across runs._")
+    if identical_keys:
+        lines.append("")
+        lines.append("**Identical across all runs:** " + ", ".join(identical_keys))
+
+    # Container images table
+    img_table: list[list[str]] = []
+    image_runs: list[RunData] = []
+    agent_imgs: list[str] = []
+    operator_imgs: list[str] = []
+    for r in runs:
+        at = (r.cilium_summary.get("agent_template") or {}).get("containers") or []
+        ot = (r.cilium_summary.get("operator_template") or {}).get("containers") or []
+        if not at and not ot:
+            continue
+        agent = next((c.get("image", "—") for c in at if c.get("name") == "cilium-agent"), "—")
+        operator = next((c.get("image", "—") for c in ot if c.get("name") == "cilium-operator"), "—")
+        image_runs.append(r)
+        agent_imgs.append(agent)
+        operator_imgs.append(operator)
+    if image_runs:
         lines.append("")
         lines.append("**Container images:**")
-        lines.extend(img_lines)
+        lines.append("")
+        img_header = ["Container"] + [r.display_name for r in image_runs]
+        img_table.append(img_header)
+        img_table.append(["cilium-agent"] + [f"`{i}`" for i in agent_imgs])
+        img_table.append(["cilium-operator"] + [f"`{i}`" for i in operator_imgs])
+        lines.append(_table_md(img_table))
 
-    return lines or ["_No diffable keys present._"]
+    return lines
 
 
 # ---------- Anomalies ----------
@@ -374,10 +510,14 @@ def headline(runs: list[RunData]) -> str:
             s = _series(r.ok, metric)
             if not s.empty:
                 return (
-                    f"Single-run report for `{r.run_id}` ({r.provider}, {r.region}). "
-                    f"Mean `{metric}` = {_fmt(s.mean())} s (p90 {_fmt(s.quantile(0.9))} s)."
+                    f"Single-run report for **{r.display_name}** (`{r.run_id}`, "
+                    f"{r.region}). "
+                    f"`{metric}`: avg = {_fmt(s.mean())} s, "
+                    f"p50 = {_fmt(s.median())} s, "
+                    f"p90 = {_fmt(s.quantile(0.9))} s."
                 )
-        return f"Single-run report for `{r.run_id}` ({r.provider}, {r.region})."
+        return (f"Single-run report for **{r.display_name}** "
+                f"(`{r.run_id}`, {r.region}).")
 
     # Pick the best available headline metric (autoscaler-free preferred).
     metric = None
@@ -402,16 +542,15 @@ def headline(runs: list[RunData]) -> str:
         cni.append(s.mean() if not s.empty else None)
     cni_note = ""
     if all(v is not None for v in cni) and cni[fastest] and cni[slowest]:
-        cni_note = (f" CNI conflist install (`cni_conflist_install_s`): "
+        cni_note = (f" CNI conflist install (`cni_conflist_install_s`, avg): "
                     f"{_fmt(cni[fastest])} s vs {_fmt(cni[slowest])} s.")
 
     qualifier = " (autoscaler-free)" if metric == "node_ready_after_register_s" else ""
     return (
-        f"On `{metric}`{qualifier}, **`{runs[fastest].run_id}` "
-        f"({runs[fastest].provider}) is fastest at {_fmt(means[fastest])} s mean**, "
-        f"vs `{runs[slowest].run_id}` ({runs[slowest].provider}) at "
-        f"{_fmt(means[slowest])} s (~{delta:.1f}×).{cni_note} "
-        f"See the per-run `phase_profile.png` plots below for the phase decomposition."
+        f"On `{metric}`{qualifier}, **{runs[fastest].display_name} is fastest** "
+        f"(avg {_fmt(means[fastest])} s), vs **{runs[slowest].display_name}** "
+        f"(avg {_fmt(means[slowest])} s, ~{delta:.1f}×).{cni_note} "
+        f"See the per-run `phase_profile_report.png` plots for the phase decomposition."
     )
 
 
@@ -539,16 +678,35 @@ def render_docx(runs: list[RunData], out_path: Path) -> Path:
                     run.bold = True
 
     doc.add_heading("Cilium config diff", level=1)
-    for line in cilium_config_diff(runs):
-        if line.startswith("- "):
-            doc.add_paragraph(line[2:], style="List Bullet")
-        elif line.startswith("**"):
+    diff_rows, identical, image_rows = _cilium_diff_data(runs)
+    if not diff_rows and not identical and not image_rows:
+        doc.add_paragraph("No `cilium_config/cilium-config.json` available for any run.")
+    else:
+        if diff_rows:
+            t = doc.add_table(rows=len(diff_rows), cols=len(diff_rows[0]))
+            t.style = "Light Grid Accent 1"
+            for i, row in enumerate(diff_rows):
+                for j, cell in enumerate(row):
+                    t.rows[i].cells[j].text = cell
+                    for run in t.rows[i].cells[j].paragraphs[0].runs:
+                        run.font.size = Pt(9)
+                        if i == 0:
+                            run.bold = True
+        if identical:
             p = doc.add_paragraph()
-            p.add_run(line.strip("*")).bold = True
-        elif line.strip() == "":
-            continue
-        else:
-            doc.add_paragraph(line)
+            p.add_run("Identical across all runs: ").bold = True
+            p.add_run(", ".join(identical))
+        if image_rows:
+            doc.add_paragraph().add_run("Container images:").bold = True
+            t = doc.add_table(rows=len(image_rows), cols=len(image_rows[0]))
+            t.style = "Light Grid Accent 1"
+            for i, row in enumerate(image_rows):
+                for j, cell in enumerate(row):
+                    t.rows[i].cells[j].text = cell
+                    for run in t.rows[i].cells[j].paragraphs[0].runs:
+                        run.font.size = Pt(8)
+                        if i == 0:
+                            run.bold = True
 
     doc.add_heading("Anomalies", level=1)
     for line in anomalies(runs):
