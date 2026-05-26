@@ -1128,6 +1128,30 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
                 pk = _pod_key(ns, pod)
                 if pk:
                     container_image.setdefault((pk, cn), img)
+        # Fallback source: node_image_pulls_json includes (container, image)
+        # for every kubelet pull event captured on the new node, even when
+        # the pull was dropped from the main chart (e.g. "other" family
+        # with sub-second duration, or events where only "Pulled" was
+        # observed and `duration_s` is None). This covers legacy runs
+        # captured before the `image` field was added to
+        # `node_container_starts_json` and any container with a real but
+        # filtered-out pull lane (e.g. GKE anetd's `cni-writer`).
+        if "node_image_pulls_json" in ok.columns:
+            for v in ok["node_image_pulls_json"].dropna():
+                try:
+                    rows = _json2.loads(v) if isinstance(v, str) else []
+                except Exception:
+                    rows = []
+                for r in rows:
+                    img = r.get("image")
+                    cn = r.get("container")
+                    ns = r.get("namespace") or ""
+                    pod = r.get("pod") or ""
+                    if not (img and cn and pod):
+                        continue
+                    pk = _pod_key(ns, pod)
+                    if pk:
+                        container_image.setdefault((pk, cn), img)
 
         # (pod_key, container) pairs that already have a pull lane.
         pulled_pairs: set[tuple[str, str]] = set()
@@ -1181,11 +1205,30 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
             pull_lane_keys[label] = img
             pull_label_to_pod[label] = pk
             pull_label_to_container[label] = cn
-            # Zero-width marker: render as a tiny tick (5ms) ending exactly
-            # at the run lane's start so it visually anchors to the right
-            # spot without overlapping the create/run bars.
-            s = max(0.0, run_s - 5e-3)
-            e = run_s
+            # Anchor BEFORE the earliest visible event for this container
+            # (create lane if present, otherwise the run lane). This
+            # preserves the kubelet pipeline ordering Pulled -> Created ->
+            # Started even when we only have a zero-width synthetic
+            # marker (e.g. cached image, or `t_pulling`/`t_pulled` event
+            # that was dropped by per-image filters). Without this the
+            # marker visually appears AFTER `create:` because both are
+            # near `run_start` and the create lane spans
+            # [t_created, t_started].
+            anchor = run_s
+            if "/" in pk:
+                _ns_pk, _base_pk = pk.split("/", 1)
+            else:
+                _ns_pk, _base_pk = "", pk
+            c_off = creates_lookup.get((_ns_pk, _base_pk, cn))
+            if c_off is None:
+                _m = [v for k, v in creates_lookup.items()
+                      if k[2] == cn and (k[0], k[1]) == (_ns_pk, _base_pk)]
+                if _m:
+                    c_off = _m[0]
+            if c_off is not None and c_off < anchor:
+                anchor = c_off
+            s = max(0.0, anchor - 5e-3)
+            e = max(s + 5e-3, anchor)
             all_lanes.append((label, s, e, f"pull:{fam}"))
 
     # ---- Fill remaining per-pod gaps with `kubelet: sync wait` lanes ----
@@ -1395,6 +1438,73 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
     ax_regen = sub_axes.pop(0) if has_regen_bd else None
     ax_pulls = sub_axes.pop(0) if has_pulls_bd else None
     ax_pulls_tl = sub_axes.pop(0) if has_pulls_tl else None
+
+    # ---- Enforce pull <= create <= run ordering per (pod, container) ----
+    # Kubelet pulled/created/started timestamps usually obey this order,
+    # but clock-second rounding, missing `Pulling` events (only `Pulled`
+    # captured), and our synthetic zero-width pull markers can produce
+    # configurations where a `pull:` lane's start is >= a `create:` or
+    # `run:` lane's start for the same container. That visually places
+    # pull after create/run in the per-pod chronological sort below.
+    # Walk every (pod, container) triple and shift the pull lane's
+    # `[s, e]` backwards (preserving width) so its start is strictly
+    # earlier than the earliest of its sibling create/run lanes.
+    _by_pc: dict[tuple[str, str], dict[str, list[int]]] = {}
+    for _i, (_lbl, _s, _e, _a) in enumerate(all_lanes):
+        if isinstance(_a, str) and _a.startswith("pull:"):
+            _pk = pull_label_to_pod.get(_lbl)
+            _cn = pull_label_to_container.get(_lbl)
+            _kind = "pull"
+        elif _a == "init_run" and _lbl in create_label_to_pod:
+            _pk = create_label_to_pod.get(_lbl)
+            _cn = create_label_to_container.get(_lbl)
+            _kind = "create"
+        elif _a == "init_run" and _lbl in run_label_to_pod:
+            _pk = run_label_to_pod.get(_lbl)
+            _cn = run_label_to_container.get(_lbl)
+            _kind = "run"
+        elif _a == "init_run" and _lbl.startswith("run: "):
+            # Cilium-pod run lane (no run_label_to_pod entry); group by
+            # container name resolution to cilium_pod_key.
+            _cn = run_label_to_container.get(_lbl)
+            _pk = cilium_pod_key if _cn else None
+            _kind = "run"
+        else:
+            continue
+        if not (_pk and _cn):
+            continue
+        _by_pc.setdefault((_pk, _cn), {}).setdefault(_kind, []).append(_i)
+
+    _EPS = 5e-3
+    for (_pk, _cn), _kinds in _by_pc.items():
+        _pull_is = _kinds.get("pull") or []
+        _create_is = _kinds.get("create") or []
+        _run_is = _kinds.get("run") or []
+        if not _pull_is:
+            continue
+        _earliest_sibling = None
+        for _i in _create_is + _run_is:
+            _s = all_lanes[_i][1]
+            if _earliest_sibling is None or _s < _earliest_sibling:
+                _earliest_sibling = _s
+        if _earliest_sibling is None:
+            continue
+        for _i in _pull_is:
+            _lbl, _s, _e, _a = all_lanes[_i]
+            if _s + _EPS > _earliest_sibling:
+                _w = max(_e - _s, _EPS)
+                _new_e = max(0.0, _earliest_sibling - _EPS / 2)
+                _new_s = max(0.0, _new_e - _w)
+                all_lanes[_i] = (_lbl, _new_s, _new_e, _a)
+        # Also ensure create lanes don't start strictly after run.
+        if _create_is and _run_is:
+            _run_start = min(all_lanes[_i][1] for _i in _run_is)
+            for _i in _create_is:
+                _lbl, _s, _e, _a = all_lanes[_i]
+                if _s > _run_start:
+                    _w = max(_e - _s, _EPS)
+                    _new_s = max(0.0, _run_start - _w)
+                    all_lanes[_i] = (_lbl, _new_s, _run_start, _a)
 
     # ---- Chronological sort of all lanes ----
     # Before the pod-grouping reorder below, sort by start time so that
