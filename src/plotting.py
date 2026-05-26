@@ -707,10 +707,49 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
             if any(_c[0] == "cilium-agent" for _c in _cs):
                 _cilium_ns_base = (_ns, _base)
                 break
+        # Container names already rendered as dedicated per-init lanes
+        # from `init_containers_json`. We avoid emitting a duplicate
+        # `run:` lane for these, but we DO want to recover any cilium-pod
+        # container that's missing from `ic_offsets` — i.e. native sidecar
+        # init containers (`restartPolicy: Always`, in `state.running`,
+        # so kubelet reports no `terminated.started_at` — e.g. GKE
+        # anetd's `cni-writer`) and main / sidecar regular containers
+        # (`cilium-agent-metrics-collector`, GKE netd-style aux containers
+        # if any) that live in `containerStatuses`, not
+        # `initContainerStatuses`. Without this, the cilium pod group
+        # renders sparse on GKE compared to AKS/EKS.
+        _ic_names = {n for n, _s, _e in ic_offsets}
         for (ns, base), container_starts in starts_by_pod.items():
-            if (ns, base) == _cilium_ns_base:
-                continue
-            if base == "cilium" or base.startswith("cilium-"):
+            is_cilium_pod = ((ns, base) == _cilium_ns_base
+                             or base == "cilium" or base.startswith("cilium-"))
+            if is_cilium_pod:
+                # Only emit lanes for containers NOT already covered by
+                # the dedicated init-chain rendering. Leave `run_label_to_pod`
+                # unset so `_lane_pod_key` falls through to `cilium_pod_key`
+                # and groups them under the cilium dashed box.
+                filtered = [(c, ii, so) for c, ii, so in container_starts
+                            if c not in _ic_names]
+                if not filtered:
+                    continue
+                n = len(filtered)
+                for i, (cname, is_init, s_off) in enumerate(filtered):
+                    if i + 1 < n:
+                        next_started = filtered[i + 1][2]
+                        next_cname = filtered[i + 1][0]
+                        next_created = creates_lookup.get(
+                            (ns or "", base or "", next_cname))
+                        e_off = next_created if (next_created is not None
+                                                  and next_created <= next_started
+                                                  and next_created > s_off) \
+                                else next_started
+                    else:
+                        e_off = s_off + (1.0 if is_init else 2.0)
+                    if e_off <= s_off + 5e-3:
+                        continue
+                    label = f"run: {cname}"
+                    run_label_to_container[label] = cname
+                    all_lanes.append((label, s_off, e_off, "init_run"))
+                    _emit_create_lane_for_run(ns, base, cname, s_off, label)
                 continue
             pod_key = f"{ns}/{base}" if ns else base
             n = len(container_starts)
@@ -1027,6 +1066,127 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
             all_lanes.append((label, s, e, f"pull:{fam}"))
     else:
         cilium_pod_key = None
+        from .image_family import (
+            DEFAULT_FAMILY as _DF,
+            image_basename as _basename,
+            classify as _classify,
+        )
+        def _pod_key(ns: str, pod: str) -> str | None:
+            if not pod:
+                return None
+            base = _pod_basename(pod)
+            return f"{ns}/{base}" if ns else base
+        # When no real pull events were captured, recover cilium_pod_key
+        # from node_container_starts_json so synthetic pull lanes (below)
+        # still group under the cilium box.
+        if "node_container_starts_json" in ok.columns:
+            import json as _json
+            for v in ok["node_container_starts_json"].dropna():
+                try:
+                    rows = _json.loads(v) if isinstance(v, str) else []
+                except Exception:
+                    rows = []
+                for r in rows:
+                    if r.get("container") == "cilium-agent":
+                        cilium_pod_key = _pod_key(r.get("namespace") or "",
+                                                  r.get("pod") or "")
+                        if cilium_pod_key:
+                            break
+                if cilium_pod_key:
+                    break
+
+    # ---- Synthetic `pull:` lanes for cached images (no Pulling event) ----
+    # Every run lane should be paired with a `pull:` lane so the reader can
+    # see which image each container uses, even when kubelet skipped the
+    # Pulling event because the image was already cached on the node
+    # (common on GKE COS-baked images and Cilium-distroless sidecars across
+    # iterations 2+). We pull (ns, pod, container -> image) from
+    # node_container_starts_json (populated by Collector since this commit),
+    # find every (pod_key, container) referenced by a run lane that lacks a
+    # real pull lane, and insert a zero-width marker right before the run
+    # lane's start so it appears as a labeled tick under the right pod box.
+    if "node_container_starts_json" in ok.columns:
+        from .image_family import (
+            DEFAULT_FAMILY as _DF2,
+            image_basename as _basename2,
+            classify as _classify2,
+        )
+        import json as _json2
+        container_image: dict[tuple[str, str], str] = {}
+        for v in ok["node_container_starts_json"].dropna():
+            try:
+                rows = _json2.loads(v) if isinstance(v, str) else []
+            except Exception:
+                rows = []
+            for r in rows:
+                img = r.get("image")
+                cn = r.get("container")
+                ns = r.get("namespace") or ""
+                pod = r.get("pod") or ""
+                if not (img and cn and pod):
+                    continue
+                pk = _pod_key(ns, pod)
+                if pk:
+                    container_image.setdefault((pk, cn), img)
+
+        # (pod_key, container) pairs that already have a pull lane.
+        pulled_pairs: set[tuple[str, str]] = set()
+        for lbl in pull_label_to_pod:
+            pk = pull_label_to_pod.get(lbl)
+            cn = pull_label_to_container.get(lbl)
+            if pk and cn:
+                pulled_pairs.add((pk, cn))
+
+        def _run_pod_key(lbl: str, container: str) -> str | None:
+            pk = run_label_to_pod.get(lbl)
+            if pk:
+                return pk
+            # Cilium-pod run lanes don't set run_label_to_pod (they auto-
+            # group via _CILIUM_LIFECYCLE_ACTORS -> cilium_pod_key).
+            # Resolve by container-name lookup in container_image: when a
+            # container name maps to exactly one (pk, cn) entry, use that
+            # pk. If ambiguous, fall back to cilium_pod_key.
+            matches = {pk for (pk, cn) in container_image if cn == container}
+            if len(matches) == 1:
+                return next(iter(matches))
+            return cilium_pod_key
+
+        synth: list[tuple[str, str, float, str]] = []  # (pk, container, run_start, image)
+        seen_synth: set[tuple[str, str]] = set()
+        for lbl, s, _e, actor in all_lanes:
+            if actor != "init_run" or not lbl.startswith("run: "):
+                continue
+            cn = run_label_to_container.get(lbl)
+            if not cn:
+                continue
+            pk = _run_pod_key(lbl, cn)
+            if not pk:
+                continue
+            if (pk, cn) in pulled_pairs or (pk, cn) in seen_synth:
+                continue
+            img = container_image.get((pk, cn))
+            if not img:
+                continue
+            synth.append((pk, cn, s, img))
+            seen_synth.add((pk, cn))
+
+        for pk, cn, run_s, img in synth:
+            fam = _classify2(img) or _DF2
+            base = _basename2(img) or img
+            label = f"pull: {base}"
+            n = 2
+            while label in pull_lane_keys and pull_lane_keys[label] != img:
+                label = f"pull: {base} ({n})"
+                n += 1
+            pull_lane_keys[label] = img
+            pull_label_to_pod[label] = pk
+            pull_label_to_container[label] = cn
+            # Zero-width marker: render as a tiny tick (5ms) ending exactly
+            # at the run lane's start so it visually anchors to the right
+            # spot without overlapping the create/run bars.
+            s = max(0.0, run_s - 5e-3)
+            e = run_s
+            all_lanes.append((label, s, e, f"pull:{fam}"))
 
     # ---- Fill remaining per-pod gaps with `kubelet: sync wait` lanes ----
     # Now that ALL explainable lanes are emitted (pull/create/run/
@@ -1157,6 +1317,35 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
                 f"pods={sorted(pods_filter or [])}"
             )
             return None
+
+        # Narrow the image-pull sub-panel to only the images whose pull
+        # lane survived the filter, so the chart below reflects the same
+        # pods/containers as the main Gantt. `pull_lane_keys` maps the
+        # rendered pull label to the canonical image string used in
+        # `pull_image_order` / `image_pulls_by_image`.
+        _surviving_images: set[str] = set()
+        for lbl, _s, _e, actor in all_lanes:
+            if isinstance(actor, str) and actor.startswith("pull:"):
+                img = pull_lane_keys.get(lbl)
+                if img:
+                    # Aggregated rows may map a label to a comma-separated
+                    # "img1, img2" string (see agg_rows in pull emission);
+                    # split so each constituent image is retained.
+                    for part in img.split(","):
+                        part = part.strip()
+                        if part:
+                            _surviving_images.add(part)
+        if _surviving_images:
+            pull_image_order = [im for im in pull_image_order
+                                if im in _surviving_images
+                                or (_basename2(im) or im) in _surviving_images]
+            image_pulls_by_image = {im: image_pulls_by_image[im]
+                                    for im in pull_image_order
+                                    if im in image_pulls_by_image}
+        else:
+            pull_image_order = []
+            image_pulls_by_image = {}
+        has_pulls_bd = bool(pull_image_order)
 
     # Layout: main wall-clock Gantt on top, plus optional zoomed subplots
     # (CNI add\u2192Ready decomposition, Cilium-internal bootstrap).
@@ -1449,6 +1638,12 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
     ax.set_yticklabels([label for label, _, _, _ in all_lanes], fontsize=9)
     ax.set_xlabel("seconds since T1 (node registered)")
     ax.set_ylim(0.2, n_main + 1.2)
+    # Lanes are T1-relative; clamp left edge to 0 so synthetic markers
+    # that anchor a few ms before run-start don't push the origin
+    # negative.
+    _xr = ax.get_xlim()[1]
+    ax.set_xlim(left=0, right=_xr if _xr > 0 else None)
+    ax.margins(x=0)
 
     # Emphasise the T0->T1 cloud bringup latency as a prominent suptitle so
     # the reader immediately sees the dominant (and not-to-scale) cost.
@@ -1647,7 +1842,11 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
         ax_pulls.set_yticks(y_pulls)
         ax_pulls.set_yticklabels([_basename(d["image"]) or d["image"] for d in per_image],
                                  fontsize=7)
-        ax_pulls.set_xlim(0, max_dur * 1.22)
+        # Force the x-axis origin at 0: matplotlib's autoscaler can add a
+        # small negative margin when errorbar whiskers touch x=0, which
+        # makes the visualization appear to start below 0s.
+        ax_pulls.set_xlim(left=0, right=max(max_dur * 1.22, 0.1))
+        ax_pulls.margins(x=0)
         ax_pulls.set_ylim(0.3, n_pull_rows + 0.7)
         ax_pulls.set_xlabel("pull duration (seconds, median across iterations; whisker = p25..p75)")
         # Headline stats for the title. Recompute from the dedup
