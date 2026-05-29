@@ -189,6 +189,11 @@ class RunData:
         return unfiltered if unfiltered.exists() else None
 
     @property
+    def phase_stacked_png(self) -> Path | None:
+        p = self.run_dir / "plots" / "phase_stacked.png"
+        return p if p.exists() else None
+
+    @property
     def ok(self) -> pd.DataFrame:
         if "status" not in self.iterations.columns:
             return self.iterations
@@ -601,6 +606,25 @@ def render_markdown(runs: list[RunData], out_path: Path) -> Path:
         lines.append(f"![phase_profile {r.run_id}]({rel.as_posix()})")
         lines.append("")
 
+    lines.append("## Phase stacked")
+    lines.append("")
+    lines.append("Per-run stacked bar of the headline phases — quick visual "
+                 "of how each phase contributes to total `time_to_schedulable`.")
+    lines.append("")
+    for r in runs:
+        p = r.phase_stacked_png
+        if p is None:
+            lines.append(f"- _{r.run_id}: no `plots/phase_stacked.png`._")
+            continue
+        try:
+            rel = Path("..") / p.resolve().relative_to(out_path.resolve().parent.parent)
+        except ValueError:
+            rel = p.resolve()
+        lines.append(f"**{r.label}:**")
+        lines.append("")
+        lines.append(f"![phase_stacked {r.run_id}]({rel.as_posix()})")
+        lines.append("")
+
     lines.append("## Headline")
     lines.append("")
     lines.append(headline(runs))
@@ -659,6 +683,19 @@ def render_docx(runs: list[RunData], out_path: Path) -> Path:
         p = r.phase_profile_png
         if p is None:
             doc.add_paragraph(f"(no phase_profile.png for {r.run_id})")
+        else:
+            doc.add_picture(str(p), width=Inches(6.5))
+
+    doc.add_heading("Phase stacked", level=1)
+    doc.add_paragraph(
+        "Per-run stacked bar of the headline phases — quick visual of how "
+        "each phase contributes to total time_to_schedulable."
+    )
+    for r in runs:
+        doc.add_heading(r.label, level=2)
+        p = r.phase_stacked_png
+        if p is None:
+            doc.add_paragraph(f"(no phase_stacked.png for {r.run_id})")
         else:
             doc.add_picture(str(p), width=Inches(6.5))
 
