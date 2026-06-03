@@ -40,9 +40,11 @@ output:
   show_plots: false
 
 gke_standard:
-  # Trigger pod requests 1500m CPU / 2Gi — e2-medium is too small for CA to
-  # find a fit, leaving the pod Pending forever. e2-standard-4 has headroom.
-  machine_type: e2-standard-4
+  # Trigger pod requests 6000m CPU / 16Gi (see trigger_pod above; sized to
+  # force AKS NAP to pick D8). e2-standard-4 (4 vCPU) is too small for CA
+  # to find a fit, leaving the pod Pending forever and timing out every
+  # iteration. e2-standard-8 (8 vCPU / 32 GiB) matches the AKS D8s_v5 default.
+  machine_type: e2-standard-8
   num_nodes: 1
   min_nodes: 0
   max_nodes: 10
