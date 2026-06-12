@@ -221,6 +221,12 @@ def _augment_derived(df: pd.DataFrame) -> pd.DataFrame:
             s = _delta(end, start)
             if not s.isna().all():
                 df[col] = s
+    # Backfill trigger-pod lifecycle decomposition for legacy iterations.csv.
+    try:
+        from .analysis import enrich_trigger_pod_metrics
+        enrich_trigger_pod_metrics(df)
+    except Exception:
+        pass
     return df
 
 
@@ -585,7 +591,6 @@ def render_markdown(runs: list[RunData], out_path: Path) -> Path:
     lines.append(f"_Generated: {when}_  ")
     lines.append(f"_Runs analyzed: {run_ids}_")
     lines.append("")
-
     lines.append("## Phase profile")
     lines.append("")
     lines.append("Per-run mean phase Gantt (autoscaler/VM bringup shown as a number "
@@ -629,6 +634,28 @@ def render_markdown(runs: list[RunData], out_path: Path) -> Path:
     lines.append("")
     lines.append(headline(runs))
     lines.append("")
+
+    # Cross-provider pod-running breakdown (≥ 2 runs only).
+    pod_png = _build_pod_running_compare(runs, out_path.parent)
+    if pod_png is not None:
+        lines.append("## Pod-running breakdown (cross-provider)")
+        lines.append("")
+        lines.append(
+            "Decomposes the *trigger pod scheduled → Running* window — i.e. "
+            "the workload-side cost of pod sandbox setup + image pull + "
+            "container create/start — using only data already in each run's "
+            "`iterations.csv`. The top panel ranks providers by p50 total "
+            "and shows where the time is spent; the box and CDF panels "
+            "expose per-iteration spread."
+        )
+        lines.append("")
+        try:
+            rel = pod_png.resolve().relative_to(out_path.resolve().parent)
+            rel_str = rel.as_posix()
+        except ValueError:
+            rel_str = pod_png.resolve().as_posix()
+        lines.append(f"![compare_pod_running]({rel_str})")
+        lines.append("")
 
     lines.append("## KPI table")
     lines.append("")
@@ -702,6 +729,21 @@ def render_docx(runs: list[RunData], out_path: Path) -> Path:
     doc.add_heading("Headline", level=1)
     doc.add_paragraph(headline(runs))
 
+    pod_png = _build_pod_running_compare(runs, out_path.parent)
+    if pod_png is not None:
+        doc.add_heading("Pod-running breakdown (cross-provider)", level=1)
+        doc.add_paragraph(
+            "Decomposes the trigger pod scheduled → Running window into "
+            "sandbox / image pull / container create / container start "
+            "phases. Top panel: p50 per phase, ordered fastest-first. "
+            "Middle: distribution of trigger_total_s per provider. "
+            "Bottom: trigger_total_s CDF per provider."
+        )
+        try:
+            doc.add_picture(str(pod_png), width=Inches(6.5))
+        except Exception:
+            doc.add_paragraph(f"(failed to embed {pod_png.name})")
+
     doc.add_heading("KPI table", level=1)
     rows = build_kpi_table(runs)
     table = doc.add_table(rows=len(rows), cols=len(rows[0]))
@@ -772,6 +814,27 @@ def output_basename(runs: list[RunData]) -> str:
     if len(runs) == 2:
         return f"compare-{runs[0].run_id}-vs-{runs[1].run_id}"
     return f"compare-{runs[0].run_id}-plus{len(runs)-1}"
+
+
+def _build_pod_running_compare(runs: list[RunData], out_dir: Path) -> Path | None:
+    """Generate the cross-provider pod-running breakdown into ``out_dir``.
+
+    Reuses :func:`plotting._plot_compare_pod_running` so the report is
+    self-contained (no dependency on ``analysis/`` having been refreshed).
+    Returns the PNG path on success, ``None`` if fewer than 2 runs or
+    the plot could not be produced.
+    """
+    if len(runs) < 2:
+        return None
+    csvs = [r.run_dir / "iterations.csv" for r in runs
+            if (r.run_dir / "iterations.csv").exists()]
+    if len(csvs) < 2:
+        return None
+    try:
+        from .plotting import _plot_compare_pod_running
+        return _plot_compare_pod_running(csvs, out_dir)
+    except Exception:
+        return None
 
 
 def build_report(run_ids: list[str], *, last: int | None,

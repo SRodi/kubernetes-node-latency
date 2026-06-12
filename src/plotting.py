@@ -2911,6 +2911,135 @@ def _plot_compare_phase_decomposition(csvs: list[Path], out_dir: Path) -> Path |
     return p
 
 
+# Pod-running breakdown segments (left → right within the stacked bar).
+# Phase column → (legend label, ACTOR_COLORS key).
+_POD_RUNNING_PHASES = [
+    ("trigger_prepull_s",     "sandbox / CNI ADD",   "sandbox"),
+    ("trigger_image_pull_s",  "image pull",          "image_pull"),
+    ("trigger_create_s",      "container create",    "kubelet"),
+    ("trigger_run_gap_s",     "container start",     "kubelet_main"),
+]
+
+
+def _plot_compare_pod_running(csvs: list[Path], out_dir: Path) -> Path | None:
+    """Cross-provider decomposition of the [trigger pod scheduled → Running]
+    window into prepull / image_pull / create / run_gap phases.
+
+    Three panels (top → bottom):
+      1. Stacked horizontal bars (p50 of each phase per provider), ordered
+         by total time-to-running ascending. Single number to compare.
+      2. Box plot of ``trigger_total_s`` per provider — shows distribution.
+      3. CDF of ``trigger_total_s`` per provider — same as compare_cdf.png
+         but for the pod-running KPI rather than node-ready.
+    """
+    from .analysis import enrich_trigger_pod_metrics
+
+    runs: list[tuple[str, pd.DataFrame]] = []
+    for csv in csvs:
+        try:
+            df = pd.read_csv(csv)
+        except Exception:
+            continue
+        df = enrich_trigger_pod_metrics(df)
+        df = _ok(df)
+        if df.empty:
+            continue
+        if pd.to_numeric(df.get("trigger_total_s"), errors="coerce").dropna().empty:
+            continue
+        runs.append((_run_label(csv), df))
+    if not runs:
+        return None
+
+    def _p50(df: pd.DataFrame, col: str) -> float:
+        s = pd.to_numeric(df.get(col), errors="coerce").dropna()
+        return float(s.quantile(0.50)) if not s.empty else 0.0
+
+    # Sort by p50 total ascending so the fastest provider sits on top.
+    labels_totals = [(lbl, df, _p50(df, "trigger_total_s")) for lbl, df in runs]
+    labels_totals.sort(key=lambda x: x[2])
+    labels = [x[0] for x in labels_totals]
+    dfs = [x[1] for x in labels_totals]
+    totals = [x[2] for x in labels_totals]
+
+    n = len(labels)
+    fig, axes = plt.subplots(
+        3, 1,
+        figsize=(11, max(5.5, 0.5 * n + 6.5)),
+        gridspec_kw={"height_ratios": [max(2.0, 0.45 * n + 1.0), 3.0, 3.0]},
+    )
+    ax_bar, ax_box, ax_cdf = axes
+
+    # ---- Panel 1: stacked horizontal bars (p50 per phase) ----
+    y = np.arange(n)
+    left = np.zeros(n)
+    for col, legend, color_key in _POD_RUNNING_PHASES:
+        widths = np.array([_p50(df, col) for df in dfs])
+        if not widths.any():
+            continue
+        ax_bar.barh(y, widths, left=left, height=0.62,
+                    color=ACTOR_COLORS.get(color_key, "#cbd5e1"),
+                    edgecolor="white", label=legend)
+        left = left + widths
+    ax_bar.set_yticks(y)
+    ax_bar.set_yticklabels(labels, fontsize=9)
+    ax_bar.invert_yaxis()  # fastest provider at the top
+    ax_bar.set_xlabel("seconds (p50 of each phase)")
+    ax_bar.set_title(
+        "Pod-running decomposition by provider — "
+        "p50 trigger pod: scheduled → Running"
+    )
+    ax_bar.grid(True, axis="x", alpha=0.3)
+    ax_bar.legend(loc="lower right", fontsize=8, framealpha=0.95, ncol=2)
+    # Annotate total at the end of each bar.
+    for i, t in enumerate(totals):
+        ax_bar.text(left[i], y[i], f"  {t:.2f}s", va="center",
+                    fontsize=8, color="#374151")
+
+    # ---- Panel 2: box plot of trigger_total_s ----
+    box_data = [pd.to_numeric(df.get("trigger_total_s"), errors="coerce").dropna().values
+                for df in dfs]
+    box_pos = np.arange(1, n + 1)
+    bp = ax_box.boxplot(
+        box_data, positions=box_pos, orientation="horizontal", widths=0.55,
+        patch_artist=True, showfliers=True,
+    )
+    for patch in bp["boxes"]:
+        patch.set_facecolor(ACTOR_COLORS["trigger_pod"])
+        patch.set_alpha(0.55)
+        patch.set_edgecolor("#581c87")
+    for med in bp["medians"]:
+        med.set_color("#1f2937"); med.set_linewidth(1.4)
+    ax_box.set_yticks(box_pos)
+    ax_box.set_yticklabels(labels, fontsize=9)
+    ax_box.invert_yaxis()
+    ax_box.set_xlabel("trigger_total_s (sandbox_setup_s) — distribution")
+    ax_box.set_title("Per-iteration spread of the pod-running window")
+    ax_box.grid(True, axis="x", alpha=0.3)
+
+    # ---- Panel 3: CDF overlay of trigger_total_s ----
+    for lbl, df in zip(labels, dfs):
+        s = pd.to_numeric(df.get("trigger_total_s"), errors="coerce").dropna().sort_values()
+        if s.empty:
+            continue
+        cdf = np.arange(1, len(s) + 1) / len(s)
+        ax_cdf.plot(s.values, cdf, marker=".", label=lbl)
+    ax_cdf.set_xlabel("trigger_total_s (s)")
+    ax_cdf.set_ylabel("CDF")
+    ax_cdf.set_title("trigger_total_s CDF — provider comparison")
+    ax_cdf.grid(True, alpha=0.3)
+    ax_cdf.legend(fontsize=8, loc="lower right")
+
+    fig.suptitle(
+        "Trigger pod lifecycle — cross-provider comparison",
+        fontsize=12, fontweight="bold", y=0.998,
+    )
+    fig.tight_layout(rect=(0, 0, 1.0, 0.985))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    p = out_dir / "compare_pod_running.png"
+    fig.savefig(p, dpi=140); plt.close(fig)
+    return p
+
+
 def plot_compare(csvs: list[Path], out_dir: Path) -> list[Path]:
     """Overlay headline-latency CDF across multiple runs and emit a
     cross-provider phase decomposition figure (cross-provider compare)."""
@@ -2964,4 +3093,7 @@ def plot_compare(csvs: list[Path], out_dir: Path) -> list[Path]:
     decomp = _plot_compare_phase_decomposition(csvs, out_dir)
     if decomp is not None:
         out.append(decomp)
+    pod_running = _plot_compare_pod_running(csvs, out_dir)
+    if pod_running is not None:
+        out.append(pod_running)
     return out
