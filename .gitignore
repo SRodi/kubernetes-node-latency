@@ -7,3 +7,4 @@ results/
 *.egg-info/
 .pytest_cache/
 analysis/
+.copilot-session/

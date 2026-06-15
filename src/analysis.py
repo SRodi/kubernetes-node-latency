@@ -33,6 +33,31 @@ TRIGGER_POD_METRICS = [
     # summary code can drive directly off `trigger_total_s` rather than
     # the legacy name.
     "trigger_total_s",
+    # T_trigger_scheduled − T4b_schedulable. The gap between the node
+    # becoming schedulable (taints cleared) and the scheduler binding
+    # the trigger pod. Captures scheduler-bind latency / scheduling-cycle
+    # cadence — usually < 1 s, but can be larger on cold clusters.
+    "trigger_scheduler_wait_s",
+    # T5_pod_running − T4b_schedulable. The broader "node became usable
+    # for a workload" window: scheduler bind + sandbox + pull + create +
+    # start. Equals trigger_scheduler_wait_s + trigger_total_s.
+    "pod_running_from_schedulable_s",
+    # T4b_schedulable − T_taint_observed. How long the configured
+    # NoSchedule "blocking" taints (e.g. `node.cilium.io/agent-not-ready`)
+    # were *actually present* on the node before clearing. Non-null only
+    # on providers that bootstrap with a blocking taint (AKS/EKS+Cilium,
+    # AKS BYOCNI). Null on providers that gate scheduling via Node Ready
+    # (GKE) since no blocking taint is configured / observed.
+    "taint_blocking_duration_s",
+    # T_trigger_scheduled − T1_node_registered. Full pre-workload delay
+    # from node-registered to scheduler binding the trigger pod.
+    "trigger_scheduled_from_t1_s",
+    # T_trigger_scheduled − T1c_cni_conflist. "Post-network-ready" gap:
+    # on AKS/EKS this is dominated by NoSchedule taint clear; on GKE
+    # there is no taint, so this is just the Node Ready transition +
+    # scheduling cycle. Demonstrates that even taint-free providers
+    # cannot bind a pod until network is wired.
+    "post_network_to_scheduled_s",
 ]
 
 
@@ -86,6 +111,14 @@ def enrich_trigger_pod_metrics(df: pd.DataFrame) -> pd.DataFrame:
         if "T_trigger_scheduled" in df.columns else pd.Series([pd.NaT] * len(df))
     t5 = pd.to_datetime(df.get("T5_pod_running"), utc=True, errors="coerce") \
         if "T5_pod_running" in df.columns else pd.Series([pd.NaT] * len(df))
+    t4b = pd.to_datetime(df.get("T4b_schedulable"), utc=True, errors="coerce") \
+        if "T4b_schedulable" in df.columns else pd.Series([pd.NaT] * len(df))
+    t_taint = pd.to_datetime(df.get("T_taint_observed"), utc=True, errors="coerce") \
+        if "T_taint_observed" in df.columns else pd.Series([pd.NaT] * len(df))
+    t1 = pd.to_datetime(df.get("T1_node_registered"), utc=True, errors="coerce") \
+        if "T1_node_registered" in df.columns else pd.Series([pd.NaT] * len(df))
+    t1c = pd.to_datetime(df.get("T1c_cni_conflist"), utc=True, errors="coerce") \
+        if "T1c_cni_conflist" in df.columns else pd.Series([pd.NaT] * len(df))
 
     pulls_col = df["node_image_pulls_json"] if "node_image_pulls_json" in df.columns \
         else pd.Series([None] * len(df))
@@ -100,7 +133,36 @@ def enrich_trigger_pod_metrics(df: pd.DataFrame) -> pd.DataFrame:
         pod = pod_col.iat[i]
         s_sched = sched.iat[i]
         s_run = t5.iat[i]
+        s_t4b = t4b.iat[i]
+        s_taint = t_taint.iat[i]
+        s_t1 = t1.iat[i]
+        s_t1c = t1c.iat[i]
+        # Taint-blocking duration: how long the configured blocking
+        # taints were observed on the node before clearing. Only
+        # meaningful when both T_taint_observed and T4b_schedulable
+        # exist; on no-taint providers (GKE) T_taint_observed is NaN
+        # and this stays None.
+        taint_block = _seconds_between(s_t4b, s_taint)
+        # Pre-workload offsets relative to T1_node_registered. These
+        # let the cross-provider Gantt show the full timeline from
+        # node registration through scheduling, so that GKE (no taint)
+        # and AKS/EKS (taint) can be compared on a single axis.
+        sched_from_t1 = _seconds_between(s_sched, s_t1)
+        post_network_to_sched = _seconds_between(s_sched, s_t1c)
         total = _seconds_between(s_run, s_sched)
+        # Anchor "node became schedulable" at the earliest of T4b_schedulable
+        # and T_trigger_scheduled. The harness watch can observe taints
+        # clearing 100s of ms after the scheduler has already bound the pod
+        # (kube-scheduler informer sees the same Node update earlier), so
+        # raw T4b would yield a *negative* scheduler-bind wait and a node→run
+        # value shorter than pod→run. The scheduler binding is itself proof
+        # the node was schedulable by that point, so floor T4b at T_sched.
+        s_t4b_eff = s_t4b
+        if s_sched is not None and not pd.isna(s_sched):
+            if s_t4b is None or pd.isna(s_t4b) or s_sched < s_t4b:
+                s_t4b_eff = s_sched
+        sched_wait = _seconds_between(s_sched, s_t4b_eff)
+        node_to_run = _seconds_between(s_run, s_t4b_eff)
 
         pulls = _safe_json_list(pulls_col.iat[i])
         creates = _safe_json_list(creates_col.iat[i])
@@ -150,6 +212,11 @@ def enrich_trigger_pod_metrics(df: pd.DataFrame) -> pd.DataFrame:
         out["trigger_create_s"].append(create)
         out["trigger_run_gap_s"].append(run_gap)
         out["trigger_total_s"].append(total)
+        out["trigger_scheduler_wait_s"].append(sched_wait)
+        out["pod_running_from_schedulable_s"].append(node_to_run)
+        out["taint_blocking_duration_s"].append(taint_block)
+        out["trigger_scheduled_from_t1_s"].append(sched_from_t1)
+        out["post_network_to_scheduled_s"].append(post_network_to_sched)
 
     for c in TRIGGER_POD_METRICS:
         new_vals = pd.to_numeric(pd.Series(out[c]), errors="coerce")
@@ -179,6 +246,11 @@ METRICS = [
     "trigger_create_s",
     "trigger_run_gap_s",
     "trigger_total_s",
+    "trigger_scheduler_wait_s",
+    "pod_running_from_schedulable_s",
+    "taint_blocking_duration_s",
+    "trigger_scheduled_from_t1_s",
+    "post_network_to_scheduled_s",
     # ---- Legacy / supporting (T0-anchored or component-level) ----
     "node_startup_latency_s",
     "time_to_schedulable_s",

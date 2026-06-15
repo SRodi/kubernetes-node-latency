@@ -497,10 +497,15 @@ def _trigger_pod_records(n: int = 3, *, with_pull: bool = True) -> list[Iteratio
 
 
 def test_enrich_trigger_pod_metrics_decomposes_window():
-    """The 4 phase columns must sum to trigger_total_s (== sandbox_setup_s)."""
+    """The 4 phase columns must sum to trigger_total_s (== sandbox_setup_s).
+
+    Also exercises the broader [T4b_schedulable, T5_pod_running] window:
+    scheduler bind wait + trigger_total_s == pod_running_from_schedulable_s.
+    """
     df = to_dataframe(_trigger_pod_records(2))
     for col in ("trigger_prepull_s", "trigger_image_pull_s",
-                "trigger_create_s", "trigger_run_gap_s", "trigger_total_s"):
+                "trigger_create_s", "trigger_run_gap_s", "trigger_total_s",
+                "trigger_scheduler_wait_s", "pod_running_from_schedulable_s"):
         assert col in df.columns
     row = df.iloc[0]
     # Total = T5 − T_trigger_scheduled = 8.0s.
@@ -514,6 +519,12 @@ def test_enrich_trigger_pod_metrics_decomposes_window():
     assert row["trigger_prepull_s"] == 3.0
     # trigger_total_s == sandbox_setup_s.
     assert row["trigger_total_s"] == row["sandbox_setup_s"]
+    # Scheduler bind wait = T_trigger_scheduled − T4b = 22 − 20 = 2s.
+    assert row["trigger_scheduler_wait_s"] == 2.0
+    # Broader window = T5 − T4b = 30 − 20 = 10s (== sched_wait + total).
+    assert row["pod_running_from_schedulable_s"] == 10.0
+    assert (row["pod_running_from_schedulable_s"]
+            == row["trigger_scheduler_wait_s"] + row["trigger_total_s"])
 
 
 def test_enrich_trigger_pod_metrics_handles_cached_image():
