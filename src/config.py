@@ -87,7 +87,7 @@ class AKSCfg:
 
 @dc.dataclass
 class GKEStandardCfg:
-    machine_type: str = "e2-standard-4"
+    machine_type: str = "e2-standard-8"
     num_nodes: int = 1
     min_nodes: int = 0
     max_nodes: int = 10
@@ -96,7 +96,7 @@ class GKEStandardCfg:
     # nodeSelector so every iteration deterministically provisions a fresh
     # VM (no cordon-and-pray dance with cluster autoscaler).
     trigger_pool_name: str = "latencypool"
-    trigger_pool_machine_type: str = "e2-standard-4"
+    trigger_pool_machine_type: str = "e2-standard-8"
     trigger_pool_min_nodes: int = 0
     trigger_pool_max_nodes: int = 50
 

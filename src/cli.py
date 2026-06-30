@@ -122,6 +122,15 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
 
 def _cmd_plot(args: argparse.Namespace) -> int:
     from .report import resolve_runs
+    _VALID_ONLY = {"cdf", "phase_decomposition", "pod_running"}
+    _only: set[str] | None = None
+    if args.only:
+        _only = {x.strip() for x in args.only.split(",") if x.strip()}
+        bad = _only - _VALID_ONLY
+        if bad:
+            print(f"--only: unknown choices {sorted(bad)}; "
+                  f"valid: {sorted(_VALID_ONLY)}", file=sys.stderr)
+            return 2
     if args.last is not None:
         base = Path(args.base_dir or "results")
         run_dirs = resolve_runs([], last=args.last, base_dir=base)
@@ -159,7 +168,8 @@ def _cmd_plot(args: argparse.Namespace) -> int:
     if args.compare:
         base_run = run_dirs[0]
         csvs = [Path(d) / "iterations.csv" for d in args.compare]
-        cmp_paths = plot_compare([base_run / "iterations.csv", *csvs], base_run / "plots")
+        cmp_paths = plot_compare([base_run / "iterations.csv", *csvs],
+                                 base_run / "plots", only=_only)
         print("comparison:")
         for p in cmp_paths:
             print(f"  {p}")
@@ -171,7 +181,7 @@ def _cmd_plot(args: argparse.Namespace) -> int:
         # newest first in the legend / cdf line order
         ordered = sorted(run_dirs, key=lambda p: p.name, reverse=True)
         csvs = [d / "iterations.csv" for d in ordered]
-        cmp_paths = plot_compare(csvs, out_dir)
+        cmp_paths = plot_compare(csvs, out_dir, only=_only)
         print(f"comparison (--last {args.last}):")
         for p in cmp_paths:
             print(f"  {p}")
@@ -270,6 +280,10 @@ def main(argv: list[str] | None = None) -> int:
     pp.add_argument("--out-suffix", default=None,
                     help="custom suffix for filtered phase_profile output "
                          "(default: 'filtered' when --containers/--pods is set)")
+    pp.add_argument("--only", default=None,
+                    help="comma-separated subset of compare plots to emit "
+                         "(choices: cdf, phase_decomposition, pod_running). "
+                         "Default: emit all. Per-run plots are still produced.")
     pp.set_defaults(func=_cmd_plot)
 
     pc = sub.add_parser("clean", help="remove all run dirs under results/")

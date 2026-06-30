@@ -2911,16 +2911,320 @@ def _plot_compare_phase_decomposition(csvs: list[Path], out_dir: Path) -> Path |
     return p
 
 
-def plot_compare(csvs: list[Path], out_dir: Path) -> list[Path]:
-    """Overlay headline-latency CDF across multiple runs and emit a
-    cross-provider phase decomposition figure (cross-provider compare)."""
+# Trigger-pod lifecycle phase decomposition for the positional Gantt
+# panel. Each entry: (iterations.csv column, legend label, ACTOR_COLORS
+# key, is_kubelet_phase). Anchored at T_trigger_scheduled = 0:
+#
+#   [0, prepull) = sandbox / CNI ADD             (kubelet)
+#   [prepull, +image_pull) = registry pull        (network)
+#   [+create) = CRI CreateContainer roundtrip     (kubelet)
+#   [+run_gap) = StartContainer + entrypoint      (kubelet)
+#
+# Sum of widths == trigger_total_s == sandbox_setup_s.
+_POD_RUNNING_PHASES_POD = [
+    ("trigger_prepull_s",     "sandbox / CNI ADD",  "sandbox",      True),
+    ("trigger_image_pull_s",  "image pull",         "image_pull",   False),
+    ("trigger_create_s",      "container create",   "kubelet",      True),
+    ("trigger_run_gap_s",     "container start",    "kubelet_main", True),
+]
+
+
+def _plot_compare_pod_running(csvs: list[Path], out_dir: Path) -> Path | None:
+    """Cross-provider visualization aimed at answering three questions:
+
+    1. **Where in the lifecycle does sandbox setup happen, and how
+       long does it take?** — Panel 1 renders a *positional* Gantt
+       anchored at ``T_trigger_scheduled = 0``: each provider gets a
+       single horizontal bar whose segments are colored by phase and
+       laid out in time-order (sandbox / CNI ADD → image pull →
+       container create → container start). The width of the first
+       (yellow) segment is the sandbox / CNI ADD duration and its
+       horizontal position shows that it always starts at scheduler
+       bind. Total bar width == ``trigger_total_s``.
+    2. **Does the provider gate scheduling with a NoSchedule taint?**
+       — annotated to the right of each provider label is
+       ``taint_blocking_duration_s`` (= ``T4b_schedulable −
+       T_taint_observed``). It is present on AKS/EKS (where Cilium /
+       AKS bootstrap the node with a NoSchedule taint that is removed
+       once the CNI is ready) and absent on GKE (no blocking taint
+       configured; Node Ready already requires the CNI conflist, so
+       scheduling is gated by Ready rather than by a taint).
+    3. **How much of pod startup is kubelet work vs network (image
+       pull)?** — Panel 2 collapses the four phases of panel 1 into
+       two grouped segments per provider: **kubelet** (prepull + create
+       + run_gap — everything kubelet does locally) vs **network**
+       (image pull from the registry). Whichever segment dominates is
+       the bottleneck to attack.
+
+    Panel 3 is a CDF of ``trigger_total_s`` per provider showing
+    per-iteration spread.
+    """
+    from .analysis import enrich_trigger_pod_metrics
+
+    runs: list[tuple[str, pd.DataFrame]] = []
+    for csv in csvs:
+        try:
+            df = pd.read_csv(csv)
+        except Exception:
+            continue
+        df = enrich_trigger_pod_metrics(df)
+        df = _ok(df)
+        if df.empty:
+            continue
+        total = pd.to_numeric(df.get("trigger_total_s"), errors="coerce")
+        if total.dropna().empty:
+            continue
+        # Restrict to rows representing a *complete* trigger-pod iteration.
+        # Partial iterations leave phase columns at 0 even when the pod
+        # never reached Running, which would otherwise drag every per-phase
+        # p50 to ~0 while ``trigger_total_s`` (computed only on completed
+        # rows) reports the real headline — yielding a stacked bar whose
+        # segment widths are wildly inconsistent with the annotated total.
+        df = df[total.notna()].copy()
+        runs.append((_run_label(csv), df))
+    if not runs:
+        return None
+
+    def _p50(df: pd.DataFrame, col: str) -> float:
+        s = pd.to_numeric(df.get(col), errors="coerce").dropna()
+        return float(s.quantile(0.50)) if not s.empty else 0.0
+
+    def _p50_optional(df: pd.DataFrame, col: str) -> float | None:
+        if col not in df.columns:
+            return None
+        s = pd.to_numeric(df.get(col), errors="coerce").dropna()
+        return float(s.quantile(0.50)) if not s.empty else None
+
+    # Sort fastest provider first (smallest trigger_total_s p50).
+    rows = [(lbl, df, _p50(df, "trigger_total_s"),
+             _p50_optional(df, "taint_blocking_duration_s"))
+            for lbl, df in runs]
+    rows.sort(key=lambda x: x[2])
+    labels = [x[0] for x in rows]
+    dfs = [x[1] for x in rows]
+    totals = [x[2] for x in rows]
+    taint_p50 = [x[3] for x in rows]
+
+    # Node-bootstrap + scheduling p50s used by the two-lane Gantt.
+    cni_install_p50 = [_p50_optional(df, "cni_conflist_install_s") or 0.0
+                       for df in dfs]
+    # Median moment, relative to T1_node_registered, at which the
+    # bootstrap NoSchedule taint was *actually removed* by the CNI
+    # agent (T4b − T1, where T4b is the watch event observing the
+    # taint absent). Used to position the right edge of the amber
+    # "agent ready + un-taint" sub-segment at the exact median T4b
+    # moment, not at an additive p50(T1c−T1) + p50(T4b−T4) which
+    # could drift away from the real schedulable instant.
+    def _p50_t4b_from_t1(df: pd.DataFrame) -> float | None:
+        if "T4b_schedulable" not in df.columns or "T1_node_registered" not in df.columns:
+            return None
+        t4b = pd.to_datetime(df["T4b_schedulable"], errors="coerce", utc=True)
+        t1 = pd.to_datetime(df["T1_node_registered"], errors="coerce", utc=True)
+        delta = (t4b - t1).dt.total_seconds()
+        delta = delta[delta.notna() & (delta >= 0)]
+        return float(delta.quantile(0.50)) if not delta.empty else None
+    t4b_from_t1_p50 = [_p50_t4b_from_t1(df) for df in dfs]
+    # Amber width = T4b − T1c (clamped ≥ 0). If T4b is unknown
+    # (provider has no blocking taint, e.g. GKE) we fall back to 0
+    # so the segment collapses.
+    untaint_window_p50 = [
+        max((t4b or c) - c, 0.0)
+        for c, t4b in zip(cni_install_p50, t4b_from_t1_p50)
+    ]
+    sched_from_t1_p50 = [_p50_optional(df, "trigger_scheduled_from_t1_s") or 0.0
+                         for df in dfs]
+
+    # Label augmentation: append "[taint blocked: Xs]" (AKS/EKS) or
+    # "[no blocking taint]" (GKE) right of the provider label so the
+    # gating mechanism is visible at a glance.
+    augmented_labels = []
+    for lbl, t in zip(labels, taint_p50):
+        if t is None:
+            augmented_labels.append(f"{lbl}\n[no blocking taint]")
+        else:
+            augmented_labels.append(f"{lbl}\n[taint blocked node: {t:.1f}s]")
+
+    n = len(labels)
+    bar_h = max(2.2, 0.85 * n + 0.8)
+    fig, axes = plt.subplots(
+        3, 1,
+        figsize=(13, bar_h + max(1.8, 0.55 * n + 0.8) + 3.0 + 1.5),
+        gridspec_kw={"height_ratios": [bar_h, max(1.8, 0.55 * n + 0.8), 3.0]},
+    )
+    ax_gantt, ax_split, ax_cdf = axes
+
+    # ---- Panel 1: two-lane Gantt anchored at T1_node_registered = 0.
+    # Per provider, we render two parallel sub-bars:
+    #   Top sub-bar (green): node bootstrap — "CNI install / network
+    #     wiring" — spans [0, cni_conflist_install_s].
+    #   Bottom sub-bar (phase-colored): pod lifecycle — starts at
+    #     trigger_scheduled_from_t1_s, runs trigger_total_s seconds,
+    #     decomposed into the four trigger-pod phases.
+    # The horizontal *gap* (or *overlap*) between the green bar's end
+    # and the start of the pod lifecycle bar IS the story:
+    #   * AKS/EKS: pod lifecycle starts *after* network ready because
+    #     the NoSchedule taint also has to clear → visible gap.
+    #   * GKE: pod lifecycle can start *before* network ready (no
+    #     taint), so the bars overlap — the sandbox / CNI ADD phase
+    #     within the bottom bar absorbs the wait for CNI conflist.
+    y = np.arange(n)
+    sub_offset = 0.20
+    sub_h = 0.32
+    y_net = y - sub_offset
+    y_pod = y + sub_offset
+
+    # Top sub-bar: decomposed node-bootstrap window.
+    #   Segment 1 (green) = CNI plugin install (T1 → T1c): kubelet
+    #     finds a usable CNI conflist on disk; Ready=True follows.
+    #   Segment 2 (red) = post-Ready bootstrap-taint clearance
+    #     (T1c → T4b, with T4b the exact moment the harness watch
+    #     observed the bootstrap taint absent): the CNI agent's own
+    #     post-conflist work (eBPF / IPAM / identity / health) before
+    #     it removes its bootstrap NoSchedule taint. Absent on GKE
+    #     Autopilot (no blocking taint configured).
+    ax_gantt.barh(y_net, cni_install_p50, height=sub_h, left=0.0,
+                  color="#86efac", edgecolor="white", linewidth=0.5,
+                  label="node bootstrap — CNI plugin install (T1→T1c)")
+    ax_gantt.barh(y_net, untaint_window_p50, height=sub_h,
+                  left=cni_install_p50,
+                  color=ACTOR_COLORS["scheduler"],
+                  edgecolor="white", linewidth=0.5,
+                  label="agent ready + un-taint (T1c→T4b)")
+
+    # Bottom sub-bar: pod lifecycle (phases of trigger-pod), starting at
+    # T_trigger_scheduled relative to T1.
+    seen_legend: set[str] = set()
+    for col, legend, color_key, _is_kubelet in _POD_RUNNING_PHASES_POD:
+        widths = np.array([_p50(df, col) for df in dfs])
+        # Build left = sched_from_t1 + cumulative sum of earlier phases.
+        lefts = np.array(sched_from_t1_p50, dtype=float).copy()
+        for prior_col, *_ in _POD_RUNNING_PHASES_POD:
+            if prior_col == col:
+                break
+            lefts = lefts + np.array([_p50(df, prior_col) for df in dfs])
+        label = legend if legend not in seen_legend else None
+        seen_legend.add(legend)
+        ax_gantt.barh(y_pod, widths, left=lefts, height=sub_h,
+                      color=ACTOR_COLORS.get(color_key, "#cbd5e1"),
+                      edgecolor="white", linewidth=0.5, label=label)
+
+    # Vertical "network ready" tick per provider — emphasises the
+    # milestone position so even when the bars overlap (GKE) the
+    # reader can see the exact x-coordinate at which CNI was ready.
+    for i, c in enumerate(cni_install_p50):
+        ax_gantt.plot([c, c], [y_net[i] - sub_h / 2, y_pod[i] + sub_h / 2],
+                      color="#15803d", linewidth=1.0, linestyle=":")
+
+    ax_gantt.set_yticks(y)
+    ax_gantt.set_yticklabels(augmented_labels, fontsize=8)
+    # Padded ylim with extra room below the last bar so the in-axes
+    # legend (lower-right) has empty real estate and never overlaps.
+    ax_gantt.set_ylim(n - 0.5 + 1.4, -0.7)
+    x_max_gantt = max(
+        max((s + t) for s, t in zip(sched_from_t1_p50, totals)),
+        max(c + u for c, u in zip(cni_install_p50, untaint_window_p50)),
+    ) * 1.20 + 0.5
+    ax_gantt.set_xlim(0, x_max_gantt)
+    ax_gantt.set_xlabel(
+        "seconds since node registered (anchored at T1_node_registered = 0). "
+        "Dotted green tick = network ready (T1c_cni_conflist)."
+    )
+    ax_gantt.set_title(
+        "Node registered → Pod Running — two lanes per provider: top = "
+        "node bootstrap, bottom = pod lifecycle (p50)",
+        loc="left", fontsize=10,
+    )
+    ax_gantt.grid(True, axis="x", alpha=0.3)
+    ax_gantt.legend(loc="lower right", fontsize=8, framealpha=0.95,
+                    title="phase / lane", ncol=2)
+    # Annotate end of pod lifecycle with full T1→T5 duration.
+    for i in range(n):
+        end = sched_from_t1_p50[i] + totals[i]
+        ax_gantt.text(end, y_pod[i],
+                      f"  T5−T1 = {end:.1f}s  (sched at +{sched_from_t1_p50[i]:.1f}s)",
+                      va="center", fontsize=8, color="#374151")
+
+    # ---- Panel 2: kubelet vs network split (within pod→run window).
+    # kubelet = prepull + create + run_gap (everything kubelet does
+    # locally — sandbox setup, container create, container start)
+    # network = image pull (registry round-trip)
+    kub_p50 = np.array([
+        _p50(df, "trigger_prepull_s")
+        + _p50(df, "trigger_create_s")
+        + _p50(df, "trigger_run_gap_s")
+        for df in dfs
+    ])
+    net_p50 = np.array([_p50(df, "trigger_image_pull_s") for df in dfs])
+    ax_split.barh(y, kub_p50, height=0.55,
+                  color=ACTOR_COLORS.get("kubelet_main", "#93c5fd"),
+                  edgecolor="white", linewidth=0.5, label="kubelet (sandbox + create + start)")
+    ax_split.barh(y, net_p50, left=kub_p50, height=0.55,
+                  color=ACTOR_COLORS.get("image_pull", "#fbbf24"),
+                  edgecolor="white", linewidth=0.5, label="network (image pull)")
+    ax_split.set_yticks(y)
+    ax_split.set_yticklabels(labels, fontsize=9)
+    ax_split.invert_yaxis()
+    ax_split.set_xlim(0, max((k + nv) for k, nv in zip(kub_p50, net_p50)) * 1.25 + 0.5)
+    ax_split.set_xlabel("seconds (p50)")
+    ax_split.set_title(
+        "Kubelet (sandbox + create + start) vs network (image pull) — "
+        "which is the bottleneck?",
+        loc="left", fontsize=10,
+    )
+    ax_split.grid(True, axis="x", alpha=0.3)
+    ax_split.legend(loc="center left", bbox_to_anchor=(1.02, 0.5),
+                    fontsize=8, framealpha=0.95, title="actor")
+    for i, (k, nv) in enumerate(zip(kub_p50, net_p50)):
+        total_kn = k + nv
+        if total_kn > 0:
+            kpct = 100.0 * k / total_kn
+            ax_split.text(total_kn, y[i],
+                          f"  kubelet {kpct:.0f}% / network {100 - kpct:.0f}%",
+                          va="center", fontsize=8, color="#374151")
+
+    # ---- Panel 3: CDF of trigger_total_s per provider.
+    cmap = plt.get_cmap("tab10")
+    for idx, (lbl, df) in enumerate(zip(labels, dfs)):
+        s = pd.to_numeric(df.get("trigger_total_s"),
+                          errors="coerce").dropna().sort_values()
+        if s.empty:
+            continue
+        ycdf = np.arange(1, len(s) + 1) / len(s)
+        ax_cdf.plot(s.values, ycdf, marker=".", linestyle="-",
+                    color=cmap(idx % 10), label=lbl)
+    ax_cdf.set_xlabel("seconds — trigger_total_s (pod scheduled → Running)")
+    ax_cdf.set_ylabel("CDF")
+    ax_cdf.set_title("Per-iteration spread of trigger_total_s (pod-scheduled → Running)",
+                     loc="left", fontsize=10)
+    ax_cdf.grid(True, alpha=0.3)
+    ax_cdf.legend(loc="center left", bbox_to_anchor=(1.02, 0.5),
+                  fontsize=8, framealpha=0.95, title="provider")
+
+    fig.suptitle(
+        "Trigger pod lifecycle — sandbox positioning, "
+        "kubelet vs network, taint gating",
+        fontsize=12, fontweight="bold", y=0.998,
+    )
+    fig.tight_layout(rect=(0, 0, 0.78, 0.985))
     out_dir.mkdir(parents=True, exist_ok=True)
-    fig, ax = plt.subplots(figsize=(9, 5))
-    cdf_metric = "time_to_runnable_s"
-    # Filter out missing/unreadable iterations.csv up-front so the rest of the
-    # pipeline doesn't have to defend against them. An incomplete run dir
-    # (cluster create succeeded but every iteration failed before flush) won't
-    # have iterations.csv on disk — skip with a warning, don't crash.
+    p = out_dir / "compare_pod_running.png"
+    fig.savefig(p, dpi=140); plt.close(fig)
+    return p
+
+
+def plot_compare(csvs: list[Path], out_dir: Path,
+                 *, only: set[str] | None = None) -> list[Path]:
+    """Overlay headline-latency CDF across multiple runs and emit a
+    cross-provider phase decomposition figure (cross-provider compare).
+
+    ``only`` (optional) restricts which figures are emitted; valid keys:
+    ``cdf``, ``phase_decomposition``, ``pod_running``. When ``None`` (the
+    default) all three are produced.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _want = lambda k: only is None or k in only
+    out: list[Path] = []
+    # Validate csvs up-front (used by every panel).
     valid_csvs: list[Path] = []
     for csv in csvs:
         if not csv.exists():
@@ -2929,39 +3233,48 @@ def plot_compare(csvs: list[Path], out_dir: Path) -> list[Path]:
         valid_csvs.append(csv)
     if not valid_csvs:
         print("  warn: no valid run dirs to compare; nothing emitted")
-        plt.close(fig)
         return []
     csvs = valid_csvs
-    # Fall back to legacy metric if no run carries the new T1-anchored column.
-    any_runnable = False
-    for csv in csvs:
-        try:
-            cols = pd.read_csv(csv, nrows=1).columns
-        except Exception:
-            continue
-        if "time_to_runnable_s" in cols:
-            any_runnable = True; break
-    if not any_runnable:
-        cdf_metric = "node_startup_latency_s"
-    for csv in csvs:
-        try:
-            df = pd.read_csv(csv)
-        except Exception as e:
-            print(f"  warn: skipping {csv.parent.name} (read error: {e})")
-            continue
-        ok = _ok(df)
-        s = pd.to_numeric(ok.get(cdf_metric), errors="coerce").dropna().sort_values()
-        if s.empty:
-            continue
-        cdf = np.arange(1, len(s) + 1) / len(s)
-        label = _run_label(csv)
-        ax.plot(s.values, cdf, marker=".", label=label)
-    ax.set_xlabel(f"{cdf_metric} (s)"); ax.set_ylabel("CDF")
-    ax.set_title(f"{cdf_metric} CDF — provider comparison")
-    ax.grid(True, alpha=0.3); ax.legend(fontsize=8)
-    p = out_dir / "compare_cdf.png"; fig.tight_layout(); fig.savefig(p, dpi=140); plt.close(fig)
-    out: list[Path] = [p]
-    decomp = _plot_compare_phase_decomposition(csvs, out_dir)
-    if decomp is not None:
-        out.append(decomp)
+
+    if _want("cdf"):
+        fig, ax = plt.subplots(figsize=(9, 5))
+        cdf_metric = "time_to_runnable_s"
+        # Fall back to legacy metric if no run carries the new T1-anchored column.
+        any_runnable = False
+        for csv in csvs:
+            try:
+                cols = pd.read_csv(csv, nrows=1).columns
+            except Exception:
+                continue
+            if "time_to_runnable_s" in cols:
+                any_runnable = True; break
+        if not any_runnable:
+            cdf_metric = "node_startup_latency_s"
+        for csv in csvs:
+            try:
+                df = pd.read_csv(csv)
+            except Exception as e:
+                print(f"  warn: skipping {csv.parent.name} (read error: {e})")
+                continue
+            ok = _ok(df)
+            s = pd.to_numeric(ok.get(cdf_metric), errors="coerce").dropna().sort_values()
+            if s.empty:
+                continue
+            cdf = np.arange(1, len(s) + 1) / len(s)
+            label = _run_label(csv)
+            ax.plot(s.values, cdf, marker=".", label=label)
+        ax.set_xlabel(f"{cdf_metric} (s)"); ax.set_ylabel("CDF")
+        ax.set_title(f"{cdf_metric} CDF — provider comparison")
+        ax.grid(True, alpha=0.3); ax.legend(fontsize=8)
+        p = out_dir / "compare_cdf.png"
+        fig.tight_layout(); fig.savefig(p, dpi=140); plt.close(fig)
+        out.append(p)
+    if _want("phase_decomposition"):
+        decomp = _plot_compare_phase_decomposition(csvs, out_dir)
+        if decomp is not None:
+            out.append(decomp)
+    if _want("pod_running"):
+        pod_running = _plot_compare_pod_running(csvs, out_dir)
+        if pod_running is not None:
+            out.append(pod_running)
     return out

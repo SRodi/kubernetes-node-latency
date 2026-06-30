@@ -451,3 +451,128 @@ def test_wait_for_node_ready_captures_t1c_after_cni_block(monkeypatch):
     assert t1c is not None  # captured at utcnow() of the clearing event
     assert "cni_conflist_blocking" in kinds
     assert "cni_conflist_observed" in kinds
+
+
+# --- Trigger-pod lifecycle enrichment ---
+
+def _trigger_pod_records(n: int = 3, *, with_pull: bool = True) -> list[IterationRecord]:
+    """Synthetic records whose trigger pod has clean pull/create/start events."""
+    out = []
+    for i in range(1, n + 1):
+        r = IterationRecord(iteration=i, run_id="t",
+                            provider="gke_autopilot", region="x")
+        pod = f"latency-trigger-{i:03d}-abc12"
+        r.pod_name = pod; r.node_name = f"node-{i}"
+        r.T0_pod_created = _ts(0)
+        r.T1_node_registered = _ts(10)
+        r.T4_node_ready = _ts(20)
+        r.T4b_schedulable = _ts(20)
+        r.T1c_cni_conflist = _ts(18)
+        # Scheduler binds trigger pod at T+22; first kubelet event at T+25.
+        r.T_trigger_scheduled = _ts(22)
+        # T5 at T+30 → total = 8s.
+        r.T5_pod_running = _ts(30)
+        # Trigger-pod event chain: 2s prepull, 3s pull, 1s create, 1s run_gap.
+        if with_pull:
+            r.node_image_pulls = [{
+                "pod": pod, "namespace": "default",
+                "container": "pause", "image": "registry.k8s.io/pause:3.10",
+                "family": "pause",
+                "t_pulling": _ts(24), "t_pulled": _ts(27),
+                "duration_s": 3.0, "failed": False,
+            }]
+        else:
+            r.node_image_pulls = []
+        r.node_container_creates = [{
+            "namespace": "default", "pod": pod,
+            "container": "pause", "init": False, "t_created": _ts(28),
+        }]
+        r.node_container_starts = [{
+            "namespace": "default", "pod": pod,
+            "container": "pause", "init": False, "t_started": _ts(29),
+        }]
+        r.status = "success"
+        out.append(r)
+    return out
+
+
+def test_enrich_trigger_pod_metrics_decomposes_window():
+    """The 4 phase columns must sum to trigger_total_s (== sandbox_setup_s).
+
+    Also exercises the broader [T4b_schedulable, T5_pod_running] window:
+    scheduler bind wait + trigger_total_s == pod_running_from_schedulable_s.
+    """
+    df = to_dataframe(_trigger_pod_records(2))
+    for col in ("trigger_prepull_s", "trigger_image_pull_s",
+                "trigger_create_s", "trigger_run_gap_s", "trigger_total_s",
+                "trigger_scheduler_wait_s", "pod_running_from_schedulable_s"):
+        assert col in df.columns
+    row = df.iloc[0]
+    # Total = T5 − T_trigger_scheduled = 8.0s.
+    assert row["trigger_total_s"] == 8.0
+    # Pull = 3s (pulled at +27 − pulling at +24).
+    assert row["trigger_image_pull_s"] == 3.0
+    # Create = pulled→created = 1s; run_gap = created→started = 1s.
+    assert row["trigger_create_s"] == 1.0
+    assert row["trigger_run_gap_s"] == 1.0
+    # Prepull = total − (pull+create+run_gap) = 8 − 5 = 3s.
+    assert row["trigger_prepull_s"] == 3.0
+    # trigger_total_s == sandbox_setup_s.
+    assert row["trigger_total_s"] == row["sandbox_setup_s"]
+    # Scheduler bind wait = T_trigger_scheduled − T4b = 22 − 20 = 2s.
+    assert row["trigger_scheduler_wait_s"] == 2.0
+    # Broader window = T5 − T4b = 30 − 20 = 10s (== sched_wait + total).
+    assert row["pod_running_from_schedulable_s"] == 10.0
+    assert (row["pod_running_from_schedulable_s"]
+            == row["trigger_scheduler_wait_s"] + row["trigger_total_s"])
+
+
+def test_enrich_trigger_pod_metrics_handles_cached_image():
+    """When the image is cache-hit, no Pulling event fires → pull = 0,
+    and the prepull segment absorbs the slack so the bar still sums."""
+    df = to_dataframe(_trigger_pod_records(1, with_pull=False))
+    row = df.iloc[0]
+    assert row["trigger_image_pull_s"] == 0.0
+    # Total remains 8s; prepull absorbs the missing 3s.
+    assert row["trigger_total_s"] == 8.0
+    parts = (row["trigger_prepull_s"] + row["trigger_image_pull_s"]
+             + row["trigger_create_s"] + row["trigger_run_gap_s"])
+    assert abs(parts - row["trigger_total_s"]) < 1e-6
+
+
+def test_enrich_trigger_pod_metrics_idempotent_on_legacy_csv(tmp_path: Path):
+    """Round-trip via iterations.csv: enrichment runs on read-back rows
+    that lack the new columns (legacy run dirs)."""
+    from src.analysis import enrich_trigger_pod_metrics
+    recs = _trigger_pod_records(2)
+    out = tmp_path / "run"
+    write_outputs(recs, out, run_id="t", provider="gke_autopilot", region="x")
+    # Re-read and strip the new columns to simulate a pre-feature CSV.
+    df = pd.read_csv(out / "iterations.csv")
+    for c in ("trigger_prepull_s", "trigger_image_pull_s",
+              "trigger_create_s", "trigger_run_gap_s", "trigger_total_s"):
+        if c in df.columns:
+            df = df.drop(columns=c)
+    enriched = enrich_trigger_pod_metrics(df)
+    assert enriched.iloc[0]["trigger_total_s"] == 8.0
+    assert enriched.iloc[0]["trigger_image_pull_s"] == 3.0
+
+
+def test_plot_compare_pod_running_emits_png(tmp_path: Path):
+    """Smoke test: two runs across providers → compare_pod_running.png."""
+    from src.plotting import _plot_compare_pod_running
+    # Run A — fast pulls.
+    a = tmp_path / "runA"
+    write_outputs(_trigger_pod_records(3), a,
+                  run_id="A", provider="gke_autopilot", region="x")
+    # Run B — slower (synthesise a different total via shifted events).
+    recs_b = _trigger_pod_records(3)
+    for r in recs_b:
+        r.T5_pod_running = _ts(40)  # total = 18s
+    b = tmp_path / "runB"
+    write_outputs(recs_b, b,
+                  run_id="B", provider="aks_overlay_cilium", region="y")
+    out = tmp_path / "plots"
+    png = _plot_compare_pod_running(
+        [a / "iterations.csv", b / "iterations.csv"], out)
+    assert png is not None and png.exists() and png.stat().st_size > 0

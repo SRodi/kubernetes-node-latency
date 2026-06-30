@@ -221,6 +221,12 @@ def _augment_derived(df: pd.DataFrame) -> pd.DataFrame:
             s = _delta(end, start)
             if not s.isna().all():
                 df[col] = s
+    # Backfill trigger-pod lifecycle decomposition for legacy iterations.csv.
+    try:
+        from .analysis import enrich_trigger_pod_metrics
+        enrich_trigger_pod_metrics(df)
+    except Exception:
+        pass
     return df
 
 
@@ -585,7 +591,6 @@ def render_markdown(runs: list[RunData], out_path: Path) -> Path:
     lines.append(f"_Generated: {when}_  ")
     lines.append(f"_Runs analyzed: {run_ids}_")
     lines.append("")
-
     lines.append("## Phase profile")
     lines.append("")
     lines.append("Per-run mean phase Gantt (autoscaler/VM bringup shown as a number "
@@ -629,6 +634,70 @@ def render_markdown(runs: list[RunData], out_path: Path) -> Path:
     lines.append("")
     lines.append(headline(runs))
     lines.append("")
+
+    # Cross-provider pod-running breakdown (≥ 2 runs only).
+    pod_png = _build_pod_running_compare(runs, out_path.parent)
+    if pod_png is not None:
+        lines.append("## Pod-running breakdown (cross-provider)")
+        lines.append("")
+        lines.append(
+            "Three panels.\n\n"
+            "**(1) Two-lane Gantt** anchored at "
+            "``T1_node_registered = 0``. Per provider:\n"
+            "- **Top lane** = node bootstrap, split into two segments:\n"
+            "  - **Green** = ``cni_conflist_install_s`` (``T1 → T1c``): "
+            "kubelet finds a usable CNI conflist on disk; Node "
+            "Ready=True follows almost immediately "
+            "(``post_conflist_ready_s ≈ 0`` everywhere).\n"
+            "  - **Amber** = ``cilium_scheduling_block_s`` "
+            "(``T4 → T4b ≈ T1c → T4b``): the CNI agent's own "
+            "post-conflist work *after* kubelet posts Ready — eBPF "
+            "program load, identity allocation, endpoint sync, health "
+            "checks — before it removes its own bootstrap NoSchedule "
+            "taint (``node.cilium.io/agent-not-ready`` on Cilium, "
+            "``node.cloudprovider.kubernetes.io/uninitialized`` on AKS "
+            "byocni, etc.). **This is usually the largest unexplained "
+            "gap** between network-ready and pod-schedulable.\n"
+            "  - A dotted green tick marks ``T1c`` (network plugin "
+            "installed) at the boundary between the two segments.\n"
+            "- **Bottom lane (phase-colored)** = pod lifecycle "
+            "starting at ``T_trigger_scheduled`` and decomposed into "
+            "sandbox/CNI ADD → image pull → container create → "
+            "container start.\n\n"
+            "The *visual relationship* between the lanes is the story:\n"
+            "- **AKS / EKS** — bottom lane starts at the **end of the "
+            "amber segment** (not the end of the green one), because "
+            "the bootstrap taint is the actual scheduler gate. Once "
+            "scheduled, sandbox is quick (CNI was ready long before).\n"
+            "- **GKE** — no blocking taint configured, so no amber "
+            "segment at all. The bottom lane starts **before** the "
+            "green tick — kube-scheduler binds the pod eagerly, and "
+            "the sandbox segment extends past the tick (kubelet was "
+            "holding sandbox creation until CNI conflist appeared). "
+            "Same physical wait, just shifted from scheduler-time to "
+            "kubelet-time.\n\n"
+            "Each label is annotated with "
+            "``taint_blocking_duration_s`` "
+            "(= ``T4b_schedulable − T_taint_observed``) — present on "
+            "AKS/EKS where the bootstrap taint exists, absent on GKE.\n\n"
+            "**(2) Kubelet vs network split** inside the pod→running "
+            "window — kubelet (prepull + create + run_gap) vs network "
+            "(image pull) with the percentage annotated per provider. "
+            "Surfaces whether kubelet wiring or registry pull is the "
+            "bottleneck (e.g. on GKE the sandbox-absorbs-network-wait "
+            "pattern + image pull pushes the network share to "
+            "majority).\n\n"
+            "**(3) CDF** of ``trigger_total_s`` (pod scheduled → "
+            "Running) per provider — per-iteration spread."
+        )
+        lines.append("")
+        try:
+            rel = pod_png.resolve().relative_to(out_path.resolve().parent)
+            rel_str = rel.as_posix()
+        except ValueError:
+            rel_str = pod_png.resolve().as_posix()
+        lines.append(f"![compare_pod_running]({rel_str})")
+        lines.append("")
 
     lines.append("## KPI table")
     lines.append("")
@@ -702,6 +771,39 @@ def render_docx(runs: list[RunData], out_path: Path) -> Path:
     doc.add_heading("Headline", level=1)
     doc.add_paragraph(headline(runs))
 
+    pod_png = _build_pod_running_compare(runs, out_path.parent)
+    if pod_png is not None:
+        doc.add_heading("Pod-running breakdown (cross-provider)", level=1)
+        doc.add_paragraph(
+            "Three panels. (1) Two-lane Gantt anchored at "
+            "T1_node_registered=0. TOP LANE = node bootstrap split "
+            "into two segments: GREEN = cni_conflist_install_s "
+            "(T1→T1c) — kubelet finds a usable CNI conflist on disk; "
+            "AMBER = cilium_scheduling_block_s (T4→T4b ≈ T1c→T4b) — "
+            "the CNI agent's own post-conflist work (eBPF / IPAM / "
+            "identity / health) AFTER kubelet posts Ready=True, "
+            "before it removes its bootstrap NoSchedule taint. "
+            "Dotted green tick marks T1c (network plugin installed). "
+            "BOTTOM LANE = pod lifecycle from T_trigger_scheduled "
+            "decomposed into sandbox/CNI ADD → image pull → container "
+            "create → container start. The visual relationship is the "
+            "story: AKS/EKS bottom lane starts at the end of the "
+            "AMBER segment (taint is the scheduler gate), then "
+            "sandbox is quick; GKE has no amber segment (no blocking "
+            "taint) and the bottom lane starts BEFORE the green tick "
+            "— kubelet absorbs the network wait inside sandbox setup. "
+            "Each label annotated with taint_blocking_duration_s "
+            "(T4b - T_taint_observed). (2) Kubelet vs network split "
+            "inside the pod→running window — kubelet (prepull + "
+            "create + start) vs network (image pull) with percentage "
+            "annotated. (3) CDF of trigger_total_s per provider — "
+            "per-iteration spread."
+        )
+        try:
+            doc.add_picture(str(pod_png), width=Inches(6.5))
+        except Exception:
+            doc.add_paragraph(f"(failed to embed {pod_png.name})")
+
     doc.add_heading("KPI table", level=1)
     rows = build_kpi_table(runs)
     table = doc.add_table(rows=len(rows), cols=len(rows[0]))
@@ -772,6 +874,27 @@ def output_basename(runs: list[RunData]) -> str:
     if len(runs) == 2:
         return f"compare-{runs[0].run_id}-vs-{runs[1].run_id}"
     return f"compare-{runs[0].run_id}-plus{len(runs)-1}"
+
+
+def _build_pod_running_compare(runs: list[RunData], out_dir: Path) -> Path | None:
+    """Generate the cross-provider pod-running breakdown into ``out_dir``.
+
+    Reuses :func:`plotting._plot_compare_pod_running` so the report is
+    self-contained (no dependency on ``analysis/`` having been refreshed).
+    Returns the PNG path on success, ``None`` if fewer than 2 runs or
+    the plot could not be produced.
+    """
+    if len(runs) < 2:
+        return None
+    csvs = [r.run_dir / "iterations.csv" for r in runs
+            if (r.run_dir / "iterations.csv").exists()]
+    if len(csvs) < 2:
+        return None
+    try:
+        from .plotting import _plot_compare_pod_running
+        return _plot_compare_pod_running(csvs, out_dir)
+    except Exception:
+        return None
 
 
 def build_report(run_ids: list[str], *, last: int | None,
