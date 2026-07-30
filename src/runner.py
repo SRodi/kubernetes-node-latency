@@ -279,6 +279,7 @@ def run_iterations(cfg: Config, handle: ClusterHandle, provider: ClusterProvider
                         # Cilium agents + CNS/IPAM (best-effort across providers).
                         targets = [
                             ("kube-system", "k8s-app=cilium"),
+                            ("kube-system", "k8s-app=aws-node"),
                             ("kube-system", "k8s-app=azure-cns"),
                             ("kube-system", "k8s-app=cilium-azure-ipam"),
                         ]

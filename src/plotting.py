@@ -53,6 +53,13 @@ PHASE_COLS = [
 ]
 
 
+# Container names that identify the per-node CNI agent's main container.
+# Used to resolve the agent pod key so lifecycle lanes (image pull, CNI
+# conflist, T2->T3 bootstrap) group under the real pod box. Covers Cilium
+# (``cilium-agent`` — DS named ``cilium`` on AKS/EKS, ``anetd`` on GKE) and
+# the AWS VPC CNI (``aws-node``).
+_AGENT_CONTAINER_NAMES = ("cilium-agent", "aws-node")
+
 # Profile lanes: each entry is (lane label, start column, end column, actor key).
 # `actor` controls the bar colour so the reader can immediately see which
 # concurrent processes are happening on the same time-window.
@@ -609,7 +616,7 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
     # is below the chart's labeling resolution and would just be noise.
     agent_pull_end: float | None = None
     for img, insts in image_pulls_by_image.items():
-        if any(r.get("container") == "cilium-agent" for r in insts):
+        if any(r.get("container") in _AGENT_CONTAINER_NAMES for r in insts):
             ends = [r["end_off"] for r in insts if isinstance(r.get("end_off"), (int, float))]
             if ends:
                 agent_pull_end = float(np.median(ends))
@@ -988,7 +995,7 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
         cilium_pod_key: str | None = None
         for image, insts in image_pulls_by_image.items():
             for r in insts:
-                if r.get("container") == "cilium-agent":
+                if r.get("container") in _AGENT_CONTAINER_NAMES:
                     cilium_pod_key = _pod_key(r.get("namespace") or "", r.get("pod") or "")
                     break
             if cilium_pod_key:
@@ -1001,7 +1008,7 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
                 except Exception:
                     rows = []
                 for r in rows:
-                    if r.get("container") == "cilium-agent":
+                    if r.get("container") in _AGENT_CONTAINER_NAMES:
                         cilium_pod_key = _pod_key(r.get("namespace") or "",
                                                   r.get("pod") or "")
                         if cilium_pod_key:
@@ -1087,7 +1094,7 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
                 except Exception:
                     rows = []
                 for r in rows:
-                    if r.get("container") == "cilium-agent":
+                    if r.get("container") in _AGENT_CONTAINER_NAMES:
                         cilium_pod_key = _pod_key(r.get("namespace") or "",
                                                   r.get("pod") or "")
                         if cilium_pod_key:

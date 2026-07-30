@@ -28,6 +28,7 @@ REPORT_PODS_BY_PROVIDER: dict[str, set[str]] = {
     "gke_autopilot": {"anetd", "netd"},
     "gke_standard_dpv2": {"anetd", "netd"},
     "eks_eni_cilium": {"cilium"},
+    "eks_vpc_cni": {"aws-node"},
     "aks_overlay_cilium": {"cilium", "azure-cns"},
     "aks_byocni": {"cilium", "azure-cns"},
     "aks_kubenet": {"azure-cns"},
@@ -43,6 +44,7 @@ PROVIDER_DISPLAY_NAMES: dict[str, str] = {
     "aks_byocni":         "AKS BYO-CNI",
     "aks_kubenet":        "AKS Kubenet",
     "eks_eni_cilium":     "EKS ENI+Cilium",
+    "eks_vpc_cni":        "EKS VPC CNI",
 }
 
 

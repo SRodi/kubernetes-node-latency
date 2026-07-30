@@ -221,7 +221,7 @@ def main(argv: list[str] | None = None) -> int:
     pr.add_argument("--provider", default=None,
                     choices=["gke_autopilot", "gke_standard_dpv2",
                              "aks_overlay_cilium", "aks_byocni", "aks_kubenet",
-                             "eks_eni_cilium",
+                             "eks_eni_cilium", "eks_vpc_cni",
                              "existing"])
     pr.add_argument("--region", default=None)
     pr.add_argument("--iterations", type=int, default=None)
