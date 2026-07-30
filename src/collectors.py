@@ -112,6 +112,20 @@ def _container_started_at(pod: client.V1Pod, container_name: str) -> datetime | 
     return None
 
 
+def _first_container_running_start(pod: client.V1Pod) -> datetime | None:
+    """T5: the first container's ``state.running.startedAt`` — the
+    workload-side moment the pod sandbox was wired up (CNI ADD done) and a
+    container could start. Returns None while the pod is still Pending.
+    """
+    for cs in (pod.status.container_statuses or []):
+        run = cs.state and cs.state.running
+        if run and run.started_at:
+            ts = _parse_k8s_time(run.started_at)
+            if ts:
+                return ts
+    return None
+
+
 def _pod_ready_transition(pod: client.V1Pod, condition_type: str) -> datetime | None:
     for c in (pod.status.conditions or []):
         if c.type == condition_type and c.status == "True" and c.last_transition_time:
@@ -366,6 +380,51 @@ class Collector:
                 self.sink.write("agent_pod_read_error", {"pod": pod_name, "error": str(e)})
         return t2, t3
 
+    def wait_for_pod_running(
+        self, pod_name: str, namespace: str, timeout_s: int,
+    ) -> datetime | None:
+        """Block until the pod's first container reports
+        ``state.running.startedAt`` (== sandbox wired + CNI ADD done), then
+        return that timestamp. This is T5 — the numerator of the headline
+        ``time_to_runnable_s`` KPI.
+
+        Must be called explicitly in the iteration flow: the trigger pod
+        reaches Running a few seconds *after* the CNI agent is Ready (T3),
+        so reading pod state opportunistically at end-of-iteration races
+        the container start and yields a null T5 on fast providers. Bounded
+        by ``timeout_s``; returns None if it never observes Running.
+        Best-effort: never raises.
+        """
+        t5: datetime | None = None
+        read_timeout = min(120, max(30, timeout_s // 4))
+        w = watch.Watch()
+        try:
+            for ev in w.stream(
+                self.core.list_namespaced_pod, namespace=namespace,
+                field_selector=f"metadata.name={pod_name}", timeout_seconds=timeout_s,
+                _request_timeout=(10, read_timeout),
+            ):
+                t5 = _first_container_running_start(ev["object"])
+                if t5:
+                    break
+        except Exception as e:  # noqa: BLE001
+            self.sink.write("trigger_pod_watch_error",
+                            {"pod": pod_name, "error": str(e)[:200]})
+        finally:
+            w.stop()
+        # One last sync read in case the watch missed the transition.
+        if t5 is None:
+            try:
+                pod = self.core.read_namespaced_pod(name=pod_name, namespace=namespace)
+                t5 = _first_container_running_start(pod)
+            except Exception as e:  # noqa: BLE001
+                self.sink.write("trigger_pod_read_error",
+                                {"pod": pod_name, "error": str(e)[:200]})
+        if t5:
+            self.sink.write("trigger_pod_running",
+                            {"pod": pod_name, "ts": t5.isoformat()})
+        return t5
+
     def collect_pod_lifecycle(self, pod_name: str, namespace: str) -> dict:
         """Post-T3 enrichment: re-read the cilium DS pod and pull events
         to derive scheduler latency, image-pull window, and per-init-container
@@ -492,13 +551,9 @@ class Collector:
                 break
         # First container Running startedAt — workload-side moment the
         # pod sandbox was wired up and the container could start.
-        for cs in (pod.status.container_statuses or []):
-            run = cs.state and cs.state.running
-            if run and run.started_at:
-                ts = _parse_k8s_time(run.started_at)
-                if ts:
-                    out["T5_pod_running"] = ts
-                    break
+        ts = _first_container_running_start(pod)
+        if ts:
+            out["T5_pod_running"] = ts
         self.sink.write("trigger_pod_status_collected",
                         {"pod": pod_name,
                          "have_scheduled": "T_trigger_scheduled" in out,
@@ -1008,6 +1063,8 @@ class Collector:
         targets: list[tuple[str, str]],
         since_time: datetime | None = None,
         tail_lines: int = 5000,
+        fetch_retries: int = 4,
+        fetch_backoff_s: float = 3.0,
     ) -> dict:
         """Capture logs from selected pods on `node_name` into `dest_dir`.
 
@@ -1052,19 +1109,43 @@ class Collector:
                 containers += [c.name for c in (p.spec.init_containers or [])]
                 containers += [c.name for c in (p.spec.containers or [])]
                 for cname in containers:
-                    try:
-                        kw = dict(
-                            name=pname, namespace=ns, container=cname,
-                            timestamps=True, tail_lines=tail_lines,
-                            _request_timeout=(10, 60),
-                        )
-                        if since_s is not None:
-                            kw["since_seconds"] = since_s
-                        logs: str = self.core.read_namespaced_pod_log(**kw)
-                    except Exception as e:  # noqa: BLE001
+                    # apiserver proxies pod-log requests to the node's
+                    # kubelet; on a freshly-provisioned node that tunnel
+                    # (EKS konnectivity, etc.) can briefly 5xx before it's
+                    # established, so retry transient failures with backoff.
+                    logs = None
+                    last_err: Exception | None = None
+                    for attempt in range(fetch_retries + 1):
+                        try:
+                            kw = dict(
+                                name=pname, namespace=ns, container=cname,
+                                timestamps=True, tail_lines=tail_lines,
+                                _request_timeout=(10, 60),
+                            )
+                            if since_s is not None:
+                                kw["since_seconds"] = since_s
+                            logs = self.core.read_namespaced_pod_log(**kw)
+                            last_err = None
+                            break
+                        except client.ApiException as e:  # noqa: PERF203
+                            last_err = e
+                            # 400/404 are terminal (bad container / not
+                            # found); only retry server-side 5xx.
+                            if e.status and 500 <= int(e.status) < 600 \
+                                    and attempt < fetch_retries:
+                                time.sleep(fetch_backoff_s * (attempt + 1))
+                                continue
+                            break
+                        except Exception as e:  # noqa: BLE001
+                            last_err = e
+                            if attempt < fetch_retries:
+                                time.sleep(fetch_backoff_s * (attempt + 1))
+                                continue
+                            break
+                    if last_err is not None:
                         self.sink.write("pod_logs_fetch_error",
                                         {"ns": ns, "pod": pname, "container": cname,
-                                         "error": str(e)[:200]})
+                                         "error": str(last_err)[:200]})
                         summary["errors"] += 1
                         continue
                     if not logs:

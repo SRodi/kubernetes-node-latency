@@ -195,6 +195,20 @@ def run_iterations(cfg: Config, handle: ClusterHandle, provider: ClusterProvider
                                {"iteration": i,
                                 "have_metrics": "metrics" in (rec.deep_cilium or {})})
 
+                # T5: explicitly wait for the trigger pod's first container
+                # to reach Running (== sandbox wired, CNI ADD done). This is
+                # the numerator of the headline `time_to_runnable_s` KPI and
+                # must be waited on deterministically — the trigger pod goes
+                # Running a few seconds AFTER the CNI agent is Ready (T3), so
+                # without this the finally-block read races the container
+                # start and yields a null T5 on fast providers (only masked
+                # previously by the incidental wall-clock delay of
+                # --deep-cilium metric scraping).
+                rec.T5_pod_running = collector.wait_for_pod_running(
+                    rec.pod_name, cfg.trigger_pod.namespace,
+                    timeout_s=cfg.per_iteration_timeout_s,
+                )
+
                 rec.status = "success"
             except TimeoutError as e:
                 rec.status = "timeout"
@@ -206,9 +220,11 @@ def run_iterations(cfg: Config, handle: ClusterHandle, provider: ClusterProvider
                 log.exception("iteration %d errored", i)
             finally:
                 # Trigger-pod lifecycle capture — read pod state BEFORE
-                # delete_pod so we can record T_trigger_scheduled and
-                # T5_pod_running (the workload-side moment kubelet finished
-                # CNI ADD). Best-effort; never raises. Guarded by
+                # delete_pod so we can record T_trigger_scheduled and (as a
+                # backstop) T5_pod_running. The primary T5 signal comes from
+                # the explicit wait_for_pod_running above; here we only fill
+                # gaps and never overwrite an already-captured T5 with a
+                # null re-read. Best-effort; never raises. Guarded by
                 # locals().get() because `collector` may not be defined
                 # yet if we errored before instantiation.
                 _coll = locals().get("collector")
@@ -217,7 +233,8 @@ def run_iterations(cfg: Config, handle: ClusterHandle, provider: ClusterProvider
                         tp = _coll.collect_trigger_pod_status(
                             rec.pod_name, cfg.trigger_pod.namespace)
                         rec.T_trigger_scheduled = tp.get("T_trigger_scheduled")
-                        rec.T5_pod_running = tp.get("T5_pod_running")
+                        if rec.T5_pod_running is None:
+                            rec.T5_pod_running = tp.get("T5_pod_running")
                     except Exception as e:  # noqa: BLE001
                         log.warning("trigger-pod status capture failed for iter %d: %s", i, e)
                 # Image-pull capture on the new node. Bounded by
