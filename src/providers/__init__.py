@@ -9,6 +9,7 @@ from .aks_overlay_cilium import AKSOverlayCiliumProvider
 from .aks_byocni import AKSBYOCNIProvider
 from .aks_kubenet import AKSKubenetProvider
 from .eks_eni_cilium import EKSEniCiliumProvider
+from .eks_vpc_cni import EKSVPCCNIProvider
 
 _PROVIDERS = {
     GKEAutopilotProvider.name: GKEAutopilotProvider,
@@ -18,6 +19,7 @@ _PROVIDERS = {
     AKSBYOCNIProvider.name: AKSBYOCNIProvider,
     AKSKubenetProvider.name: AKSKubenetProvider,
     EKSEniCiliumProvider.name: EKSEniCiliumProvider,
+    EKSVPCCNIProvider.name: EKSVPCCNIProvider,
 }
 
 
