@@ -78,6 +78,10 @@ class AKSCfg:
     resource_group: str = "node-latency-rg"
     location: str | None = None  # falls back to top-level region
     kubernetes_version: str | None = None
+    # Long-Term Support: LTS-only k8s versions (past community support) must
+    # be created on Premium tier with the LTS support plan, otherwise
+    # `az aks create` fails with K8sVersionNotSupported. See aka.ms/aks/lts.
+    long_term_support: bool = False
     node_provisioning: str = "cluster_autoscaler"  # cluster_autoscaler|nap|manual
     system_node_pool: AKSSystemPoolCfg = dc.field(default_factory=AKSSystemPoolCfg)
     user_node_pool: AKSNodePoolCfg = dc.field(default_factory=AKSNodePoolCfg)

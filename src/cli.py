@@ -36,6 +36,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
         cfg.aks.node_provisioning = args.aks_node_provisioning
     if args.aks_resource_group is not None:
         cfg.aks.resource_group = args.aks_resource_group
+    if args.aks_kubernetes_version is not None:
+        cfg.aks.kubernetes_version = args.aks_kubernetes_version
+    if args.aks_lts:
+        cfg.aks.long_term_support = True
     if args.aws_region is not None:
         cfg.eks.region = args.aws_region
     if args.deep_cilium:
@@ -232,6 +236,17 @@ def main(argv: list[str] | None = None) -> int:
     pr.add_argument("--aks-resource-group", default=None,
                     help="AKS only: override the resource group name "
                          "(default: node-latency-rg from config.yaml)")
+    pr.add_argument("--aks-kubernetes-version", default=None,
+                    help="AKS only: pin the cluster's Kubernetes version "
+                         "(e.g. 1.30.4). Use a non-latest version to test "
+                         "whether the managed Cilium image is baked into the "
+                         "node VHD (no runtime pull). Default: AKS default.")
+    pr.add_argument("--aks-lts", action="store_true",
+                    help="AKS only: create on Premium tier with the "
+                         "Long-Term Support plan (--tier premium "
+                         "--k8s-support-plan AKSLongTermSupport). Required for "
+                         "LTS-only k8s versions (e.g. 1.33.x past community "
+                         "support), else az aks create rejects the version.")
     pr.add_argument("--aws-region", default=None,
                     help="EKS only: override the AWS region "
                          "(default: top-level --region, then config.yaml)")
