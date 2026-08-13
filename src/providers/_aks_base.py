@@ -65,6 +65,10 @@ class AKSProviderBase(ClusterProvider):
         ]
         if cfg.aks.kubernetes_version:
             create_args += ["--kubernetes-version", cfg.aks.kubernetes_version]
+        if cfg.aks.long_term_support:
+            # LTS-only versions require Premium tier + the LTS support plan.
+            create_args += ["--tier", "premium",
+                            "--k8s-support-plan", "AKSLongTermSupport"]
         create_args += self._az_create_cluster_args(cfg)
 
         if self._mode == NAP:
