@@ -60,6 +60,18 @@ PHASE_COLS = [
 # the AWS VPC CNI (``aws-node``).
 _AGENT_CONTAINER_NAMES = ("cilium-agent", "aws-node")
 
+# Max gap (seconds) between the last init container's rounded ``finished_at``
+# and the observed conflist (T1c) for which we still attribute the conflist
+# to that init container and snap the init-chain lane end forward to T1c.
+# This closes the small gap caused by kubelet's 1s-resolution timestamps plus
+# our watcher's polling lag when the last init genuinely writes the conflist
+# (upstream / EKS Cilium: ``install-cni-binaries``). On providers where the
+# conflist is authored by a *separate* component (AKS managed Cilium, where
+# ``azure-cns`` writes ``05-cilium.conflist`` many seconds after the Cilium
+# init container exits), T1c is decoupled and much later — snapping there
+# would wrongly stretch the init lane past the agent, so we skip it.
+_INIT_CONFLIST_SNAP_TOLERANCE_S = 4.0
+
 # Profile lanes: each entry is (lane label, start column, end column, actor key).
 # `actor` controls the bar colour so the reader can immediately see which
 # concurrent processes are happening on the same time-window.
@@ -584,9 +596,18 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
     # finished_at, so the last init is logically still running until T1c.
     # Snapping the chain end to T1c (when present and later) closes that
     # visual gap on the main chart and the zoom alike.
+    #
+    # Only snap when T1c is within `_INIT_CONFLIST_SNAP_TOLERANCE_S` of the
+    # last init's finished_at: that small gap is 1s-rounding + watcher lag
+    # and means the init genuinely authored the conflist. On AKS managed
+    # Cilium the conflist is written by a separate DaemonSet (`azure-cns`)
+    # long after the Cilium init exits, so T1c is unrelated and much later —
+    # snapping there would stretch the `cilium-init-*` lane past the agent.
     t1c_off = _mean_offset("T1c_cni_conflist")
     t1c_rel = (t1c_off - t1_off) if t1c_off is not None else None
-    if last_init_end_t1 is not None and t1c_rel is not None and t1c_rel > last_init_end_t1:
+    if (last_init_end_t1 is not None and t1c_rel is not None
+            and last_init_end_t1 < t1c_rel
+            <= last_init_end_t1 + _INIT_CONFLIST_SNAP_TOLERANCE_S):
         last_init_end_t1 = t1c_rel
 
     # Make the main-chart "Cilium init-container chain" lane match the zoom
@@ -878,9 +899,11 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
                         e = starts[i + 1]
                     else:
                         # Last init: extend through last_init_end (which is
-                        # snapped to T1c when T1c > rounded finished_at, so
-                        # the bar visually closes the gap to the conflist
-                        # appearing on disk).
+                        # snapped to T1c only when T1c is within
+                        # `_INIT_CONFLIST_SNAP_TOLERANCE_S` of the rounded
+                        # finished_at, so the bar closes the small gap to the
+                        # conflist appearing on disk without over-stretching
+                        # when a separate component authors it).
                         e = max(fa_ends[i], last_init_end)
                     e = min(e, last_init_end)
                     chain.append((name, s, e))
