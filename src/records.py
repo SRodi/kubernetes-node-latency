@@ -140,8 +140,14 @@ class IterationRecord:
     # or when the agent pod was unreachable).
     deep_cilium: dict | None = None
 
+    # Tier-1 kubelet PLEG headline numbers scraped from the new node's
+    # kubelet /metrics (None when --deep-cilium not set or the node-proxy
+    # scrape failed). See `kubelet_pleg.parse_pleg`.
+    kubelet_pleg: dict | None = None
+
     def to_row(self) -> dict:
         from .cilium_deep import headline_to_columns
+        from .kubelet_pleg import pleg_to_columns
         import json as _json
         # Serialize init_containers: list[dict] with datetime values \u2192 list[dict] iso strings.
         init_serial: str | None = None
@@ -448,4 +454,5 @@ class IterationRecord:
             row["log_capture_s"] = None
         row.update(ic_durations)
         row.update(headline_to_columns(self.deep_cilium))
+        row.update(pleg_to_columns(self.kubelet_pleg))
         return row

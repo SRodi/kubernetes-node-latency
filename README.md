@@ -237,6 +237,8 @@ results/20260512-085541/
 ├── iter-001/              # only with --deep-cilium: per-iteration Cilium artefacts
 │   ├── cilium_metrics.txt        # raw Prometheus dump from the agent on the new node
 │   ├── cilium_deep_headline.json # parsed headline numbers (also merged into iterations.csv)
+│   ├── kubelet_pleg.txt          # raw kubelet PLEG metric lines (relist duration/interval)
+│   ├── kubelet_pleg.json         # parsed PLEG headline (also merged into iterations.csv)
 │   └── scraper_probe.log         # logs from the single-shot scraper Pod
 ├── cilium_config/         # one-shot Cilium configuration snapshot (agent + operator)
 │   ├── cilium-config.json        # full `cilium-config` ConfigMap
@@ -332,6 +334,37 @@ after each iteration. Override the image / namespace via
 > `anetd` does not bind a TCP listener on port 9090 and the scraper sees
 > connection-refused. AKS exposes the Cilium metrics port unconditionally,
 > so no equivalent flag is needed there.
+
+### Kubelet PLEG capture (bundled with `--deep-cilium`)
+
+`--deep-cilium` also scrapes the **new node's kubelet PLEG (Pod Lifecycle
+Event Generator) instrumentation** — the authoritative, sub-second signal
+for kubelet's container-state relist loop. This is captured independently
+of the Cilium agent (it hits the kubelet directly), so it is populated even
+on `aks_kubenet`, which has no CNI agent DaemonSet.
+
+Captured after T4/T5 from the kubelet `/metrics` page:
+
+- `kubelet_pleg_relist_duration_seconds` — how long each PLEG relist (CRI
+  list + diff) takes; the canonical "PLEG health" metric.
+- `kubelet_pleg_relist_interval_seconds` — wall-clock gap between relists
+  (≈ 1 s cadence when healthy; grows under CRI/kubelet pressure).
+
+`avg` (`_sum/_count`) plus `p50/p90/p99` (Prometheus histogram-quantile over
+the cumulative buckets) are merged into `iterations.csv` as the
+`kubelet_pleg_relist_{avg,p50,p90,p99}_s`, `kubelet_pleg_relist_count`, and
+`kubelet_pleg_interval_{avg,p50,p90,p99}_s` columns. Raw PLEG lines and the
+parsed headline land under `results/<run_id>/iter-<NNN>/kubelet_pleg.txt` and
+`kubelet_pleg.json`.
+
+**How it works.** The kubelet `/metrics` endpoint is authenticated
+(HTTPS :10250), so rather than a scraper Pod the harness proxies through the
+apiserver — `GET /api/v1/nodes/<node>/proxy/metrics` — which the run's admin
+kubeconfig is authorised for on GKE / AKS / EKS alike. No shell, no
+privileged Pod, no extra node. The histograms are cumulative since kubelet
+start, so by T4 a fresh node already carries the relist samples covering the
+exact pod-wiring window. Best-effort: a blocked/failed proxy simply yields
+null PLEG columns for that iteration.
 
 ## Architecture
 

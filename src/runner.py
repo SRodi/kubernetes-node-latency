@@ -268,6 +268,24 @@ def run_iterations(cfg: Config, handle: ClusterHandle, provider: ClusterProvider
                             ) or None
                     except Exception as e:  # noqa: BLE001
                         log.warning("node image-pull capture failed for iter %d: %s", i, e)
+                # Kubelet PLEG capture — scrape the new node's kubelet
+                # /metrics (via apiserver node-proxy) for the authoritative
+                # sub-second PLEG relist duration/interval histograms. Gated
+                # on --deep-cilium (deep-diagnostics mode); node-only, so it
+                # works even on kubenet with no CNI agent. Post-T4/T5 → no
+                # effect on any measured latency. Best-effort; never raises.
+                if cfg.cni.deep and rec.node_name:
+                    try:
+                        from . import kubelet_pleg as _kpleg
+                        iter_dir = run_dir / f"iter-{i:03d}"
+                        rec.kubelet_pleg = _kpleg.collect(
+                            core, node_name=rec.node_name, iter_dir=iter_dir,
+                        ) or None
+                        sink.write("kubelet_pleg_collected",
+                                   {"iteration": i,
+                                    "have_pleg": rec.kubelet_pleg is not None})
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("kubelet PLEG capture failed for iter %d: %s", i, e)
                 # Cluster-manifest snapshot — one-shot per run, fired
                 # on the FIRST iteration once we have a fresh node so the
                 # kubelet configz endpoint is reachable. Captures kubelet
