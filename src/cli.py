@@ -38,6 +38,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
         cfg.aks.resource_group = args.aks_resource_group
     if args.aks_kubernetes_version is not None:
         cfg.aks.kubernetes_version = args.aks_kubernetes_version
+    if args.aks_vm_size is not None:
+        cfg.aks.system_node_pool.vm_size = args.aks_vm_size
+        cfg.aks.user_node_pool.vm_size = args.aks_vm_size
     if args.aks_lts:
         cfg.aks.long_term_support = True
     if args.aws_region is not None:
@@ -241,6 +244,12 @@ def main(argv: list[str] | None = None) -> int:
                          "(e.g. 1.30.4). Use a non-latest version to test "
                          "whether the managed Cilium image is baked into the "
                          "node VHD (no runtime pull). Default: AKS default.")
+    pr.add_argument("--aks-vm-size", default=None,
+                    help="AKS only: override the node VM size for both the "
+                         "system and user node pools (e.g. Standard_D8s_v6). "
+                         "Use when the default Standard_D8s_v5 is not available "
+                         "in the target region/subscription. Default: from "
+                         "config.yaml.")
     pr.add_argument("--aks-lts", action="store_true",
                     help="AKS only: create on Premium tier with the "
                          "Long-Term Support plan (--tier premium "
