@@ -188,9 +188,18 @@ def append_summary_section(summary_md: Path, meta: dict[str, Any]) -> None:
     cni = (cluster.get("cni") or {})
     nodes = cluster.get("nodes") or []
     machine = None
+    node_image = None
     if nodes:
         machine = (nodes[0].get("labels") or {}).get("node.kubernetes.io/instance-type")
+        # Actual OS image string reported by the kubelet (node.status.nodeInfo),
+        # e.g. "Ubuntu 22.04.5 LTS" or "Container-Optimized OS from Google".
+        node_image = nodes[0].get("os_image")
     pdesc = meta.get("provider_describe") or {}
+    # Requested node-image selector (os_sku / image_type / ami_family),
+    # whichever the provider surfaced, so the summary records the knob the
+    # user set as well as the image the node actually booted.
+    requested_image = (pdesc.get("os_sku") or pdesc.get("image_type")
+                       or pdesc.get("ami_family"))
     lines = [
         "",
         "## Cluster",
@@ -198,6 +207,8 @@ def append_summary_section(summary_md: Path, meta: dict[str, Any]) -> None:
         f"- Provider: **{cluster.get('provider')}** (`{cluster.get('name')}` @ `{cluster.get('region')}`)",
         f"- Kubernetes: `{cluster.get('kubernetes_version')}`",
         f"- Machine type: `{machine}`",
+        f"- Node image: `{node_image}`"
+        + (f" (requested: `{requested_image}`)" if requested_image else ""),
         f"- CNI image: `{cni.get('image')}`",
         f"- Nodes at start: {cluster.get('node_count_at_start')}",
     ]

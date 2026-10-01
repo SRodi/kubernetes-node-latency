@@ -65,6 +65,8 @@ class AKSProviderBase(ClusterProvider):
         ]
         if cfg.aks.kubernetes_version:
             create_args += ["--kubernetes-version", cfg.aks.kubernetes_version]
+        if cfg.aks.os_sku:
+            create_args += ["--os-sku", cfg.aks.os_sku]
         if cfg.aks.long_term_support:
             # LTS-only versions require Premium tier + the LTS support plan.
             create_args += ["--tier", "premium",
@@ -88,6 +90,8 @@ class AKSProviderBase(ClusterProvider):
                 "--node-count", str(up.node_count),
                 "--mode", "User",
             ]
+            if cfg.aks.os_sku:
+                np_args += ["--os-sku", cfg.aks.os_sku]
             if self._mode == CLUSTER_AUTOSCALER:
                 np_args += [
                     "--enable-cluster-autoscaler",
@@ -130,6 +134,7 @@ class AKSProviderBase(ClusterProvider):
             "node_provisioning": self._mode,
             "system_pool_vm": self.cfg.aks.system_node_pool.vm_size,
             "user_pool_vm": self.cfg.aks.user_node_pool.vm_size,
+            "os_sku": self.cfg.aks.os_sku,
             "resource_group": self.cfg.aks.resource_group,
             **self._network_describe(),
         }

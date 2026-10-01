@@ -80,6 +80,8 @@ class EKSVPCCNIProvider(ClusterProvider):
             "--node-labels", f"nodepool={e.system_node_pool.name}",
             "--asg-access",  # gives instance role autoscaling perms (used by CA)
         ]
+        if e.ami_family:
+            sys_args += ["--node-ami-family", e.ami_family]
         _eks.eksctl(sys_args)
 
         # NB: the stock VPC CNI (aws-node) and kube-proxy are intentionally
@@ -99,6 +101,8 @@ class EKSVPCCNIProvider(ClusterProvider):
             "--node-labels", f"nodepool={up.name}",
             "--asg-access",
         ]
+        if e.ami_family:
+            np_args += ["--node-ami-family", e.ami_family]
         _eks.eksctl(np_args)
 
         # 3a. Tag the latencypool ASG with node-template hints so the
@@ -167,6 +171,7 @@ class EKSVPCCNIProvider(ClusterProvider):
             "kubernetes_version": e.kubernetes_version,
             "system_pool_instance_type": e.system_node_pool.instance_type,
             "user_pool_instance_type": e.user_node_pool.instance_type,
+            "ami_family": e.ami_family,
             "cni": "aws-vpc-cni",
             "kube_proxy_replacement": False,
             "cluster_autoscaler": e.cluster_autoscaler.enabled,

@@ -41,6 +41,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if args.aks_vm_size is not None:
         cfg.aks.system_node_pool.vm_size = args.aks_vm_size
         cfg.aks.user_node_pool.vm_size = args.aks_vm_size
+    if args.aks_os_sku is not None:
+        cfg.aks.os_sku = args.aks_os_sku
+    if args.gke_image_type is not None:
+        cfg.gke_standard.image_type = args.gke_image_type
+    if args.eks_ami_family is not None:
+        cfg.eks.ami_family = args.eks_ami_family
     if args.aks_lts:
         cfg.aks.long_term_support = True
     if args.aws_region is not None:
@@ -250,6 +256,20 @@ def main(argv: list[str] | None = None) -> int:
                          "Use when the default Standard_D8s_v5 is not available "
                          "in the target region/subscription. Default: from "
                          "config.yaml.")
+    pr.add_argument("--aks-os-sku", default=None,
+                    help="AKS only: node OS image for both node pools via "
+                         "`--os-sku` (e.g. Ubuntu, Ubuntu2204, AzureLinux). "
+                         "Default: AKS default for the Kubernetes version.")
+    pr.add_argument("--gke-image-type", default=None,
+                    help="GKE Standard only: node OS image for the default and "
+                         "trigger node pools via `--image-type` (e.g. "
+                         "COS_CONTAINERD, UBUNTU_CONTAINERD). Default: GKE "
+                         "default for the release channel.")
+    pr.add_argument("--eks-ami-family", default=None,
+                    help="EKS only: node OS image family for both nodegroups "
+                         "via eksctl `--node-ami-family` (e.g. AmazonLinux2, "
+                         "AmazonLinux2023, Ubuntu2204, Bottlerocket). Default: "
+                         "eksctl default.")
     pr.add_argument("--aks-lts", action="store_true",
                     help="AKS only: create on Premium tier with the "
                          "Long-Term Support plan (--tier premium "

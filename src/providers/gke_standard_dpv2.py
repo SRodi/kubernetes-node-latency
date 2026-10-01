@@ -31,6 +31,8 @@ class GKEStandardDPv2Provider(GKEProviderBase):
             "--min-nodes", str(gs.min_nodes),
             "--max-nodes", str(gs.max_nodes),
         ]
+        if gs.image_type:
+            cmd += ["--image-type", gs.image_type]
         if cfg.kubernetes_version:
             cmd += ["--cluster-version", cfg.kubernetes_version]
         if getattr(cfg.cni, "deep", False):
@@ -51,7 +53,7 @@ class GKEStandardDPv2Provider(GKEProviderBase):
             gs.trigger_pool_name, gs.trigger_pool_min_nodes,
             gs.trigger_pool_max_nodes, gs.trigger_pool_machine_type,
         )
-        run([
+        np_args = [
             "gcloud", "container", "node-pools", "create", gs.trigger_pool_name,
             "--cluster", h.name,
             "--region", h.region,
@@ -61,7 +63,10 @@ class GKEStandardDPv2Provider(GKEProviderBase):
             "--min-nodes", str(gs.trigger_pool_min_nodes),
             "--max-nodes", str(gs.trigger_pool_max_nodes),
             "--node-labels", f"{TRIGGER_POOL_LABEL_KEY}={gs.trigger_pool_name}",
-        ])
+        ]
+        if gs.image_type:
+            np_args += ["--image-type", gs.image_type]
+        run(np_args)
 
     def node_autoprovision_hint(self) -> dict:
         # Pin trigger pods to the dedicated pool so cluster autoscaler must
@@ -78,6 +83,7 @@ class GKEStandardDPv2Provider(GKEProviderBase):
         return {
             "flavor": "standard",
             "machine_type": gs.machine_type,
+            "image_type": gs.image_type,
             "autoscaling": f"min={gs.min_nodes},max={gs.max_nodes}",
             "trigger_pool": {
                 "name": gs.trigger_pool_name,

@@ -45,6 +45,10 @@ gke_standard:
   # to find a fit, leaving the pod Pending forever and timing out every
   # iteration. e2-standard-8 (8 vCPU / 32 GiB) matches the AKS D8s_v5 default.
   machine_type: e2-standard-8
+  # Node OS image for the default + trigger node pools (gcloud --image-type).
+  # null = GKE default. e.g. COS_CONTAINERD, UBUNTU_CONTAINERD.
+  # CLI override: --gke-image-type
+  image_type: null
   num_nodes: 1
   min_nodes: 0
   max_nodes: 10
@@ -54,6 +58,10 @@ aks:
   location: null              # null -> falls back to top-level region
   kubernetes_version: null
   node_provisioning: cluster_autoscaler   # cluster_autoscaler | nap | manual
+  # Node OS image for both node pools (az aks --os-sku). null = AKS default
+  # for the k8s version. e.g. Ubuntu, Ubuntu2204, AzureLinux.
+  # CLI override: --aks-os-sku
+  os_sku: null
   keep_resource_group: true   # don't delete the RG on cluster delete
   system_node_pool:
     name: systempool
@@ -79,6 +87,10 @@ aks:
 eks:
   region: us-east-1           # null -> falls back to top-level region
   kubernetes_version: null    # null -> eksctl default
+  # Node OS image family for both nodegroups (eksctl --node-ami-family).
+  # null = eksctl default. e.g. AmazonLinux2, AmazonLinux2023, Ubuntu2204,
+  # Bottlerocket. CLI override: --eks-ami-family
+  ami_family: null
   system_node_pool:
     name: systempool
     instance_type: m6i.2xlarge   # 8 vCPU / 32 GiB — parity with AKS D8s_v5 / GKE ek-standard-8

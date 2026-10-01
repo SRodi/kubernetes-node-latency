@@ -52,6 +52,31 @@ def test_overlay_cilium_create_args_managed_dataplane():
     assert "--enable-cluster-autoscaler" in np_cmd
 
 
+def test_os_sku_applied_to_create_and_nodepool_when_set():
+    cfg = _cfg(mode="cluster_autoscaler", provider="aks_overlay_cilium")
+    cfg.aks.os_sku = "AzureLinux"
+    p = AKSOverlayCiliumProvider(cfg)
+    with patch("src.providers._az._run") as run:
+        run.return_value = MagicMock(stdout="", returncode=0)
+        p.create(cfg)
+    cmds = [c.args[0] for c in run.call_args_list]
+    create_cmd = next(c for c in cmds if c[:3] == ["az", "aks", "create"])
+    assert create_cmd[create_cmd.index("--os-sku") + 1] == "AzureLinux"
+    np_cmd = next(c for c in cmds if c[:4] == ["az", "aks", "nodepool", "add"])
+    assert np_cmd[np_cmd.index("--os-sku") + 1] == "AzureLinux"
+    assert p.describe(MagicMock()).get("os_sku") == "AzureLinux"
+
+
+def test_os_sku_absent_by_default():
+    cfg = _cfg(mode="cluster_autoscaler", provider="aks_overlay_cilium")
+    p = AKSOverlayCiliumProvider(cfg)
+    with patch("src.providers._az._run") as run:
+        run.return_value = MagicMock(stdout="", returncode=0)
+        p.create(cfg)
+    cmds = [c.args[0] for c in run.call_args_list]
+    assert all("--os-sku" not in c for c in cmds)
+
+
 def test_byocni_invokes_helm_install():
     cfg = _cfg(mode="cluster_autoscaler", provider="aks_byocni")
     p = AKSBYOCNIProvider(cfg)

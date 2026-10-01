@@ -155,6 +155,34 @@ One command per supported scenario:
 .venv/bin/python -m src.cli run --provider existing --iterations 5
 ```
 
+### Node machine type and OS image
+
+Each provider provisions its nodes with a default machine type (`Standard_D8s_v5`
+on AKS, `e2-standard-8` on GKE, `m6i.2xlarge` on EKS — all 8 vCPU / 32 GiB for
+cross-provider parity). On top of the machine type you can pin a specific **node
+OS image**; the selector is applied to every node pool the harness creates,
+including the trigger pool that each iteration measures. Set it in `config.yaml`
+or override per run:
+
+| Provider | config.yaml key | CLI flag | underlying flag | examples |
+|----------|-----------------|----------|-----------------|----------|
+| AKS (all) | `aks.os_sku` | `--aks-os-sku` | `az aks ... --os-sku` | `Ubuntu`, `Ubuntu2204`, `AzureLinux` |
+| GKE Standard | `gke_standard.image_type` | `--gke-image-type` | `gcloud ... --image-type` | `COS_CONTAINERD`, `UBUNTU_CONTAINERD` |
+| EKS | `eks.ami_family` | `--eks-ami-family` | `eksctl ... --node-ami-family` | `AmazonLinux2`, `AmazonLinux2023`, `Ubuntu2204`, `Bottlerocket` |
+
+Machine type overrides use the same pattern (`--aks-vm-size`, and the
+`machine_type` / `instance_type` config keys). The OS image the node actually
+booted — plus the selector that was requested — is recorded in
+`run_metadata.json` and surfaced in `summary.md`'s **Cluster** section as the
+`Node image` line.
+
+```bash
+# e.g. AKS on Azure Linux, GKE on Ubuntu, EKS on AL2023
+.venv/bin/python -m src.cli run --provider aks_overlay_cilium --region westeurope --aks-os-sku AzureLinux    --iterations 10
+.venv/bin/python -m src.cli run --provider gke_standard_dpv2  --region europe-west1 --gke-image-type UBUNTU_CONTAINERD --iterations 10
+.venv/bin/python -m src.cli run --provider eks_eni_cilium     --aws-region us-east-1 --eks-ami-family AmazonLinux2023 --iterations 10
+```
+
 ### AKS configuration
 
 Set provider-specific options under the `aks:` block in `config.yaml`:
@@ -167,6 +195,7 @@ aks:
   location: westeurope            # defaults to top-level region
   kubernetes_version: null        # null => AKS default
   node_provisioning: cluster_autoscaler   # cluster_autoscaler | nap | manual
+  os_sku: null                    # null => AKS default; e.g. Ubuntu2204, AzureLinux
   system_node_pool:
     name: systempool
     vm_size: Standard_D4s_v5

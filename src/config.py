@@ -83,6 +83,10 @@ class AKSCfg:
     # `az aks create` fails with K8sVersionNotSupported. See aka.ms/aks/lts.
     long_term_support: bool = False
     node_provisioning: str = "cluster_autoscaler"  # cluster_autoscaler|nap|manual
+    # Node OS image selector, applied to both node pools via `az aks
+    # create/nodepool add --os-sku` (e.g. Ubuntu, Ubuntu2204, AzureLinux).
+    # null = AKS default for the Kubernetes version.
+    os_sku: str | None = None
     system_node_pool: AKSSystemPoolCfg = dc.field(default_factory=AKSSystemPoolCfg)
     user_node_pool: AKSNodePoolCfg = dc.field(default_factory=AKSNodePoolCfg)
     byocni: AKSByocniCfg = dc.field(default_factory=AKSByocniCfg)
@@ -92,6 +96,10 @@ class AKSCfg:
 @dc.dataclass
 class GKEStandardCfg:
     machine_type: str = "e2-standard-8"
+    # Node OS image selector, applied to the default and trigger node pools
+    # via `gcloud ... --image-type` (e.g. COS_CONTAINERD, UBUNTU_CONTAINERD).
+    # null = GKE default for the release channel.
+    image_type: str | None = None
     num_nodes: int = 1
     min_nodes: int = 0
     max_nodes: int = 10
@@ -177,6 +185,10 @@ class EKSClusterAutoscalerCfg:
 class EKSCfg:
     region: str | None = None  # falls back to top-level region
     kubernetes_version: str | None = None  # null = eksctl default
+    # Node OS image selector, applied to both nodegroups via eksctl
+    # `--node-ami-family` (e.g. AmazonLinux2, AmazonLinux2023, Ubuntu2204,
+    # Bottlerocket). null = eksctl default.
+    ami_family: str | None = None
     system_node_pool: EKSSystemPoolCfg = dc.field(default_factory=EKSSystemPoolCfg)
     user_node_pool: EKSNodePoolCfg = dc.field(default_factory=EKSNodePoolCfg)
     cilium: EKSCiliumCfg = dc.field(default_factory=EKSCiliumCfg)
