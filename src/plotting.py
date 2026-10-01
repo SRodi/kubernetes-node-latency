@@ -108,9 +108,10 @@ ACTOR_COLORS = {
     "sandbox":         "#fde68a",  # pale amber (kubelet pre-pull setup)
     "kubelet_main":    "#93c5fd",  # light blue (kubelet starting agent main container)
     "init_run":        "#f97316",  # dark orange (init container execution window)
+    "containerd_setup": "#0891b2", # cyan (containerd CreateContainer->Started: snapshot mount + runc)
     "trigger_pod":     "#a855f7",  # purple (trigger pod CNI ADD / sandbox setup)
     "kubelet_wait":    "#cbd5e1",  # neutral slate-grey (fallback gap-fill lane)
-    "pleg":            "#db2777",  # magenta (kubelet PLEG observation lag)
+    "pleg":            "#6b7280",  # grey (kubelet PLEG observation lag, shaded inside the run block)
 }
 
 # Cilium bootstrap sub-phases in the canonical execution order published by
@@ -1814,13 +1815,15 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
 
     # Per-container kubelet PLEG observation-lag overlay. PLEG is a single
     # per-node relist loop, so every container inherits the same lag
-    # distribution (see `_pleg_delay_estimate`). We render it as a magenta
-    # whisker reaching *backwards* from each container's `Started` marker
-    # (the run-lane start): the container was actually running on the CRI
-    # runtime up to `expected` (solid) — and at most `worst` (dashed cap) —
-    # seconds before kubelet observed it at the next relist. The space to the
-    # left of a run lane's start on its own row is empty, so the whisker never
-    # collides with the bar.
+    # distribution (see `_pleg_delay_estimate`). We shade it *inside* the run
+    # block: the kubelet `Started` event fires as soon as CRI `StartContainer`
+    # returns, so the container is already running at the run-lane start. The
+    # first `expected` seconds of that observed run window are the interval
+    # during which kubelet's ~1 Hz relist had not yet reported the container as
+    # Running. We paint that slice in one consistent grey across every run lane
+    # of every pod, so the "time the container was running but unobserved" is
+    # legible as a distinct portion of the run block (not a value that happens
+    # before, or outside, it).
     pleg_est = _pleg_delay_estimate(ok)
     pleg_drawn = False
     from matplotlib.patches import Rectangle as _PlegRect
@@ -1828,6 +1831,13 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
     for (label, s_off, e_off, actor), y in zip(all_lanes, y_positions):
         dur = e_off - s_off
         is_pull = isinstance(actor, str) and actor.startswith("pull:")
+        # `create:<container>` lanes carry the containerd CreateContainer ->
+        # Started window: snapshot mount + any deferred layer extraction +
+        # runc create/start. Previously these shared the run lane's
+        # per-container colour, so the overhead visually hid inside the run
+        # block. Render them in a distinct hatched cyan so the containerd
+        # setup cost is legible on its own.
+        is_create = actor == "init_run" and label in create_label_to_container
         # Look up the container this lane is "for" (1:1 mapping for both
         # the image pull and the subsequent run). Container colour wins
         # over family / actor colour when present.
@@ -1837,7 +1847,14 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
             container = create_label_to_container.get(label) or run_label_to_container.get(label)
         else:
             container = None
-        if container and container in container_to_color:
+        hatch = None
+        if is_create:
+            color = ACTOR_COLORS["containerd_setup"]
+            bar_h = 0.45
+            hatch = "////"
+            if "containerd_setup" not in used_actors:
+                used_actors.append("containerd_setup")
+        elif container and container in container_to_color:
             color = container_to_color[container]
             if container not in used_containers:
                 used_containers.append(container)
@@ -1854,7 +1871,7 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
             if actor not in used_actors:
                 used_actors.append(actor)
         ax.barh(y, max(dur, 0.05), left=s_off, height=bar_h, color=color,
-                edgecolor="black", linewidth=0.5,
+                edgecolor="black", linewidth=0.5, hatch=hatch,
                 alpha=0.9 if is_pull else 1.0)
         text = f"{dur:.2f}s"
         ax.text(s_off + dur / 2 if dur > 1.5 else e_off + 0.4, y, text,
@@ -1862,24 +1879,21 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
                 fontsize=7 if is_pull else 8,
                 color="white" if (dur > 1.5 and not is_pull) else "black")
 
-        # PLEG observation-lag whisker for per-container run lanes.
-        if (pleg_est is not None and actor == "init_run" and container
-                and pleg_est.get("expected_s")):
+        # PLEG observation-lag shading for per-container run lanes. Only the
+        # run lane (the `Started` marker) earns it — the create lane ends *at*
+        # Started, so annotating it too would double-count.
+        if (pleg_est is not None and actor == "init_run" and not is_create
+                and container and pleg_est.get("expected_s")):
             exp = pleg_est["expected_s"]
-            worst = pleg_est.get("worst_s") or exp
             pcol = ACTOR_COLORS["pleg"]
-            # Solid expected band [s_off - exp, s_off], thin, just below the
-            # bar's vertical centre so it reads as an attached annotation.
+            # Grey band over the first `exp` seconds of the run block, clamped
+            # to the bar width, full bar height, hatched so it stands out on
+            # top of the per-container colour. One consistent grey everywhere.
+            band = min(exp, max(dur, 0.05))
             ax.add_patch(_PlegRect(
-                (s_off - exp, y - 0.10), exp, 0.20,
-                facecolor=pcol, edgecolor="none", alpha=0.55, zorder=2.5))
-            # Dashed whisker from expected out to worst-case, with an end cap.
-            if worst > exp + 1e-3:
-                ax.plot([s_off - worst, s_off - exp], [y, y],
-                        color=pcol, linestyle="--", linewidth=1.0,
-                        alpha=0.8, zorder=2.5)
-                ax.plot([s_off - worst, s_off - worst], [y - 0.14, y + 0.14],
-                        color=pcol, linewidth=1.0, alpha=0.8, zorder=2.5)
+                (s_off, y - bar_h / 2), band, bar_h,
+                facecolor=pcol, edgecolor="#1f2937", linewidth=0.6,
+                hatch="xxx", alpha=0.92, zorder=3.0))
             pleg_drawn = True
     # Lanes have already been reordered so each pod's lanes are
     # contiguous. Draw a single thin dashed outer border around the
@@ -2009,8 +2023,13 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
     ax.grid(True, axis="x", alpha=0.3)
 
     from matplotlib.patches import Patch
+    _ACTOR_LEGEND_LABELS = {
+        "containerd_setup": "containerd setup (Created\u2192Started: snapshot mount + runc)",
+    }
     legend_handles = [
-        Patch(facecolor=ACTOR_COLORS[a], edgecolor="black", label=a)
+        Patch(facecolor=ACTOR_COLORS[a], edgecolor="black",
+              hatch="////" if a == "containerd_setup" else None,
+              label=_ACTOR_LEGEND_LABELS.get(a, a))
         for a in used_actors
     ]
     if used_pull_fams:
@@ -2022,15 +2041,15 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
     if pleg_drawn and pleg_est is not None:
         exp = pleg_est.get("expected_s")
         worst = pleg_est.get("worst_s")
-        _lbl = "PLEG observe lag"
+        _lbl = "PLEG observe lag (unobserved run time"
         if exp is not None:
-            _lbl += f" (exp {exp:.2f}s"
+            _lbl += f" \u2248 {exp:.2f}s"
             if worst is not None and worst > (exp + 1e-3):
-                _lbl += f" \u2192 worst {worst:.2f}s"
-            _lbl += ", before Started)"
+                _lbl += f", up to {worst:.2f}s"
+        _lbl += ")"
         legend_handles.append(
-            Patch(facecolor=ACTOR_COLORS["pleg"], edgecolor="none",
-                  alpha=0.55, label=_lbl))
+            Patch(facecolor=ACTOR_COLORS["pleg"], edgecolor="#1f2937",
+                  hatch="xxx", alpha=0.92, label=_lbl))
     _n_leg = len(used_actors) + len(used_pull_fams) + (1 if pleg_drawn else 0)
     ax.legend(handles=legend_handles, loc="lower left", fontsize=8, title="actor",
               ncol=2 if _n_leg > 6 else 1)

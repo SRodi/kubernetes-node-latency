@@ -638,3 +638,49 @@ def test_plot_pleg_detail_skips_without_data(tmp_path: Path):
     out = tmp_path / "plots"
     assert _plot_pleg_detail(_pleg_df(with_data=False), out) is None
     assert not (out / "pleg.png").exists()
+
+
+def _has_color(png_path: Path, rgb: tuple[int, int, int], tol: int = 10) -> bool:
+    """True if any pixel in the PNG is within `tol` of `rgb` (per channel)."""
+    from PIL import Image
+    im = Image.open(png_path).convert("RGB")
+    import numpy as _np
+    arr = _np.asarray(im).reshape(-1, 3).astype(int)
+    r, g, b = rgb
+    hit = ((abs(arr[:, 0] - r) <= tol)
+           & (abs(arr[:, 1] - g) <= tol)
+           & (abs(arr[:, 2] - b) <= tol))
+    return bool(hit.any())
+
+
+def test_containerd_setup_color_registered():
+    from src.plotting import ACTOR_COLORS
+    assert ACTOR_COLORS["containerd_setup"] == "#0891b2"
+
+
+def test_phase_profile_draws_containerd_setup_band(tmp_path: Path):
+    """A Created->Started gap renders a distinct cyan containerd-setup band."""
+    d = tmp_path / "run"
+    write_outputs(_trigger_pod_records(3), d,
+                  run_id="A", provider="gke_autopilot", region="x")
+    out = tmp_path / "plots"
+    plot_all(d / "iterations.csv", out, title="(x)")
+    png = out / "phase_profile.png"
+    assert png.exists()
+    # ACTOR_COLORS["containerd_setup"] == #0891b2 == (8,145,178).
+    assert _has_color(png, (8, 145, 178)), "containerd-setup band not drawn"
+
+
+def test_phase_profile_no_band_without_create_gap(tmp_path: Path):
+    """When Created == Started (no gap), no containerd-setup band is drawn."""
+    recs = _trigger_pod_records(3)
+    for r in recs:
+        # Collapse the create window: started at the created instant.
+        r.node_container_starts[0]["t_started"] = r.node_container_creates[0]["t_created"]
+    d = tmp_path / "run"
+    write_outputs(recs, d, run_id="B", provider="gke_autopilot", region="x")
+    out = tmp_path / "plots"
+    plot_all(d / "iterations.csv", out, title="(x)")
+    png = out / "phase_profile.png"
+    assert png.exists()
+    assert not _has_color(png, (8, 145, 178)), "unexpected containerd-setup band"

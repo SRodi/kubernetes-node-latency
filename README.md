@@ -257,8 +257,12 @@ results/20260512-085541/
     │                            # lanes and per-phase `bootstrap:` and `regen:` lanes inlined.
     │                            # T-markers: T1, Tt, Ts, Tips, Tip, Tcsi, T1c, T2, T3, T4, T4b, Tts, T5;
     │                            # coincident markers (within 1 ms) collapse to combined labels (e.g. T1=Ts, T4=T4b).
-    │                            # Each per-container run lane carries a magenta PLEG observe-lag whisker
-    │                            # reaching backwards from `Started` (expected → worst) when PLEG data exists.
+    │                            # Each per-container run lane shades its PLEG observe-lag (the first ≈expected
+    │                            # seconds of the run block during which kubelet's ~1Hz relist had not yet
+    │                            # reported the already-running container) as a consistent grey hatched band.
+    │                            # The `create:<container>` lane (CreateContainer→Started: snapshot mount +
+    │                            # runc, the containerd setup overhead that otherwise hides inside the run
+    │                            # block) is drawn as a distinct hatched-cyan "containerd setup" band.
     ├── pleg.png                 # kubelet PLEG detail (only emitted when PLEG columns are present):
     │                            # left = relist duration avg→p99 vs ~1s relist interval and the 3s
     │                            # unhealthy threshold; right = derived per-container observe-lag
@@ -378,12 +382,39 @@ actually running on the CRI and kubelet noticing it on the next relist pass.
 `plot` derives a per-container estimate from the histograms —
 `expected = interval_avg/2 + relist_avg` (uniform arrival within a relist
 cycle) and `worst = interval_p99 + relist_p99` (state changed just after a
-relist began, on the slowest cycle). This is drawn two ways: a magenta
-observe-lag whisker reaching backwards from each run lane's `Started` marker on
-`phase_profile.png`, and a dedicated `pleg.png` detail (relist-duration vs
-interval plus the per-container lag bar). Both are skipped cleanly when a run
-has no PLEG columns (e.g. GKE Autopilot, whose managed kubelet proxy returns
-403).
+relist began, on the slowest cycle). This is drawn two ways: a consistent grey
+hatched band shaded over the **first `expected` seconds of each run lane** on
+`phase_profile.png` (the container is already running at `Started`, so this slice
+of the observed run block is the "running-but-not-yet-observed" interval — the
+same grey is used for every run lane of every pod so it reads uniformly), and a
+dedicated
+`pleg.png` detail (relist-duration vs interval plus the per-container lag bar).
+Both are skipped cleanly when a run has no PLEG columns (e.g. GKE Autopilot,
+whose managed kubelet proxy returns 403).
+
+### Image unpack / containerd setup overhead
+
+All supported platforms (GKE COS, AKS, EKS AL2023) run **containerd**. A
+common question is "how long does unpacking (layer decompress) add?".
+Important nuance, verified against containerd's source:
+
+- containerd's CRI performs **pull and unpack as one combined operation**
+  (`WithPullUnpack`). The kubelet `Successfully pulled image "X" in <d>s`
+  figure **already includes decompress/unpack** — i.e. unpack is a subset of
+  the *pull* window, not a separate phase after it.
+- containerd exposes **no per-image unpack-duration metric** (only
+  `image_pulls`, `in_progress_image_pulls`, and `image_pulling_throughput_mibps`).
+  Its metrics endpoint (`127.0.0.1:1338`) and logs are **not reachable**
+  through the harness's non-privileged apiserver node-proxy model, so the
+  download-vs-unpack split cannot be isolated without a privileged node agent.
+
+What the harness *can* surface accurately, with no privileged access, is the
+**CreateContainer→Started** window captured from kubelet `Created` / `Started`
+events (`node_container_creates_json` / `node_container_starts_json`): snapshot
+mount, any deferred layer extraction, and `runc create`/`start`. This overhead
+previously shared the run lane's colour and so visually hid inside the "run"
+block; it is now drawn as a distinct **hatched-cyan "containerd setup" band**
+on each `create:<container>` lane of `phase_profile.png`.
 
 ## Architecture
 
