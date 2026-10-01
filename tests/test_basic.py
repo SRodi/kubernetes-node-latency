@@ -576,3 +576,65 @@ def test_plot_compare_pod_running_emits_png(tmp_path: Path):
     png = _plot_compare_pod_running(
         [a / "iterations.csv", b / "iterations.csv"], out)
     assert png is not None and png.exists() and png.stat().st_size > 0
+
+
+def _pleg_df(with_data: bool = True, n: int = 5) -> pd.DataFrame:
+    """Minimal success DataFrame with (or without) kubelet PLEG columns."""
+    rows = []
+    for i in range(1, n + 1):
+        row = {"status": "success", "iteration": i,
+               "provider": "eks_eni_cilium", "region": "us-east-1"}
+        if with_data:
+            row.update({
+                "kubelet_pleg_relist_avg_s": 0.0015,
+                "kubelet_pleg_relist_p50_s": 0.0005,
+                "kubelet_pleg_relist_p90_s": 0.0046,
+                "kubelet_pleg_relist_p99_s": 0.0079,
+                "kubelet_pleg_relist_count": 20,
+                "kubelet_pleg_interval_avg_s": 1.002,
+                "kubelet_pleg_interval_p50_s": 1.0,
+                "kubelet_pleg_interval_p90_s": 1.004,
+                "kubelet_pleg_interval_p99_s": 2.485,
+            })
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def test_pleg_delay_estimate_derives_expected_and_worst():
+    from src.plotting import _pleg_delay_estimate
+    est = _pleg_delay_estimate(_pleg_df(with_data=True))
+    assert est is not None
+    # expected = interval_avg/2 + relist_avg
+    assert abs(est["expected_s"] - (1.002 / 2 + 0.0015)) < 1e-9
+    # worst = interval_p99 + relist_p99
+    assert abs(est["worst_s"] - (2.485 + 0.0079)) < 1e-9
+    assert est["n_iters"] == 5
+    assert est["worst_s"] > est["expected_s"]
+
+
+def test_pleg_delay_estimate_none_without_columns():
+    from src.plotting import _pleg_delay_estimate
+    assert _pleg_delay_estimate(_pleg_df(with_data=False)) is None
+
+
+def test_pleg_delay_estimate_none_when_all_null():
+    from src.plotting import _pleg_delay_estimate
+    df = _pleg_df(with_data=True)
+    for c in [c for c in df.columns if c.startswith("kubelet_pleg")]:
+        df[c] = None
+    assert _pleg_delay_estimate(df) is None
+
+
+def test_plot_pleg_detail_emits_png_when_data_present(tmp_path: Path):
+    from src.plotting import _plot_pleg_detail
+    out = tmp_path / "plots"
+    png = _plot_pleg_detail(_pleg_df(with_data=True), out, title="(eks @ x)")
+    assert png is not None and png.exists() and png.stat().st_size > 0
+    assert png.name == "pleg.png"
+
+
+def test_plot_pleg_detail_skips_without_data(tmp_path: Path):
+    from src.plotting import _plot_pleg_detail
+    out = tmp_path / "plots"
+    assert _plot_pleg_detail(_pleg_df(with_data=False), out) is None
+    assert not (out / "pleg.png").exists()

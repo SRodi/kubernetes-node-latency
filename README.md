@@ -257,6 +257,12 @@ results/20260512-085541/
     │                            # lanes and per-phase `bootstrap:` and `regen:` lanes inlined.
     │                            # T-markers: T1, Tt, Ts, Tips, Tip, Tcsi, T1c, T2, T3, T4, T4b, Tts, T5;
     │                            # coincident markers (within 1 ms) collapse to combined labels (e.g. T1=Ts, T4=T4b).
+    │                            # Each per-container run lane carries a magenta PLEG observe-lag whisker
+    │                            # reaching backwards from `Started` (expected → worst) when PLEG data exists.
+    ├── pleg.png                 # kubelet PLEG detail (only emitted when PLEG columns are present):
+    │                            # left = relist duration avg→p99 vs ~1s relist interval and the 3s
+    │                            # unhealthy threshold; right = derived per-container observe-lag
+    │                            # (expected = interval_avg/2 + relist_avg, worst = interval_p99 + relist_p99).
     ├── latency_vs_iteration.png # both T0→T1 (IaaS) and T1→T5 (K8s networking) per iteration
     └── cdf.png                  # CDF of time_to_runnable_s (falls back to node_startup_latency_s
                                  # for older runs that pre-date T5 capture) with p50/p90/p99 markers
@@ -365,6 +371,19 @@ privileged Pod, no extra node. The histograms are cumulative since kubelet
 start, so by T4 a fresh node already carries the relist samples covering the
 exact pod-wiring window. Best-effort: a blocked/failed proxy simply yields
 null PLEG columns for that iteration.
+
+**Visualising the delay.** The node-level relist loop means every container on
+the node inherits the same PLEG observation lag — the gap between a container
+actually running on the CRI and kubelet noticing it on the next relist pass.
+`plot` derives a per-container estimate from the histograms —
+`expected = interval_avg/2 + relist_avg` (uniform arrival within a relist
+cycle) and `worst = interval_p99 + relist_p99` (state changed just after a
+relist began, on the slowest cycle). This is drawn two ways: a magenta
+observe-lag whisker reaching backwards from each run lane's `Started` marker on
+`phase_profile.png`, and a dedicated `pleg.png` detail (relist-duration vs
+interval plus the per-container lag bar). Both are skipped cleanly when a run
+has no PLEG columns (e.g. GKE Autopilot, whose managed kubelet proxy returns
+403).
 
 ## Architecture
 

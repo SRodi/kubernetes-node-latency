@@ -110,6 +110,7 @@ ACTOR_COLORS = {
     "init_run":        "#f97316",  # dark orange (init container execution window)
     "trigger_pod":     "#a855f7",  # purple (trigger pod CNI ADD / sandbox setup)
     "kubelet_wait":    "#cbd5e1",  # neutral slate-grey (fallback gap-fill lane)
+    "pleg":            "#db2777",  # magenta (kubelet PLEG observation lag)
 }
 
 # Cilium bootstrap sub-phases in the canonical execution order published by
@@ -147,6 +148,68 @@ def _seconds(a: pd.Series, b: pd.Series) -> pd.Series:
 
 def _ok(df: pd.DataFrame) -> pd.DataFrame:
     return df[df["status"] == "success"].reset_index(drop=True)
+
+
+# Columns written by `src.kubelet_pleg.pleg_to_columns`. Kept local (rather
+# than imported) so plotting has no hard dependency on the collector module.
+_PLEG_COLS = (
+    "kubelet_pleg_relist_avg_s", "kubelet_pleg_relist_p50_s",
+    "kubelet_pleg_relist_p90_s", "kubelet_pleg_relist_p99_s",
+    "kubelet_pleg_relist_count",
+    "kubelet_pleg_interval_avg_s", "kubelet_pleg_interval_p50_s",
+    "kubelet_pleg_interval_p90_s", "kubelet_pleg_interval_p99_s",
+)
+
+
+def _pleg_delay_estimate(ok: pd.DataFrame) -> dict | None:
+    """Derive the per-container kubelet PLEG observation-lag estimate from the
+    node-level relist histograms captured by `--deep-cilium`.
+
+    PLEG is a single per-node relist loop: kubelet lists all container states
+    from the CRI runtime every `relist_interval` seconds (each pass costs
+    `relist_duration`), and only reflects a container's state transition in
+    Kubernetes state at the *next* relist that observes it. Every container on
+    the node therefore inherits the same lag distribution:
+
+        expected ≈ relist_interval/2 + relist_duration   (uniform arrival
+                   within a cycle, plus the pass cost)
+        worst    ≈ relist_interval_p99 + relist_duration_p99  (state changed
+                   just after a relist began, during the slowest cycle)
+
+    Values are medians across the run's iterations (robust to the occasional
+    scrape that caught kubelet mid-churn). Returns None when no iteration
+    carries PLEG columns (e.g. GKE Autopilot blocks the kubelet node-proxy,
+    or the run predates capture).
+    """
+    def _med(col: str) -> float | None:
+        if col not in ok.columns:
+            return None
+        s = pd.to_numeric(ok[col], errors="coerce").dropna()
+        return float(s.median()) if not s.empty else None
+
+    interval_avg = _med("kubelet_pleg_interval_avg_s")
+    interval_p99 = _med("kubelet_pleg_interval_p99_s")
+    relist_avg = _med("kubelet_pleg_relist_avg_s")
+    relist_p99 = _med("kubelet_pleg_relist_p99_s")
+    count = pd.to_numeric(ok.get("kubelet_pleg_relist_avg_s"), errors="coerce").dropna().size \
+        if "kubelet_pleg_relist_avg_s" in ok.columns else 0
+    if interval_avg is None and relist_avg is None:
+        return None
+    ra = relist_avg or 0.0
+    rp = relist_p99 or 0.0
+    expected = (interval_avg / 2.0 + ra) if interval_avg is not None else None
+    worst = (interval_p99 + rp) if interval_p99 is not None else None
+    if expected is None and worst is None:
+        return None
+    return {
+        "expected_s": expected,
+        "worst_s": worst,
+        "interval_avg_s": interval_avg,
+        "interval_p99_s": interval_p99,
+        "relist_avg_s": relist_avg,
+        "relist_p99_s": relist_p99,
+        "n_iters": int(count),
+    }
 
 
 def plot_all(iterations_csv: Path, out_dir: Path, *, title: str = "",
@@ -356,7 +419,123 @@ def plot_all(iterations_csv: Path, out_dir: Path, *, title: str = "",
     if p is not None:
         paths.append(p)
 
+    # 7. kubelet PLEG detail — relist duration + interval distributions and
+    #    the derived per-container observation-lag envelope. Only emitted when
+    #    `--deep-cilium` captured PLEG columns for this run.
+    p = _plot_pleg_detail(ok, out_dir, title=title)
+    if p is not None:
+        paths.append(p)
+
     return paths
+
+
+def _plot_pleg_detail(ok: pd.DataFrame, out_dir: Path, *,
+                      title: str = "") -> Path | None:
+    """Dedicated kubelet-PLEG figure (`pleg.png`).
+
+    Two panels:
+      * left  — per-iteration relist duration (avg with p90/p99 whiskers) and
+                the relist interval (the ~1 s healthy cadence), on a log-y so
+                the millisecond durations and second-scale interval coexist.
+      * right — the derived per-container PLEG observation-lag envelope:
+                expected (`interval/2 + duration`) with a whisker out to the
+                worst case (`interval_p99 + duration_p99`). This is the lag
+                every container inherits before kubelet reflects its state.
+
+    Returns None when the run has no PLEG columns populated.
+    """
+    est = _pleg_delay_estimate(ok)
+    if est is None:
+        return None
+
+    def _num(col: str) -> pd.Series:
+        if col not in ok.columns:
+            return pd.Series(dtype=float)
+        return pd.to_numeric(ok[col], errors="coerce")
+
+    r_avg = _num("kubelet_pleg_relist_avg_s")
+    r_p90 = _num("kubelet_pleg_relist_p90_s")
+    r_p99 = _num("kubelet_pleg_relist_p99_s")
+    i_avg = _num("kubelet_pleg_interval_avg_s")
+    mask = r_avg.notna() | i_avg.notna()
+    if not mask.any():
+        return None
+    idx = np.arange(1, int(mask.sum()) + 1)
+    r_avg_v = r_avg[mask].to_numpy(dtype=float)
+    r_p90_v = r_p90[mask].to_numpy(dtype=float)
+    r_p99_v = r_p99[mask].to_numpy(dtype=float)
+    i_avg_v = i_avg[mask].to_numpy(dtype=float)
+
+    fig, (axl, axr) = plt.subplots(1, 2, figsize=(12, 5),
+                                   gridspec_kw={"width_ratios": [2, 1]})
+
+    # ---- Left: relist duration + interval per iteration ----
+    pcol = ACTOR_COLORS["pleg"]
+    # Relist duration avg with an upward whisker to p99 (log-y: no downward
+    # whisker, which would run toward 0).
+    upper = np.nan_to_num(r_p99_v - r_avg_v, nan=0.0)
+    upper = np.clip(upper, 0.0, None)
+    axl.errorbar(idx, r_avg_v, yerr=[np.zeros_like(r_avg_v), upper],
+                 fmt="o", color=pcol, ecolor=pcol, elinewidth=1.0,
+                 capsize=3, markersize=4, label="relist duration avg (→p99)")
+    # p90 markers for extra context.
+    if np.isfinite(r_p90_v).any():
+        axl.scatter(idx, r_p90_v, marker="_", color=pcol, alpha=0.6,
+                    s=120, label="relist duration p90")
+    # Interval line (healthy ≈ 1 s cadence).
+    if np.isfinite(i_avg_v).any():
+        axl.plot(idx, i_avg_v, marker="s", color=ACTOR_COLORS["kubelet"],
+                 linewidth=1.2, markersize=4, label="relist interval avg")
+        axl.axhline(1.0, color=ACTOR_COLORS["kubelet"], linestyle=":",
+                    alpha=0.5, linewidth=1.0)
+    axl.axhline(3.0, color=ACTOR_COLORS["scheduler"], linestyle="--",
+                alpha=0.6, linewidth=1.0,
+                label="PLEG unhealthy threshold (3 s)")
+    axl.set_yscale("log")
+    axl.set_xlabel("iteration")
+    axl.set_ylabel("seconds (log)")
+    axl.set_title("Kubelet PLEG relist: duration vs interval", fontsize=10)
+    axl.grid(True, which="both", alpha=0.25)
+    axl.legend(fontsize=7, loc="center right")
+
+    # ---- Right: per-container observation-lag envelope ----
+    exp = est.get("expected_s")
+    worst = est.get("worst_s")
+    bars = []
+    if exp is not None:
+        bars.append(("expected\n(interval/2 + dur)", exp, worst))
+    if bars:
+        labels = [b[0] for b in bars]
+        vals = [b[1] for b in bars]
+        yerr_up = [max((b[2] or b[1]) - b[1], 0.0) for b in bars]
+        axr.bar(range(len(bars)), vals, color=pcol, alpha=0.6,
+                edgecolor="black", linewidth=0.6,
+                yerr=[[0.0] * len(bars), yerr_up], capsize=6,
+                error_kw={"ecolor": pcol, "elinewidth": 1.4})
+        axr.set_xticks(range(len(bars)))
+        axr.set_xticklabels(labels, fontsize=8)
+        for i, (lbl, v, w) in enumerate(bars):
+            axr.text(i, v, f" {v:.2f}s", ha="center", va="bottom", fontsize=9,
+                     color="black", fontweight="bold")
+            if w is not None and w > v + 1e-3:
+                axr.text(i, w, f"worst {w:.2f}s", ha="center", va="bottom",
+                         fontsize=8, color=pcol)
+    axr.set_ylabel("observation lag (s)")
+    axr.set_ylim(bottom=0)
+    axr.set_title("Per-container PLEG lag\n(before kubelet reflects start)",
+                  fontsize=10)
+    axr.grid(True, axis="y", alpha=0.25)
+
+    fig.suptitle(
+        f"Kubelet PLEG {title}  \u2014  n={est.get('n_iters', 0)} iterations"
+        "  (node-level relist loop; every container inherits the same lag)",
+        fontsize=11, fontweight="bold")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    p = out_dir / "pleg.png"
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.savefig(p, dpi=140)
+    plt.close(fig)
+    return p
 
 
 def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
@@ -1633,6 +1812,19 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
         container_to_color[c] = _CONTAINER_PALETTE[i % len(_CONTAINER_PALETTE)]
     used_containers: list[str] = []
 
+    # Per-container kubelet PLEG observation-lag overlay. PLEG is a single
+    # per-node relist loop, so every container inherits the same lag
+    # distribution (see `_pleg_delay_estimate`). We render it as a magenta
+    # whisker reaching *backwards* from each container's `Started` marker
+    # (the run-lane start): the container was actually running on the CRI
+    # runtime up to `expected` (solid) — and at most `worst` (dashed cap) —
+    # seconds before kubelet observed it at the next relist. The space to the
+    # left of a run lane's start on its own row is empty, so the whisker never
+    # collides with the bar.
+    pleg_est = _pleg_delay_estimate(ok)
+    pleg_drawn = False
+    from matplotlib.patches import Rectangle as _PlegRect
+
     for (label, s_off, e_off, actor), y in zip(all_lanes, y_positions):
         dur = e_off - s_off
         is_pull = isinstance(actor, str) and actor.startswith("pull:")
@@ -1670,7 +1862,25 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
                 fontsize=7 if is_pull else 8,
                 color="white" if (dur > 1.5 and not is_pull) else "black")
 
-    # ---- Container/pod grouping boxes ----
+        # PLEG observation-lag whisker for per-container run lanes.
+        if (pleg_est is not None and actor == "init_run" and container
+                and pleg_est.get("expected_s")):
+            exp = pleg_est["expected_s"]
+            worst = pleg_est.get("worst_s") or exp
+            pcol = ACTOR_COLORS["pleg"]
+            # Solid expected band [s_off - exp, s_off], thin, just below the
+            # bar's vertical centre so it reads as an attached annotation.
+            ax.add_patch(_PlegRect(
+                (s_off - exp, y - 0.10), exp, 0.20,
+                facecolor=pcol, edgecolor="none", alpha=0.55, zorder=2.5))
+            # Dashed whisker from expected out to worst-case, with an end cap.
+            if worst > exp + 1e-3:
+                ax.plot([s_off - worst, s_off - exp], [y, y],
+                        color=pcol, linestyle="--", linewidth=1.0,
+                        alpha=0.8, zorder=2.5)
+                ax.plot([s_off - worst, s_off - worst], [y - 0.14, y + 0.14],
+                        color=pcol, linewidth=1.0, alpha=0.8, zorder=2.5)
+            pleg_drawn = True
     # Lanes have already been reordered so each pod's lanes are
     # contiguous. Draw a single thin dashed outer border around the
     # block belonging to each pod.
@@ -1809,8 +2019,21 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
                   label=f"pull:{f}")
             for f in used_pull_fams
         ]
+    if pleg_drawn and pleg_est is not None:
+        exp = pleg_est.get("expected_s")
+        worst = pleg_est.get("worst_s")
+        _lbl = "PLEG observe lag"
+        if exp is not None:
+            _lbl += f" (exp {exp:.2f}s"
+            if worst is not None and worst > (exp + 1e-3):
+                _lbl += f" \u2192 worst {worst:.2f}s"
+            _lbl += ", before Started)"
+        legend_handles.append(
+            Patch(facecolor=ACTOR_COLORS["pleg"], edgecolor="none",
+                  alpha=0.55, label=_lbl))
+    _n_leg = len(used_actors) + len(used_pull_fams) + (1 if pleg_drawn else 0)
     ax.legend(handles=legend_handles, loc="lower left", fontsize=8, title="actor",
-              ncol=2 if (len(used_actors) + len(used_pull_fams)) > 6 else 1)
+              ncol=2 if _n_leg > 6 else 1)
 
     # ---- T1\u2192T1c install-cni decomposition (zoomed) ----
     if has_cni_bd and ax_cni_bd is not None:
