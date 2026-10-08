@@ -144,12 +144,24 @@ class Collector:
     # ----- T1: first time the new node shows up in the API -----
     def wait_for_new_node(self, before_nodes: set[str], timeout_s: int,
                           *, not_before: datetime | None = None,
-                          skew_tolerance_s: float = 2.0) -> tuple[str, datetime]:
+                          skew_tolerance_s: float = 2.0,
+                          label_selector: dict[str, str] | None = None) -> tuple[str, datetime]:
         """Wait for a node whose creationTimestamp is at or after ``not_before``.
 
         Nodes that pre-date the trigger (with `skew_tolerance_s` of clock skew)
         are skipped: they were already being provisioned for unrelated reasons
         and would yield bogus negative latencies.
+
+        ``label_selector`` (when given, typically the same nodeSelector used
+        to pin the trigger pod — see `ClusterProvider.node_autoprovision_hint`)
+        restricts matches to nodes carrying those labels. Without this, a node
+        from an unrelated pool that happens to register concurrently (e.g. a
+        stale node from a prior iteration still scaling down, or an unrelated
+        autoscaler event) can be mistaken for the trigger pod's node, silently
+        attributing that iteration's metrics to the wrong node pool/VM
+        size/image. Discovered when a `--provider existing` run pinned to a
+        custom-VHD pool nonetheless reported 3/5 iterations landing on a
+        different, default pool.
 
         Resilient to the apiserver closing watch streams early (it typically
         does so well before our budget), by re-opening the watch until the
@@ -174,6 +186,14 @@ class Collector:
                     name = node.metadata.name
                     if name in before_nodes:
                         continue
+                    if label_selector:
+                        labels = node.metadata.labels or {}
+                        if any(labels.get(k) != v for k, v in label_selector.items()):
+                            self.sink.write("node_label_mismatch",
+                                            {"name": name, "labels": dict(labels),
+                                             "expected": dict(label_selector)})
+                            before_nodes.add(name)
+                            continue
                     ts = _parse_k8s_time(node.metadata.creation_timestamp) or utcnow()
                     if cutoff is not None and ts < cutoff:
                         self.sink.write("node_pre_dates_trigger",

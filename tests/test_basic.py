@@ -352,6 +352,52 @@ def test_wait_for_new_node_skips_nodes_predating_trigger(monkeypatch):
     assert "node_added" in kinds
 
 
+def test_wait_for_new_node_skips_nodes_with_wrong_labels(monkeypatch):
+    """A node that registers concurrently but belongs to a different node
+    pool (mismatched labels) must be skipped — regression test for a bug
+    where a node from an unrelated autoscaling pool was mistaken for the
+    trigger pod's node when both pools happened to scale up at once."""
+    from datetime import datetime, timezone
+    from src.collectors import Collector
+    from src.cni import get as get_probe
+
+    class FakeMeta:
+        def __init__(self, name, ts, labels=None):
+            self.name = name
+            self.creation_timestamp = ts
+            self.labels = labels or {}
+
+    class FakeNode:
+        def __init__(self, name, ts, labels=None): self.metadata = FakeMeta(name, ts, labels)
+
+    t0 = datetime(2025, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    wrong_pool = FakeNode("wrong-pool-node", datetime(2025, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+                          labels={"agentpool": "latencypool"})
+    right_pool = FakeNode("right-pool-node", datetime(2025, 1, 1, 12, 0, 5, tzinfo=timezone.utc),
+                          labels={"agentpool": "lat8ds24"})
+
+    class FakeWatch:
+        def stream(self, *a, **kw):
+            yield {"object": wrong_pool}
+            yield {"object": right_pool}
+        def stop(self): pass
+
+    monkeypatch.setattr("src.collectors.watch.Watch", FakeWatch)
+
+    sink_calls = []
+    class S:
+        def write(self, kind, obj): sink_calls.append((kind, obj))
+
+    class FakeCore:
+        def list_node(self, **kw): return None
+    c = Collector(core=FakeCore(), probe=get_probe("cilium_dpv2"), sink=S())  # type: ignore[arg-type]
+    name, ts = c.wait_for_new_node(set(), timeout_s=5, not_before=t0,
+                                   label_selector={"agentpool": "lat8ds24"})
+    assert name == "right-pool-node"
+    kinds = [k for k, _ in sink_calls]
+    assert "node_label_mismatch" in kinds
+
+
 def _fake_node(*, ready=True, ready_ts="2025-01-01T12:00:10Z", taint_keys=(),
                ready_status: str | None = None, ready_message: str = ""):
     """Build a minimal V1Node-like object the collector's watch loop expects.

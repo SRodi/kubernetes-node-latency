@@ -129,6 +129,7 @@ def run_iterations(cfg: Config, handle: ClusterHandle, provider: ClusterProvider
 
                 cordoned = cordon_nodes(core, before, sink)
 
+                hint = provider.node_autoprovision_hint()
                 manifest = render_pod(cfg, run_id=run_id, iteration=i, provider=provider)
                 rec.pod_name = manifest["metadata"]["name"]
                 pod = submit_pod(core, manifest)
@@ -137,9 +138,15 @@ def run_iterations(cfg: Config, handle: ClusterHandle, provider: ClusterProvider
                                             "ts": rec.T0_pod_created.isoformat()})
 
                 collector = Collector(core, probe, sink)
+                # Restrict to nodes carrying the same labels the trigger pod
+                # was pinned to (nodeSelector), so a node from an unrelated
+                # pool that happens to register concurrently (e.g. a stale
+                # node from a prior iteration still scaling down) can't be
+                # mistaken for this iteration's node.
                 rec.node_name, rec.T1_node_registered = collector.wait_for_new_node(
                     before, timeout_s=cfg.per_iteration_timeout_s,
-                    not_before=rec.T0_pod_created)
+                    not_before=rec.T0_pod_created,
+                    label_selector=hint.get("nodeSelector") or None)
                 rec.T4_node_ready, rec.T4b_schedulable, rec.T1c_cni_conflist, \
                     rec.T_csinode_ready, rec.T_taint_observed = (
                         collector.wait_for_node_ready(
