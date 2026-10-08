@@ -9,6 +9,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
+from matplotlib.ticker import MultipleLocator  # noqa: E402
 
 from .analysis import METRICS
 
@@ -2099,7 +2100,11 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
         "bars overlapping on x = parallel; back-to-back = sequential.",
     ]
     ax.set_title("\n".join(title_lines), fontsize=9, loc="center", pad=22)
+    # Tick/gridline every 5s so a bar's position can be read off precisely
+    # and correlated against T1 + Ns in the raw captured logs.
+    ax.xaxis.set_major_locator(MultipleLocator(5))
     ax.grid(True, axis="x", alpha=0.3)
+    ax.tick_params(axis="x", labelsize=8)
 
     from matplotlib.patches import Patch
     _ACTOR_LEGEND_LABELS = {
@@ -2202,7 +2207,9 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
             f"per-init durations derived from consecutive start offsets",
             fontsize=9, loc="left",
         )
+        ax_cni_bd.xaxis.set_major_locator(MultipleLocator(5))
         ax_cni_bd.grid(True, axis="x", alpha=0.3)
+        ax_cni_bd.tick_params(axis="x", labelsize=8)
 
     # ---- Cilium internal breakdown (zoomed) ----
     if has_cilium_bd and ax_bd is not None:
@@ -2247,7 +2254,9 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
             f"{pre_bs_dur:.2f}s, then bootstrap phases (zoomed) total {bd_total:.2f}s",
             fontsize=9, loc="left",
         )
+        ax_bd.xaxis.set_major_locator(MultipleLocator(5))
         ax_bd.grid(True, axis="x", alpha=0.3)
+        ax_bd.tick_params(axis="x", labelsize=8)
 
     # ---- Image pulls on this node (per-image median duration) ----
     if has_pulls_bd and ax_pulls is not None:
@@ -3161,7 +3170,9 @@ def _plot_compare_phase_decomposition(csvs: list[Path], out_dir: Path) -> Path |
         "K8s networking phase decomposition — provider comparison (p50)",
         fontsize=11, fontweight="bold",
     )
+    ax_a.xaxis.set_major_locator(MultipleLocator(5))
     ax_a.grid(True, axis="x", alpha=0.3)
+    ax_a.tick_params(axis="x", labelsize=8)
     ax_a.legend(loc="center left", bbox_to_anchor=(1.02, 0.5),
                 fontsize=8, framealpha=0.95, title="phase")
 
