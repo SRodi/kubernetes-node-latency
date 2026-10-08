@@ -3268,6 +3268,7 @@ def _plot_compare_phase_decomposition(csvs: list[Path], out_dir: Path) -> Path |
                     fontsize=7, framealpha=0.95, title="family")
 
     fig.suptitle(
+        "Networking-only comparison (T1-anchored, IaaS variance excluded)",
         fontsize=12, fontweight="bold", y=0.995,
     )
     fig.tight_layout(rect=(0, 0, 0.83, 0.985))
