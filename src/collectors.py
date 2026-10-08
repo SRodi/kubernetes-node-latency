@@ -141,6 +141,25 @@ class Collector:
         self.probe = probe
         self.sink = sink
 
+    def get_node_facts(self, name: str) -> dict | None:
+        """Live ground-truth lookup of the node actually used for this
+        iteration (instance type, OS image, kubelet/kernel/runtime
+        versions). Call this immediately after `wait_for_new_node` while
+        the node is guaranteed to still exist — unlike the one-shot
+        pre-run `cluster.nodes` snapshot in run_metadata.json (taken
+        before any iteration runs), this reflects the real node, which
+        matters most for providers with a zero-scaled/autoscaling target
+        pool (e.g. `--provider existing` pinned to a specific node pool).
+        Best-effort: returns None on any failure, never raises.
+        """
+        from .node_facts import node_summary
+        try:
+            node = self.core.read_node(name)
+        except Exception as e:  # noqa: BLE001
+            self.sink.write("node_facts_lookup_failed", {"name": name, "error": str(e)[:200]})
+            return None
+        return node_summary(node)
+
     # ----- T1: first time the new node shows up in the API -----
     def wait_for_new_node(self, before_nodes: set[str], timeout_s: int,
                           *, not_before: datetime | None = None,

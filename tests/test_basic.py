@@ -398,6 +398,51 @@ def test_wait_for_new_node_skips_nodes_with_wrong_labels(monkeypatch):
     assert "node_label_mismatch" in kinds
 
 
+def test_get_node_facts_returns_live_node_summary():
+    """Collector.get_node_facts must return a ground-truth summary of the
+    real node (used to fix the instance-type misreporting bug), not raise,
+    and must succeed via a live core.read_node() call."""
+    from unittest.mock import MagicMock
+    from src.collectors import Collector
+    from src.cni import get as get_probe
+
+    node = MagicMock()
+    node.metadata.name = "aks-lat8ds24-19437756-vmss000007"
+    node.metadata.creation_timestamp = None
+    node.metadata.labels = {"node.kubernetes.io/instance-type": "Standard_D8ds_v5"}
+    node.status.node_info.kubelet_version = "v1.36.4"
+    node.status.node_info.container_runtime_version = "containerd://1.7.0"
+    node.status.node_info.os_image = "Ubuntu 24.04.3 LTS"
+    node.status.node_info.kernel_version = "6.8.0"
+    node.status.node_info.architecture = "amd64"
+
+    class FakeCore:
+        def read_node(self, name):
+            assert name == "aks-lat8ds24-19437756-vmss000007"
+            return node
+
+    c = Collector(core=FakeCore(), probe=get_probe("cilium_dpv2"), sink=MagicMock())  # type: ignore[arg-type]
+    facts = c.get_node_facts("aks-lat8ds24-19437756-vmss000007")
+    assert facts is not None
+    assert facts["labels"]["node.kubernetes.io/instance-type"] == "Standard_D8ds_v5"
+    assert facts["os_image"] == "Ubuntu 24.04.3 LTS"
+
+
+def test_get_node_facts_returns_none_on_failure():
+    from unittest.mock import MagicMock
+    from src.collectors import Collector
+    from src.cni import get as get_probe
+
+    class FakeCore:
+        def read_node(self, name):
+            raise RuntimeError("not found")
+
+    sink = MagicMock()
+    c = Collector(core=FakeCore(), probe=get_probe("cilium_dpv2"), sink=sink)  # type: ignore[arg-type]
+    assert c.get_node_facts("gone") is None
+    assert sink.write.called
+
+
 def _fake_node(*, ready=True, ready_ts="2025-01-01T12:00:10Z", taint_keys=(),
                ready_status: str | None = None, ready_message: str = ""):
     """Build a minimal V1Node-like object the collector's watch loop expects.

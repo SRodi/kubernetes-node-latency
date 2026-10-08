@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import dataclasses as dc
+import json as _json
 from datetime import datetime, timezone
 
 
@@ -28,6 +29,14 @@ class IterationRecord:
 
     pod_name: str | None = None
     node_name: str | None = None
+
+    # Ground-truth node facts (instance type, OS image, kubelet/kernel/
+    # runtime versions) captured live right after this iteration's node
+    # was identified — see `Collector.get_node_facts`. None if the lookup
+    # failed. This is the field to trust for "what machine actually ran
+    # this iteration", NOT run_metadata.json's cluster.nodes (a one-shot
+    # pre-run snapshot that can be stale/misleading for autoscaled pools).
+    node_facts: dict | None = None
 
     T0_pod_created: datetime | None = None
     T1_node_registered: datetime | None = None
@@ -462,4 +471,11 @@ class IterationRecord:
         row.update(headline_to_columns(self.deep_cilium))
         row.update(pleg_to_columns(self.kubelet_pleg))
         row.update(self.log_phase_breakdown or {})
+        nf = self.node_facts or {}
+        nf_labels = nf.get("labels") or {}
+        row["node_instance_type"] = nf_labels.get("node.kubernetes.io/instance-type")
+        row["node_agentpool"] = nf_labels.get("agentpool") or nf_labels.get("kubernetes.azure.com/agentpool")
+        row["node_os_image"] = nf.get("os_image")
+        row["node_kubelet_version"] = nf.get("kubelet_version")
+        row["node_facts_json"] = _json.dumps(nf, separators=(",", ":")) if nf else None
         return row

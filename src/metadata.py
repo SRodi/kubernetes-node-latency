@@ -59,33 +59,8 @@ def _tooling_versions() -> dict[str, str | None]:
     }
 
 
-_INTERESTING_NODE_LABELS = (
-    # GKE / GCE
-    "cloud.google.com/gke-nodepool",
-    "node.kubernetes.io/instance-type",
-    "topology.kubernetes.io/region",
-    "topology.kubernetes.io/zone",
-    # AKS / Azure
-    "agentpool",
-    "kubernetes.azure.com/agentpool",
-    "kubernetes.azure.com/mode",
-    "kubernetes.azure.com/cluster",
-)
-
-
-def _node_summary(n) -> dict[str, Any]:
-    info = n.status.node_info or None
-    labels = n.metadata.labels or {}
-    return {
-        "name": n.metadata.name,
-        "creation_timestamp": n.metadata.creation_timestamp.isoformat() if n.metadata.creation_timestamp else None,
-        "kubelet_version": getattr(info, "kubelet_version", None),
-        "container_runtime_version": getattr(info, "container_runtime_version", None),
-        "os_image": getattr(info, "os_image", None),
-        "kernel_version": getattr(info, "kernel_version", None),
-        "architecture": getattr(info, "architecture", None),
-        "labels": {k: v for k, v in labels.items() if k in _INTERESTING_NODE_LABELS},
-    }
+from .node_facts import INTERESTING_NODE_LABELS as _INTERESTING_NODE_LABELS
+from .node_facts import node_summary as _node_summary
 
 
 def _cni_image(core: client.CoreV1Api, probe) -> dict[str, str | None]:
@@ -138,14 +113,29 @@ def gather_metadata(*, cfg, handle, provider, core: client.CoreV1Api,
                      run_id: str, cli_argv: list[str]) -> dict[str, Any]:
     describe = getattr(provider, "describe", lambda h: {})
     hint = getattr(provider, "node_autoprovision_hint", lambda: {})() or {}
+    facts = _cluster_facts(core, provider.cni_probe())
+    region, name = handle.region, handle.name
+    if provider.name == "existing":
+        # `--provider existing` has no cluster API access of its own, so
+        # `handle.region`/`handle.name` are just `cfg.region`/
+        # `cfg.cluster_name` (harness config defaults, e.g.
+        # "europe-west1"/"node-latency-test") — meaningless placeholders,
+        # not the real already-existing cluster's identity. Prefer the
+        # real values observed on the live nodes themselves.
+        nodes = facts.get("nodes") or []
+        if nodes:
+            labels = nodes[0].get("labels") or {}
+            region = labels.get("topology.kubernetes.io/region") or region
+            name = (labels.get("kubernetes.azure.com/cluster")
+                    or labels.get("cloud.google.com/gke-nodepool") or name)
     cluster: dict[str, Any] = {
         "provider": provider.name,
-        "region": handle.region,
-        "name": handle.name,
+        "region": region,
+        "name": name,
         "created_by_harness": handle.created,
         "kubeconfig": str(handle.kubeconfig),
         "extra": handle.extra,
-        **_cluster_facts(core, provider.cni_probe()),
+        **facts,
     }
     if hint.get("nodeSelector"):
         # `cluster.nodes` above is a *pre-run* snapshot taken before any
@@ -186,7 +176,8 @@ def write_metadata(run_dir: Path, meta: dict[str, Any]) -> Path:
     return out
 
 
-def finalize_metadata(run_dir: Path, *, status: str) -> dict[str, Any] | None:
+def finalize_metadata(run_dir: Path, *, status: str,
+                      records: list | None = None) -> dict[str, Any] | None:
     out = run_dir / "run_metadata.json"
     if not out.exists():
         return None
@@ -196,6 +187,20 @@ def finalize_metadata(run_dir: Path, *, status: str) -> dict[str, Any] | None:
     meta["end_time"] = end.isoformat(timespec="seconds")
     meta["duration_s"] = round((end - start).total_seconds(), 1)
     meta["status"] = status
+    if records:
+        # Ground truth for "what machine actually ran this test": the
+        # live per-iteration node lookup (`rec.node_facts`), captured
+        # while each iteration's node was guaranteed to exist. Deduped by
+        # name. Supersedes `cluster.nodes` (a one-shot pre-run snapshot)
+        # for reporting purposes — critical for providers with a
+        # zero-scaled/autoscaling target pool, where the pre-run
+        # snapshot only ever shows the always-on system pool.
+        seen: dict[str, Any] = {}
+        for rec in records:
+            nf = getattr(rec, "node_facts", None)
+            if nf and nf.get("name") not in seen:
+                seen[nf["name"]] = nf
+        meta.setdefault("cluster", {})["nodes_tested"] = list(seen.values())
     out.write_text(json.dumps(meta, indent=2, default=str, sort_keys=False))
     return meta
 
@@ -205,7 +210,13 @@ def append_summary_section(summary_md: Path, meta: dict[str, Any]) -> None:
         return
     cluster = meta.get("cluster", {})
     cni = (cluster.get("cni") or {})
-    nodes = cluster.get("nodes") or []
+    # Prefer the real per-iteration node facts (`nodes_tested`, populated
+    # post-run by `finalize_metadata` from `rec.node_facts`) over the
+    # one-shot pre-run `nodes` snapshot, which can be stale/misleading for
+    # providers with a zero-scaled/autoscaling target pool (e.g.
+    # `--provider existing` pinned to a specific node pool that isn't the
+    # cluster's always-on system pool).
+    nodes = cluster.get("nodes_tested") or cluster.get("nodes") or []
     machine = None
     node_image = None
     if nodes:

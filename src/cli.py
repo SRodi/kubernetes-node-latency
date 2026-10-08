@@ -77,6 +77,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     handle = provider.create(cfg)
     status = "failed"
+    records: list[IterationRecord] = []
     try:
         # Snapshot run identity + cluster facts BEFORE iterations so a partial
         # run still has metadata. Finalised in the `finally` block below.
@@ -93,7 +94,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                                 core=core, run_id=run_id, cli_argv=sys.argv[1:])
         write_metadata(run_dir, meta)
 
-        records: list[IterationRecord] = run_iterations(cfg, handle, provider, run_dir, run_id)
+        records = run_iterations(cfg, handle, provider, run_dir, run_id)
         summary = write_outputs(records, run_dir,
                                 run_id=run_id, provider=provider.name, region=handle.region)
         plots = plot_all(run_dir / "iterations.csv", run_dir / "plots",
@@ -106,7 +107,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print(f"  plots/          -> {run_dir/'plots'}")
         return 0
     finally:
-        finalized = finalize_metadata(run_dir, status=status)
+        finalized = finalize_metadata(run_dir, status=status, records=records)
         if finalized is not None:
             append_summary_section(run_dir / "summary.md", finalized)
         if not args.keep_cluster:

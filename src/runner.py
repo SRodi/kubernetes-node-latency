@@ -147,6 +147,10 @@ def run_iterations(cfg: Config, handle: ClusterHandle, provider: ClusterProvider
                     before, timeout_s=cfg.per_iteration_timeout_s,
                     not_before=rec.T0_pod_created,
                     label_selector=hint.get("nodeSelector") or None)
+                # Ground-truth snapshot of the real node (instance type, OS
+                # image, etc.) while it's guaranteed to still exist — see
+                # Collector.get_node_facts docstring for why this matters.
+                rec.node_facts = collector.get_node_facts(rec.node_name)
                 rec.T4_node_ready, rec.T4b_schedulable, rec.T1c_cni_conflist, \
                     rec.T_csinode_ready, rec.T_taint_observed = (
                         collector.wait_for_node_ready(
