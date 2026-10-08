@@ -120,6 +120,34 @@ def test_compute_phase_breakdown_end_to_end(tmp_path):
     assert round(out["agent_log_program_attached_last_offset_s"], 1) == 3.5
 
 
+def test_find_log_prefers_most_recent_when_duplicate_pods_matched(tmp_path):
+    """A DaemonSet pod (azure-cns/cilium) can leave a stale, orphaned pod
+    object bound to a reused AKS VMSS node-name after an earlier node
+    with the same instance id was scaled down -- the log-capture step's
+    node-scoped pod listing then picks up both the stale pod and the
+    real current one. `_find_log` must pick the one with the most
+    recent log content, not the alphabetically-first filename (which
+    can arbitrarily select the stale pod and corrupt the gap metrics
+    with a huge bogus value spanning back to the earlier run).
+    """
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    # Alphabetically first, but stale: finished ~1 hour before the node
+    # under test was even created.
+    (log_dir / "kube-system__azure-cns-aaaaa__cni-installer.log").write_text(
+        "2026-10-08T11:01:34.000000000Z wrote file\n"
+        "2026-10-08T11:01:34.100000000Z successfully wrote files\n"
+    )
+    # Alphabetically second, but the real/current pod on this node.
+    (log_dir / "kube-system__azure-cns-zzzzz__cni-installer.log").write_text(
+        "2026-10-08T12:01:34.000000000Z wrote file\n"
+        "2026-10-08T12:01:34.100000000Z successfully wrote files\n"
+    )
+    found = log_phases._find_log(log_dir, "cni-installer")
+    assert found is not None
+    assert found.name == "kube-system__azure-cns-zzzzz__cni-installer.log"
+
+
 def test_compute_phase_breakdown_missing_data_is_best_effort(tmp_path):
     log_dir = tmp_path / "logs"
     log_dir.mkdir()

@@ -133,8 +133,41 @@ def parse_cilium_agent(text: str) -> dict[str, Any]:
 
 
 def _find_log(log_dir: Path, container: str) -> Path | None:
+    """Return the log file for `container` in `log_dir`, disambiguating
+    when more than one pod matched the capture selector (filename is
+    `<ns>__<pod>__<container>.log`, pod name only -- no node encoded).
+
+    This happens when a DaemonSet pod on the node under test restarts
+    mid-iteration, or -- as observed in practice -- when an AKS VMSS
+    reuses a node-name/instance-id after an earlier node was scaled
+    down, leaving a stale/orphaned pod object still bound to that node
+    name via `spec.nodeName` (its log capture then picks it up
+    alongside the real, current pod). Picking the alphabetically-first
+    match is arbitrary and can silently select the stale pod's log,
+    which carries an old timestamp from a prior run and corrupts the
+    derived gap metrics with huge bogus values. The current pod is
+    always the one with the latest log content, so prefer the match
+    whose last log line is most recent.
+    """
     matches = sorted(log_dir.glob(f"*__{container}.log"))
-    return matches[0] if matches else None
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]
+    best: Path | None = None
+    best_ts: datetime | None = None
+    for m in matches:
+        try:
+            lines = _parse_log_lines(m.read_text())
+        except OSError:
+            continue
+        if not lines:
+            continue
+        last_ts = lines[-1][0]
+        if best_ts is None or last_ts > best_ts:
+            best = m
+            best_ts = last_ts
+    return best if best is not None else matches[0]
 
 
 def _as_dt(v: Any) -> datetime | None:

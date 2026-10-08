@@ -362,6 +362,16 @@ def write_outputs(records: list[IterationRecord], out_dir: Path,
                   *, run_id: str, provider: str, region: str) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     df = to_dataframe(records)
+    # Each IterationRecord.region is set once at creation time from the
+    # as-run `cfg.region` (e.g. the config default, meaningless for
+    # `--provider existing`). `region` here is the caller's corrected,
+    # real-cluster value (see cli.py / gather_metadata) and is the single
+    # source of truth -- override the per-row column with it so the CSV
+    # (and everything downstream that reads it, e.g. plotting.py's title
+    # derivation) agrees with run_metadata.json / summary.md instead of
+    # silently keeping the stale config-default region.
+    if "region" in df.columns:
+        df["region"] = region
     df.to_csv(out_dir / "iterations.csv", index=False)
 
     summary = aggregate(df)
