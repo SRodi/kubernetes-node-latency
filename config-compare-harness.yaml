@@ -1,0 +1,52 @@
+# Default configuration for node-startup-latency runs.
+# Override on the CLI with --provider, --iterations, --region, --run-id.
+
+provider: gke_autopilot   # gke_autopilot | gke_standard_dpv2 | aks_overlay_cilium | aks_byocni | aks_kubenet | eks_eni_cilium | existing
+region: europe-west1
+cluster_name: node-latency-test
+release_channel: regular  # GKE only
+kubernetes_version: null  # null = provider default
+
+iterations: 10
+per_iteration_timeout_s: 900
+node_settle_seconds: 30   # wait this long after pod cleanup before next iteration
+
+trigger_pod:
+  namespace: default
+  image: registry.k8s.io/pause:3.9
+  cpu: "6000m"
+  memory: "16Gi"
+
+cni:
+  probe: null             # cilium_dpv2 | cilium_generic | null
+  ready_regex: null       # null = use probe default
+  log_tail_lines: 5000
+  deep: false
+  metrics_ports: [9990, 9962, 6942, 9963, 9090]
+  deep_scraper_image: curlimages/curl:8.11.1
+  deep_scraper_namespace: default
+
+output:
+  base_dir: results
+  show_plots: false
+
+# Pins trigger pods to the `latencypool` node pool (Standard_D8ds_v5 /
+# Ubuntu2404 / k8s 1.36.4 / overlay+Cilium, autoscale 0-50) on the
+# harness-managed `compare-harness` cluster (RG `pre-pull-compare2-rg`,
+# westus2) for `--provider existing` runs. This cluster was already
+# created via `--provider aks_overlay_cilium` with parameters matching
+# the custom-VHD cluster's `lat8ds24` pool exactly (same region, VM
+# size, OS, k8s version) -- reusing it for a manual re-run avoids
+# provisioning a brand-new cluster's systempool (saves ~8 vCPU of
+# already-scarce DSv5-family quota; note Standard_D8ds_v5 is in the
+# separate DDSv5 family, which has headroom -- see VHD-BUILD-LOG.md).
+#
+# Usage:
+#   export KUBECONFIG=/home/srodi/src/pre-pull/kubeconfig-compare-harness
+#   python -m src.cli run --provider existing --config config-compare-harness.yaml \
+#     --iterations 10 --deep-cilium --capture-logs minimal \
+#     --run-id <run-id>
+existing:
+  node_selector:
+    agentpool: latencypool
+  tolerations: []
