@@ -95,8 +95,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
         write_metadata(run_dir, meta)
 
         records = run_iterations(cfg, handle, provider, run_dir, run_id)
+        # Use the (possibly corrected, see gather_metadata) region from
+        # meta rather than the raw handle.region: for --provider existing,
+        # handle.region is just cfg.region (a meaningless config default),
+        # while meta["cluster"]["region"] is derived from the real node's
+        # topology label. This is what lands in iterations.csv's "region"
+        # column (used verbatim as the plot-title region).
+        region = (meta.get("cluster") or {}).get("region") or handle.region
         summary = write_outputs(records, run_dir,
-                                run_id=run_id, provider=provider.name, region=handle.region)
+                                run_id=run_id, provider=provider.name, region=region)
         plots = plot_all(run_dir / "iterations.csv", run_dir / "plots",
                          title=f"({provider.name} @ {handle.region})")
         logging.getLogger(__name__).info("wrote %d plots to %s", len(plots), run_dir / "plots")
