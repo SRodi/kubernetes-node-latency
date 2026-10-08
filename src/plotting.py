@@ -691,6 +691,46 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
     lanes = [(label, s_off - t1_off, e_off - t1_off, actor)
              for (label, s_off, e_off, actor) in lanes]
 
+    # Reference wall-clock for T1 (offset = 0 on this chart), so a secondary
+    # top axis can show absolute UTC time alongside the "seconds since T1"
+    # offsets -- lets a reader jump straight from a bar's position to the
+    # matching timestamp in the raw captured pod logs. When `ok` holds a
+    # single iteration (e.g. `--iteration N`) this is the exact T1 of that
+    # iteration; when aggregated across iterations it's the median T1, so
+    # it's an approximation shared across all iterations' differing clocks.
+    ref_t1: pd.Timestamp | None = None
+    ref_t1_exact = False
+    if "T1_node_registered" in ok.columns:
+        _t1_series = pd.to_datetime(ok["T1_node_registered"], errors="coerce", utc=True).dropna()
+        if not _t1_series.empty:
+            ref_t1 = _t1_series.median()
+            ref_t1_exact = len(_t1_series) == 1
+
+    def _attach_abs_time_axis(target_ax) -> None:
+        """Add a secondary top axis translating "seconds since T1" offsets
+        into absolute UTC wall-clock time, so a bar's x-position can be
+        matched directly to a timestamp in the raw captured pod logs.
+        """
+        if ref_t1 is None:
+            return
+        from matplotlib.ticker import FuncFormatter
+
+        def _fmt(x: float, _pos: object) -> str:
+            try:
+                return (ref_t1 + pd.Timedelta(seconds=float(x))).strftime("%H:%M:%S")
+            except (ValueError, OverflowError):
+                return ""
+
+        secax = target_ax.secondary_xaxis("top")
+        secax.xaxis.set_major_locator(MultipleLocator(5))
+        secax.xaxis.set_major_formatter(FuncFormatter(_fmt))
+        secax.tick_params(axis="x", labelsize=7, rotation=45)
+        qualifier = "" if ref_t1_exact else "approx., median T1 across iterations \u2014 "
+        secax.set_xlabel(
+            f"wall-clock UTC ({qualifier}T1={ref_t1.strftime('%H:%M:%S')})",
+            fontsize=8,
+        )
+
     # ---- Cilium bootstrap sub-phases (only when --deep-cilium data exists) ----
     # Bootstrap timings are durations only, not absolute timestamps, so we
     # chain them sequentially ending at T3 (when the agent reports ready):
@@ -2088,6 +2128,7 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
     _xr = ax.get_xlim()[1]
     ax.set_xlim(left=0, right=_xr if _xr > 0 else None)
     ax.margins(x=0)
+    _attach_abs_time_axis(ax)
 
     # Emphasise the T0->T1 cloud bringup latency as a prominent suptitle so
     # the reader immediately sees the dominant (and not-to-scale) cost.
@@ -2210,6 +2251,7 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
         ax_cni_bd.xaxis.set_major_locator(MultipleLocator(5))
         ax_cni_bd.grid(True, axis="x", alpha=0.3)
         ax_cni_bd.tick_params(axis="x", labelsize=8)
+        _attach_abs_time_axis(ax_cni_bd)
 
     # ---- Cilium internal breakdown (zoomed) ----
     if has_cilium_bd and ax_bd is not None:
@@ -2257,6 +2299,7 @@ def _plot_phase_profile(ok: pd.DataFrame, out_dir: Path, *, title: str,
         ax_bd.xaxis.set_major_locator(MultipleLocator(5))
         ax_bd.grid(True, axis="x", alpha=0.3)
         ax_bd.tick_params(axis="x", labelsize=8)
+        _attach_abs_time_axis(ax_bd)
 
     # ---- Image pulls on this node (per-image median duration) ----
     if has_pulls_bd and ax_pulls is not None:
