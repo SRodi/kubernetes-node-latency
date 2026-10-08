@@ -137,6 +137,33 @@ def _config_to_dict(cfg) -> dict[str, Any]:
 def gather_metadata(*, cfg, handle, provider, core: client.CoreV1Api,
                      run_id: str, cli_argv: list[str]) -> dict[str, Any]:
     describe = getattr(provider, "describe", lambda h: {})
+    hint = getattr(provider, "node_autoprovision_hint", lambda: {})() or {}
+    cluster: dict[str, Any] = {
+        "provider": provider.name,
+        "region": handle.region,
+        "name": handle.name,
+        "created_by_harness": handle.created,
+        "kubeconfig": str(handle.kubeconfig),
+        "extra": handle.extra,
+        **_cluster_facts(core, provider.cni_probe()),
+    }
+    if hint.get("nodeSelector"):
+        # `cluster.nodes` above is a *pre-run* snapshot taken before any
+        # iteration submits its trigger pod. On providers with a
+        # zero-scaled/autoscaling target pool (e.g. `--provider existing`
+        # pinned via cfg.existing.node_selector), that snapshot typically
+        # only shows the cluster's always-on system pool — NOT the pool
+        # trigger pods actually land on. The trigger pod's real
+        # nodeSelector (and therefore the pool/VM-size/image under test)
+        # is recorded here; ground truth for which node each iteration
+        # actually used is `node_name` in iterations.csv.
+        cluster["trigger_pod_node_selector"] = hint["nodeSelector"]
+        cluster["cluster_nodes_snapshot_caveat"] = (
+            "cluster.nodes is a pre-run snapshot and may not reflect "
+            "trigger_pod_node_selector's target pool if it autoscales "
+            "from zero. See iterations.csv:node_name for the actual "
+            "per-iteration node."
+        )
     return {
         "run_id": run_id,
         "schema_version": 1,
@@ -148,15 +175,7 @@ def gather_metadata(*, cfg, handle, provider, core: client.CoreV1Api,
         "harness_git_commit": _git_commit(),
         "tooling_versions": _tooling_versions(),
         "config": _config_to_dict(cfg),
-        "cluster": {
-            "provider": provider.name,
-            "region": handle.region,
-            "name": handle.name,
-            "created_by_harness": handle.created,
-            "kubeconfig": str(handle.kubeconfig),
-            "extra": handle.extra,
-            **_cluster_facts(core, provider.cni_probe()),
-        },
+        "cluster": cluster,
         "provider_describe": describe(handle) or {},
     }
 
