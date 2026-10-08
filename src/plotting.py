@@ -427,7 +427,86 @@ def plot_all(iterations_csv: Path, out_dir: Path, *, title: str = "",
     if p is not None:
         paths.append(p)
 
+    # 8. log-phase breakdown — fine-grained view of the 3 sub-phases found
+    #    to be abnormally slow on the custom prefetch VHD: run:cni-installer,
+    #    run:cilium-init-all, and the cilium-agent's own startup. Only
+    #    emitted when `--capture-logs minimal` (or better) populated the
+    #    `src/log_phases.py`-derived columns for this run.
+    p = _plot_log_phase_breakdown(ok, out_dir, title=title)
+    if p is not None:
+        paths.append(p)
+
     return paths
+
+
+def _plot_log_phase_breakdown(ok: pd.DataFrame, out_dir: Path, *,
+                              title: str = "") -> Path | None:
+    """Per-iteration stacked-bar breakdown of the 3 investigated slow
+    sub-phases, combining `src/log_phases.py`-derived columns:
+
+    - run:cni-installer     -> cni_installer_log_span_s (own logged work)
+                                + cni_installer_post_log_gap_s (gap before
+                                the next container starts)
+    - run:cilium-init-all   -> cilium_init_all_cni_binary_write_s (own
+                                logged work writing the cilium-cni binary)
+                                + cilium_init_all_post_log_gap_s (gap)
+    - cilium-agent startup  -> agent_internal_bootstrap_s (own internal
+                                bootstrap work) + agent_pull_to_start_gap_s
+                                (gap between image-pull-complete and the
+                                container actually starting)
+
+    The hatched ("gap") segment is the part NOT explained by the
+    container's own logs — i.e. likely node-level disk/CPU contention
+    from concurrent I/O (e.g. prefetch), invisible to the container
+    itself. Returns None (no plot emitted) when none of these columns
+    are present, e.g. the run didn't use --capture-logs minimal.
+    """
+    blocks = [
+        ("run:cni-installer", "cni_installer_log_span_s", "cni_installer_post_log_gap_s"),
+        ("run:cilium-init-all", "cilium_init_all_cni_binary_write_s", "cilium_init_all_post_log_gap_s"),
+        ("cilium-agent startup", "agent_internal_bootstrap_s", "agent_pull_to_start_gap_s"),
+    ]
+    present = [(label, work_col, gap_col) for label, work_col, gap_col in blocks
+              if work_col in ok.columns or gap_col in ok.columns]
+    if not present or "iteration" not in ok.columns:
+        return None
+    iters = pd.to_numeric(ok["iteration"], errors="coerce")
+    order = iters.argsort()
+    x = iters.iloc[order].values
+    n = len(x)
+    if n == 0:
+        return None
+
+    colors = ["#1f77b4", "#d62728", "#2ca02c"]
+    n_blocks = len(present)
+    width = 0.8 / n_blocks
+    fig, ax = plt.subplots(figsize=(max(9, n * 0.9), 5.5))
+    for i, (label, work_col, gap_col) in enumerate(present):
+        work = (pd.to_numeric(ok[work_col], errors="coerce") if work_col in ok.columns
+               else pd.Series(0.0, index=ok.index)).iloc[order].fillna(0).values
+        gap = (pd.to_numeric(ok[gap_col], errors="coerce") if gap_col in ok.columns
+              else pd.Series(0.0, index=ok.index)).iloc[order].fillna(0).values
+        offset = (i - (n_blocks - 1) / 2) * width
+        xpos = x + offset
+        ax.bar(xpos, work, width=width, color=colors[i % len(colors)],
+               edgecolor="white", linewidth=0.5)
+        ax.bar(xpos, gap, width=width, bottom=work, color=colors[i % len(colors)],
+               edgecolor="white", linewidth=0.5, hatch="//", alpha=0.55)
+
+    from matplotlib.patches import Patch
+    legend_handles = [Patch(facecolor=colors[i % len(colors)], label=label)
+                      for i, (label, _w, _g) in enumerate(present)]
+    legend_handles.append(Patch(facecolor="white", edgecolor="black", label="solid = own logged work"))
+    legend_handles.append(Patch(facecolor="white", edgecolor="black", hatch="//",
+                                label="hatched = gap (likely node contention)"))
+    ax.legend(handles=legend_handles, loc="upper right", fontsize=8)
+    ax.set_xlabel("iteration"); ax.set_ylabel("seconds")
+    ax.set_xticks(x)
+    ax.set_title(f"Slow sub-phase breakdown: cni-installer / cilium-init-all / agent startup {title}")
+    ax.grid(True, axis="y", alpha=0.3)
+    p = out_dir / "log_phase_breakdown.png"
+    fig.tight_layout(); fig.savefig(p, dpi=140); plt.close(fig)
+    return p
 
 
 def _plot_pleg_detail(ok: pd.DataFrame, out_dir: Path, *,
@@ -2901,6 +2980,15 @@ def _plot_compare_phase_decomposition(csvs: list[Path], out_dir: Path) -> Path |
         ("CNI conflist install (s)",       "#fb8c00"),  # synth: T1c-T1
         ("Agent main container startup (s)", ACTOR_COLORS["kubelet_main"]),  # synth: T2 - last_init.finished_at
         ("Sched. block taint (s)",         ACTOR_COLORS["scheduler"]),
+        # Fine-grained log-phase breakdown (src/log_phases.py) — isolates
+        # time NOT explained by each container's own logged work, i.e.
+        # likely node-level disk/CPU contention (e.g. from prefetch I/O).
+        # Only non-zero when --capture-logs minimal was used.
+        ("cni-installer post-log gap (s)",      "#9467bd"),
+        ("cilium-init-all CNI binary write (s)", "#8c564b"),
+        ("cilium-init-all post-log gap (s)",     "#e377c2"),
+        ("agent pull->start gap (s)",            "#7f7f7f"),
+        ("agent internal bootstrap (s)",         "#17becf"),
     ]
 
     def _agent_main_startup_p50(df: pd.DataFrame) -> float:
@@ -2947,6 +3035,11 @@ def _plot_compare_phase_decomposition(csvs: list[Path], out_dir: Path) -> Path |
             _delta_p50(df, "T1c_cni_conflist", "T1_node_registered"),
             _agent_main_startup_p50(df),
             _p(df, "cilium_scheduling_block_s", 0.5),
+            _p(df, "cni_installer_post_log_gap_s", 0.5),
+            _p(df, "cilium_init_all_cni_binary_write_s", 0.5),
+            _p(df, "cilium_init_all_post_log_gap_s", 0.5),
+            _p(df, "agent_pull_to_start_gap_s", 0.5),
+            _p(df, "agent_internal_bootstrap_s", 0.5),
         ]
         rows_c.append((label, [v if np.isfinite(v) else 0.0 for v in vals]))
 
@@ -3127,7 +3220,8 @@ def _plot_compare_phase_decomposition(csvs: list[Path], out_dir: Path) -> Path |
     ax_c.set_yticks(yc); ax_c.set_yticklabels([r[0] for r in rows_c], fontsize=9)
     ax_c.invert_yaxis()
     ax_c.set_xlabel("seconds (p50)")
-    ax_c.set_title("Known suspects — image pull, CNI conflist install, agent-main startup, sched-block taint",
+    ax_c.set_title("Known suspects — image pull, CNI conflist, agent-main startup, sched-block taint, "
+                   "+ fine-grained cni-installer/cilium-init-all/agent log-phase breakdown",
                    fontsize=10, fontweight="bold")
     ax_c.grid(True, axis="x", alpha=0.3)
     ax_c.legend(loc="center left", bbox_to_anchor=(1.02, 0.5),

@@ -285,6 +285,21 @@ METRICS = [
     "cilium_endpoint_regen_bpf_load_prog_s",
     "cilium_endpoint_regen_waiting_for_lock_s",
     "cilium_endpoint_regen_map_sync_s",
+    # Log-phase instrumentation (src/log_phases.py) — fine-grained
+    # breakdown of the 3 sub-phases found to be abnormally slow on the
+    # custom prefetch VHD: run:cni-installer, run:cilium-init-all, and
+    # cilium-agent's own startup. Each "post_log_gap_s"/"pull_to_start_gap_s"
+    # isolates time NOT explained by the container's own logged work —
+    # i.e. likely node-level disk/CPU contention invisible to the
+    # container itself. Silently skipped when absent (--capture-logs
+    # minimal/--deep-cilium not set for this run).
+    "cni_installer_log_span_s",
+    "cni_installer_post_log_gap_s",
+    "cilium_init_all_log_span_s",
+    "cilium_init_all_cni_binary_write_s",
+    "cilium_init_all_post_log_gap_s",
+    "agent_pull_to_start_gap_s",
+    "agent_internal_bootstrap_s",
 ]
 
 # Metrics to feature in the headline "K8s networking" table in summary.md.
@@ -314,9 +329,11 @@ def aggregate(df: pd.DataFrame) -> pd.DataFrame:
             continue
         s = pd.to_numeric(df[m], errors="coerce").dropna()
         if s.empty:
-            # Skip silently for optional deep-cilium columns; keep the
-            # placeholder for the always-present core metrics.
-            if m.startswith("cilium_bootstrap_") or m == "cilium_endpoint_regen_avg_s":
+            # Skip silently for optional deep-cilium / log-phase columns;
+            # keep the placeholder row for the always-present core metrics.
+            if (m.startswith("cilium_bootstrap_") or m == "cilium_endpoint_regen_avg_s"
+                    or m.startswith("cni_installer_") or m.startswith("cilium_init_all_")
+                    or m.startswith("agent_")):
                 continue
             rows.append({"metric": m, "count": 0})
             continue
