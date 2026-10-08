@@ -203,6 +203,20 @@ class OutputCfg:
 
 
 @dc.dataclass
+class ExistingCfg:
+    # `--provider existing` reuses the current kubeconfig context with no
+    # cluster-lifecycle ops, so it can't infer which node pool to pin
+    # trigger pods to (unlike the AKS/EKS/GKE providers, which know the
+    # pool they created). Set these to target a specific pool/taint on the
+    # existing cluster — e.g. for AKS: node_selector: {agentpool: mypool},
+    # tolerations: [{key: mytaint, operator: Equal, value: "true",
+    # effect: NoSchedule}]. Defaults to {} / [] (no pinning — the
+    # scheduler/autoscaler picks whichever pool fits the trigger pod).
+    node_selector: dict[str, str] = dc.field(default_factory=dict)
+    tolerations: list[dict[str, Any]] = dc.field(default_factory=list)
+
+
+@dc.dataclass
 class Config:
     provider: str = "gke_autopilot"
     region: str = "europe-west1"
@@ -224,6 +238,7 @@ class Config:
     aks: AKSCfg = dc.field(default_factory=AKSCfg)
     gke_standard: GKEStandardCfg = dc.field(default_factory=GKEStandardCfg)
     eks: EKSCfg = dc.field(default_factory=EKSCfg)
+    existing: ExistingCfg = dc.field(default_factory=ExistingCfg)
     output: OutputCfg = dc.field(default_factory=OutputCfg)
 
     @classmethod
@@ -237,6 +252,7 @@ class Config:
         tp = TriggerPodCfg(**(data.pop("trigger_pod", {}) or {}))
         cni = CNICfg(**(data.pop("cni", {}) or {}))
         out = OutputCfg(**(data.pop("output", {}) or {}))
+        existing = ExistingCfg(**(data.pop("existing", {}) or {}))
         aks_raw = data.pop("aks", {}) or {}
         sys_pool = AKSSystemPoolCfg(**(aks_raw.pop("system_node_pool", {}) or {}))
         usr_pool = AKSNodePoolCfg(**(aks_raw.pop("user_node_pool", {}) or {}))
@@ -252,7 +268,7 @@ class Config:
         eks = EKSCfg(system_node_pool=eks_sys, user_node_pool=eks_usr,
                      cilium=eks_cilium, cluster_autoscaler=eks_ca, **eks_raw)
         return cls(trigger_pod=tp, cni=cni, aks=aks, gke_standard=gke_std,
-                   eks=eks, output=out, **data)
+                   eks=eks, existing=existing, output=out, **data)
 
     def merge_cli(self, **overrides: Any) -> "Config":
         for k, v in overrides.items():

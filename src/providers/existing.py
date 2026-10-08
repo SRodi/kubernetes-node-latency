@@ -28,7 +28,13 @@ class ExistingProvider(ClusterProvider):
         return None
 
     def node_autoprovision_hint(self) -> dict:
-        return {"nodeSelector": {}, "tolerations": []}
+        # Unlike the AKS/EKS/GKE providers (which created their own pools
+        # and know the name), `existing` has no way to infer which node
+        # pool to pin trigger pods to. Set cfg.existing.node_selector /
+        # .tolerations in config.yaml to target a specific pool (e.g. an
+        # AKS agentpool with a NoSchedule taint).
+        return {"nodeSelector": dict(self.cfg.existing.node_selector),
+                "tolerations": list(self.cfg.existing.tolerations)}
 
     def cni_probe(self) -> CNIProbe:
         # Default to generic Cilium; user can override via cfg.cni.probe.
