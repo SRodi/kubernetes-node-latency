@@ -1,0 +1,150 @@
+# Default configuration for node-startup-latency runs.
+# Override on the CLI with --provider, --iterations, --region, --run-id.
+
+provider: gke_autopilot   # gke_autopilot | gke_standard_dpv2 | aks_overlay_cilium | aks_byocni | aks_kubenet | eks_eni_cilium | existing
+region: europe-west1
+cluster_name: node-latency-test
+release_channel: regular  # GKE only
+kubernetes_version: null  # null = provider default
+
+iterations: 10
+per_iteration_timeout_s: 900
+node_settle_seconds: 30   # wait this long after pod cleanup before next iteration
+
+trigger_pod:
+  namespace: default
+  image: registry.k8s.io/pause:3.9
+  # 6 vCPU / 16 GiB forces AKS NAP to provision a D8-class SKU (8 vCPU /
+  # 32 GiB) so cross-provider runs aren't skewed by per-node headroom.
+  # GKE Autopilot already lands on ek-standard-8 by default.
+  cpu: "6000m"
+  memory: "16Gi"
+
+cni:
+  # Override the CNIProbe; null = pick the one paired with the provider.
+  probe: null             # cilium_dpv2 | cilium_generic | null
+  ready_regex: null       # null = use probe default
+  log_tail_lines: 5000
+  # Tier-1 deep-Cilium capture (also enabled via --deep-cilium):
+  # one-shot scraper Pod per iteration, pinned to the new node, that curls
+  # the agent's PodIP:port/metrics. Works on every supported platform
+  # (incl. GKE Autopilot — no exec/proxy/hostNetwork required).
+  # Adds ~3-5s per iteration.
+  deep: false
+  metrics_ports: [9990, 9962, 6942, 9963, 9090]
+  deep_scraper_image: curlimages/curl:8.11.1
+  deep_scraper_namespace: default
+
+output:
+  base_dir: results
+  show_plots: false
+
+gke_standard:
+  # Trigger pod requests 6000m CPU / 16Gi (see trigger_pod above; sized to
+  # force AKS NAP to pick D8). e2-standard-4 (4 vCPU) is too small for CA
+  # to find a fit, leaving the pod Pending forever and timing out every
+  # iteration. e2-standard-8 (8 vCPU / 32 GiB) matches the AKS D8s_v5 default.
+  machine_type: e2-standard-8
+  # Node OS image for the default + trigger node pools (gcloud --image-type).
+  # null = GKE default. e.g. COS_CONTAINERD, UBUNTU_CONTAINERD.
+  # CLI override: --gke-image-type
+  image_type: null
+  num_nodes: 1
+  min_nodes: 0
+  max_nodes: 10
+
+aks:
+  resource_group: node-latency-rg
+  location: null              # null -> falls back to top-level region
+  kubernetes_version: null
+  node_provisioning: cluster_autoscaler   # cluster_autoscaler | nap | manual
+  # Node OS image for both node pools (az aks --os-sku). null = AKS default
+  # for the k8s version. e.g. Ubuntu, Ubuntu2204, AzureLinux.
+  # CLI override: --aks-os-sku
+  os_sku: null
+  keep_resource_group: true   # don't delete the RG on cluster delete
+  system_node_pool:
+    name: systempool
+    vm_size: Standard_D8s_v5     # 8 vCPU / 32 GiB — parity with GKE ek-standard-8
+    node_count: 1
+  user_node_pool:             # the autoscaling pool that hosts trigger pods
+    name: latencypool
+    vm_size: Standard_D8s_v5     # 8 vCPU / 32 GiB — parity with GKE ek-standard-8
+    min_count: 0
+    max_count: 50
+    node_count: 0
+  byocni:
+    cilium_chart_version: "1.19.3"
+    cilium_repo_url: https://helm.cilium.io/
+    cilium_values:
+      kubeProxyReplacement: "true"
+      operator.replicas: "1"
+      # Required for --deep-cilium: agent metrics on :9962, operator on :9963.
+      prometheus.enabled: "true"
+      operator.prometheus.enabled: "true"
+    install_timeout_s: 600
+
+eks:
+  region: us-east-1           # null -> falls back to top-level region
+  kubernetes_version: null    # null -> eksctl default
+  # Node OS image family for both nodegroups (eksctl --node-ami-family).
+  # null = eksctl default. e.g. AmazonLinux2, AmazonLinux2023, Ubuntu2204,
+  # Bottlerocket. CLI override: --eks-ami-family
+  ami_family: null
+  system_node_pool:
+    name: systempool
+    instance_type: m6i.2xlarge   # 8 vCPU / 32 GiB — parity with AKS D8s_v5 / GKE ek-standard-8
+    node_count: 1
+  user_node_pool:
+    name: latencypool
+    instance_type: m6i.2xlarge
+    min_count: 0
+    max_count: 50
+    node_count: 0
+  cilium:
+    chart_version: "1.19.3"
+    repo_url: https://helm.cilium.io/
+    # ENI-mode values per https://cilium.io/blog/2025/06/19/eks-eni-install/.
+    values:
+      eni.enabled: "true"
+      ipam.mode: "eni"
+      routingMode: "native"
+      egressMasqueradeInterfaces: "eth+"
+      kubeProxyReplacement: "true"
+      operator.replicas: "1"
+      # Required for --deep-cilium: agent metrics on :9962, operator on :9963.
+      prometheus.enabled: "true"
+      operator.prometheus.enabled: "true"
+    install_timeout_s: 600
+  cluster_autoscaler:
+    enabled: true
+    repo_url: https://kubernetes.github.io/autoscaler
+    chart_version: null       # null -> chart's latest
+    values:
+      rbac.serviceAccount.name: "cluster-autoscaler"
+      extraArgs.scan-interval: "10s"
+      extraArgs.scale-down-unneeded-time: "1m"
+      extraArgs.scale-down-delay-after-add: "1m"
+      # hostNetwork is required: with Cilium kpr + ENI mode the CA pod
+      # otherwise silently hangs after boot-time ASG discovery because
+      # IMDS / EC2 / autoscaling API calls don't survive Cilium's BPF
+      # service path. Running in the host netns bypasses Cilium for CA
+      # while leaving the rest of the pod traffic on Cilium.
+      hostNetwork: "true"
+      dnsPolicy: "ClusterFirstWithHostNet"
+    install_timeout_s: 600
+
+# Pins trigger pods to the custom Ubuntu24/D8ds_v5 VHD node pool `lat8ds24`
+# on the `pre-pull-vhd-test` cluster (see VHD-BUILD-LOG.md) for
+# `--provider existing` runs, instead of letting the autoscaler pick
+# arbitrarily (previous run 202610081008-...-D8ds-Ubuntu24 actually landed
+# on the default `latencypool` / D4as_v5 / Ubuntu22.04 pool because
+# existing.node_selector was empty).
+existing:
+  node_selector:
+    agentpool: lat8ds24
+  tolerations:
+    - key: latency-test
+      operator: Equal
+      value: "true"
+      effect: NoSchedule

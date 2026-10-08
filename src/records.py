@@ -145,6 +145,12 @@ class IterationRecord:
     # scrape failed). See `kubelet_pleg.parse_pleg`.
     kubelet_pleg: dict | None = None
 
+    # Log-derived sub-phase breakdown for the `run:cni-installer`,
+    # `run:cilium-init-all`, and "Agent main container startup" lanes
+    # (None when capture_logs != "minimal" or no logs were captured).
+    # Flat dict of scalar columns; see `log_phases.compute_phase_breakdown`.
+    log_phase_breakdown: dict | None = None
+
     def to_row(self) -> dict:
         from .cilium_deep import headline_to_columns
         from .kubelet_pleg import pleg_to_columns
@@ -455,4 +461,5 @@ class IterationRecord:
         row.update(ic_durations)
         row.update(headline_to_columns(self.deep_cilium))
         row.update(pleg_to_columns(self.kubelet_pleg))
+        row.update(self.log_phase_breakdown or {})
         return row

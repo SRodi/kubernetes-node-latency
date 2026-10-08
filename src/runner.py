@@ -326,6 +326,13 @@ def run_iterations(cfg: Config, handle: ClusterHandle, provider: ClusterProvider
                         )
                         summary["duration_s"] = round(time.monotonic() - t0_log, 3)
                         rec.log_capture = summary
+                        try:
+                            from . import log_phases as _lp
+                            rec.log_phase_breakdown = _lp.compute_phase_breakdown(
+                                rec, log_dest)
+                        except Exception as e:  # noqa: BLE001
+                            log.warning(
+                                "log phase breakdown failed for iter %d: %s", i, e)
                     except Exception as e:  # noqa: BLE001
                         log.warning("pod log capture failed for iter %d: %s", i, e)
                 if rec.pod_name:
